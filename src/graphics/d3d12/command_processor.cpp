@@ -62,6 +62,10 @@ REXCVAR_DEFINE_BOOL(gpu_clear_draws_in_place, true, "GPU/D3D12",
                     "already is, without moving it between render targets")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(d3d12_submission_thread, true, "GPU/D3D12",
+                    "Execute and submit command lists on another thread, so the command "
+                    "processor continues with the next commands meanwhile");
+
 REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -1653,6 +1657,7 @@ bool D3D12CommandProcessor::SetupContext() {
 
 void D3D12CommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
+  ShutdownSubmissionThread();
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 
@@ -1942,9 +1947,20 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     // GPU time per frame of each pass, every 300 frames.
     rex::perf::GpuProfileStats& stats = rex::perf::GetGpuProfileStats();
     static uint32_t frames = 0;
+    // CPU cycles of this (command processor) thread, for A/B comparisons that
+    // don't depend on the scene as much as the frame rate does (per draw).
+    static ULONG64 cycles_start = 0;
+    ULONG64 cycles_now = 0;
+    QueryThreadCycleTime(GetCurrentThread(), &cycles_now);
     if (!stats.enabled.exchange(true)) {
       frames = 0;
+      cycles_start = cycles_now;
     } else if (++frames == 300) {
+      const uint64_t draws = texture_cache_->request_textures_calls_;
+      REXGPU_INFO("gpu_pass_profile: command processor {:.2f} Mcycles/frame, {:.0f} cycles/draw",
+                  double(cycles_now - cycles_start) / 1e6 / frames,
+                  draws ? double(cycles_now - cycles_start) / double(draws) : 0.0);
+      cycles_start = cycles_now;
       std::string line;
       double total = 0.0;
       for (uint32_t i = 0; i < uint32_t(rex::perf::GpuPass::kCount); ++i) {
@@ -1956,8 +1972,15 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                               double(ns) / 1e6 / frames, count / frames);
         }
       }
-      REXGPU_INFO("gpu_pass_profile: {:.2f} ms/frame:{} (clears in place {}/frame)",
-                  total / 1e6 / frames, line, stats.clears_in_place.exchange(0) / frames);
+      REXGPU_INFO("gpu_pass_profile: {:.2f} ms/frame:{} (clears in place {}/frame, direct "
+                  "resolves pending {}, submissions {:.1f}/frame, texture binding resets "
+                  "{:.1f}/frame, bindings re-evaluated {:.1f}/frame, draws {:.0f}/frame)",
+                  total / 1e6 / frames, line, stats.clears_in_place.exchange(0) / frames,
+                  texture_cache_->GetPendingDirectResolveCount(),
+                  double(stats.cp_submissions.exchange(0)) / frames,
+                  double(std::exchange(texture_cache_->outdated_binding_resets_, 0)) / frames,
+                  double(std::exchange(texture_cache_->requested_bindings_, 0)) / frames,
+                  double(std::exchange(texture_cache_->request_textures_calls_, 0)) / frames);
       frames = 0;
     }
   }
@@ -3628,6 +3651,15 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
 
     primitive_processor_->EndFrame();
   }
+  // Swaps: everything submitted before the presenter submits its own commands
+  // (on returning, after this submission is queued below).
+  struct AwaitOnSwap {
+    D3D12CommandProcessor* self;
+    bool is_swap;
+    ~AwaitOnSwap() {
+      if (is_swap) self->AwaitSubmissionThread();
+    }
+  } await_on_swap{this, is_swap};
 
   if (submission_open_) {
     assert_false(scratch_buffer_used_);
@@ -3658,12 +3690,32 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     // happens between Xenia submissions.
     ID3D12CommandAllocator* command_allocator =
         command_allocator_writable_first_->command_allocator;
-    command_allocator->Reset();
-    command_list_->Reset(command_allocator, nullptr);
-    deferred_command_list_.Execute(command_list_, command_list_1_);
-    command_list_->Close();
-    ID3D12CommandList* execute_command_lists[] = {command_list_};
-    direct_queue->ExecuteCommandLists(1, execute_command_lists);
+    const bool threaded = UseSubmissionThread();
+    if (threaded) {
+      SubmissionJob job;
+      job.command_allocator = command_allocator;
+      job.fence_value = submission_current_;
+      {
+        std::lock_guard lock(submission_mutex_);
+        if (!submission_free_streams_.empty()) {
+          job.command_stream = std::move(submission_free_streams_.back());
+          submission_free_streams_.pop_back();
+        }
+      }
+      deferred_command_list_.SwapCommandStream(job.command_stream);
+      {
+        std::lock_guard lock(submission_mutex_);
+        submission_jobs_.push_back(std::move(job));
+      }
+      submission_job_added_.notify_one();
+    } else {
+      command_allocator->Reset();
+      command_list_->Reset(command_allocator, nullptr);
+      deferred_command_list_.Execute(command_list_, command_list_1_);
+      command_list_->Close();
+      ID3D12CommandList* execute_command_lists[] = {command_list_};
+      direct_queue->ExecuteCommandLists(1, execute_command_lists);
+    }
     command_allocator_writable_first_->last_usage_submission = submission_current_;
     if (command_allocator_submitted_last_) {
       command_allocator_submitted_last_->next = command_allocator_writable_first_;
@@ -3677,7 +3729,12 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
       command_allocator_writable_last_ = nullptr;
     }
 
-    direct_queue->Signal(submission_fence_, submission_current_++);
+    if (threaded) {
+      // Signaled by the submission thread after submitting.
+      ++submission_current_;
+    } else {
+      direct_queue->Signal(submission_fence_, submission_current_++);
+    }
 
     submission_open_ = false;
 
@@ -3729,6 +3786,75 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   }
 
   return true;
+}
+
+bool D3D12CommandProcessor::UseSubmissionThread() {
+  if (!submission_thread_state_) {
+    submission_thread_state_ = REXCVAR_GET(d3d12_submission_thread) ? 1 : -1;
+    if (submission_thread_state_ > 0) {
+      submission_thread_exit_ = false;
+      submission_thread_ = std::thread([this] { SubmissionThreadMain(); });
+      REXGPU_INFO("D3D12: command lists are submitted on a separate thread");
+    }
+  }
+  return submission_thread_state_ > 0;
+}
+
+void D3D12CommandProcessor::SubmissionThreadMain() {
+#ifdef _WIN32
+  SetThreadDescription(GetCurrentThread(), L"GPU Submission");
+#endif
+  DeferredCommandList list(*this);
+  ID3D12CommandQueue* direct_queue = GetD3D12Provider().GetDirectQueue();
+  std::unique_lock lock(submission_mutex_);
+  while (true) {
+    submission_job_added_.wait(
+        lock, [this] { return submission_thread_exit_ || !submission_jobs_.empty(); });
+    if (submission_jobs_.empty()) {
+      break;  // Exiting with nothing left.
+    }
+    SubmissionJob job = std::move(submission_jobs_.front());
+    submission_jobs_.pop_front();
+    submission_thread_busy_ = true;
+    lock.unlock();
+    job.command_allocator->Reset();
+    command_list_->Reset(job.command_allocator, nullptr);
+    list.SwapCommandStream(job.command_stream);
+    list.Execute(command_list_, command_list_1_);
+    list.SwapCommandStream(job.command_stream);
+    command_list_->Close();
+    ID3D12CommandList* execute_command_lists[] = {command_list_};
+    direct_queue->ExecuteCommandLists(1, execute_command_lists);
+    direct_queue->Signal(submission_fence_, job.fence_value);
+    job.command_stream.clear();
+    lock.lock();
+    submission_free_streams_.push_back(std::move(job.command_stream));
+    submission_thread_busy_ = false;
+    if (submission_jobs_.empty()) {
+      submission_jobs_done_.notify_all();
+    }
+  }
+}
+
+void D3D12CommandProcessor::AwaitSubmissionThread() {
+  if (submission_thread_state_ <= 0) {
+    return;
+  }
+  std::unique_lock lock(submission_mutex_);
+  submission_jobs_done_.wait(
+      lock, [this] { return submission_jobs_.empty() && !submission_thread_busy_; });
+}
+
+void D3D12CommandProcessor::ShutdownSubmissionThread() {
+  if (submission_thread_state_ > 0 && submission_thread_.joinable()) {
+    {
+      std::lock_guard lock(submission_mutex_);
+      submission_thread_exit_ = true;
+    }
+    submission_job_added_.notify_one();
+    submission_thread_.join();
+  }
+  submission_thread_state_ = 0;
 }
 
 bool D3D12CommandProcessor::CanEndSubmissionImmediately() const {

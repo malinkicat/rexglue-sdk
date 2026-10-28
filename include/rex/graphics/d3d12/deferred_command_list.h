@@ -34,6 +34,9 @@ class DeferredCommandList {
 
   void Reset();
   void Execute(ID3D12GraphicsCommandList* command_list, ID3D12GraphicsCommandList1* command_list_1);
+  // Exchanges the recorded commands with `stream` (handing them to another
+  // list, e.g. for executing on another thread).
+  void SwapCommandStream(std::vector<uintmax_t>& stream) { command_stream_.swap(stream); }
 
   D3D12_RECT* ClearDepthStencilViewAllocatedRects(D3D12_CPU_DESCRIPTOR_HANDLE depth_stencil_view,
                                                   D3D12_CLEAR_FLAGS clear_flags, FLOAT depth,

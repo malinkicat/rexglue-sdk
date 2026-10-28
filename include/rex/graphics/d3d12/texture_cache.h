@@ -418,6 +418,7 @@ class D3D12TextureCache final : public TextureCache {
   // dropped, the ones it overlaps partially are written out first.
   void PrepareScaledResolveWrite(uint32_t start, uint32_t length);
   bool HasPendingDirectResolves() const { return !pending_direct_resolves_.empty(); }
+  size_t GetPendingDirectResolveCount() const { return pending_direct_resolves_.size(); }
   // Writes the pending direct resolves overlapping the ranges out to memory now
   // (records dispatches, may take new descriptors - not while a draw's bindings
   // are set up).
@@ -647,6 +648,11 @@ class D3D12TextureCache final : public TextureCache {
     std::shared_ptr<DirectResolveStencil> stencil;
   };
   std::vector<PendingDirectResolve> pending_direct_resolves_;
+  // A range containing every pending direct resolve (may be larger: widened
+  // when one is added, made exact by MaterializeDirectResolves), so the
+  // requests of most draws, outside it, skip the list.
+  uint64_t pending_direct_resolves_start_ = UINT64_MAX;
+  uint64_t pending_direct_resolves_end_ = 0;
   // k_24_8 direct resolves: the stencil of the resolve, per texture (R8_UINT).
   struct DirectResolveStencil {
     Microsoft::WRL::ComPtr<ID3D12Resource> resource;

@@ -14,7 +14,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <deque>
+#include <mutex>
+#include <thread>
 #include <memory>
 #include <optional>
 #include <string>
@@ -349,6 +352,15 @@ class D3D12CommandProcessor : public CommandProcessor {
   // clearing and stopping capturing. Returns whether the submission was done
   // successfully, if it has failed, leaves it open.
   bool EndSubmission(bool is_swap);
+  // d3d12_submission_thread: the deferred command lists of ended submissions
+  // are executed into the Direct3D 12 command list and submitted (with the
+  // fence signal) on another thread, so the command processor goes on with the
+  // next commands meanwhile. Swaps wait for it (the presenter submits after).
+  bool UseSubmissionThread();
+  void SubmissionThreadMain();
+  // Waits until every ended submission has been submitted to the queue.
+  void AwaitSubmissionThread();
+  void ShutdownSubmissionThread();
   // Checks if ending a submission right now would not cause potentially more
   // delay than it would reduce by making the GPU start working earlier - such
   // as when there are unfinished graphics pipeline creation requests that would
@@ -487,6 +499,21 @@ class D3D12CommandProcessor : public CommandProcessor {
   ID3D12GraphicsCommandList* command_list_ = nullptr;
   ID3D12GraphicsCommandList1* command_list_1_ = nullptr;
   DeferredCommandList deferred_command_list_;
+  struct SubmissionJob {
+    std::vector<uintmax_t> command_stream;
+    ID3D12CommandAllocator* command_allocator;
+    uint64_t fence_value;
+  };
+  std::thread submission_thread_;
+  std::mutex submission_mutex_;
+  std::condition_variable submission_job_added_;
+  std::condition_variable submission_jobs_done_;
+  std::deque<SubmissionJob> submission_jobs_;
+  // Emptied command streams for reuse (capacity kept).
+  std::vector<std::vector<uintmax_t>> submission_free_streams_;
+  bool submission_thread_busy_ = false;
+  bool submission_thread_exit_ = false;
+  int submission_thread_state_ = 0;  // 0 not decided, 1 used, -1 not used.
 
   bool debug_markers_enabled_ = false;
 

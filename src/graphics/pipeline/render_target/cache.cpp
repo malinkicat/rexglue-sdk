@@ -28,6 +28,9 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 
+REXCVAR_DEFINE_BOOL(gpu_update_memo, true, "GPU",
+                    "Skip the render target ownership update of a draw using the same render "
+                    "targets as the previous one when nothing changed since (the same result)");
 REXCVAR_DEFINE_BOOL(mrt_edram_used_range_clamp_to_min, true, "GPU",
                     "Clamp MRT EDRAM used range to minimum");
 
@@ -347,6 +350,7 @@ void RenderTargetCache::InitializeCommon() {
 }
 
 void RenderTargetCache::DestroyAllRenderTargets(bool shutting_down) {
+  ++ownership_generation_;
   ownership_ranges_.clear();
   if (!shutting_down) {
     ownership_ranges_.emplace(std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
@@ -368,6 +372,7 @@ void RenderTargetCache::ShutdownCommon() {
 
 void RenderTargetCache::ClearCache() {
   // Keep only render targets currently owning any EDRAM data.
+  ++ownership_generation_;
   if (!render_targets_.empty()) {
     std::unordered_set<RenderTargetKey, RenderTargetKey::Hasher> used_render_targets;
     for (const auto& ownership_range_pair : ownership_ranges_) {
@@ -648,13 +653,6 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     rt_key.msaa_samples = msaa_samples;
     rt_key.is_depth = rt_bit_index == 0;
     rt_key.resource_format = resource_formats[rt_bit_index];
-    if (!interlock_barrier_only) {
-      RenderTarget* render_target = GetOrCreateRenderTarget(rt_key);
-      if (!render_target) {
-        return false;
-      }
-      rts[rt_bit_index] = render_target;
-    }
     uint32_t rt_is_64bpp = (rts_are_64bpp >> rt_bit_index) & 1;
     // The last render target can occupy the EDRAM until the base of the first
     // render target (itself in case of 1 render target) with EDRAM addressing
@@ -692,16 +690,55 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
   // draw with whatever contents currently are in the render target in this
   // case).
 
-  for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
-    const std::pair<uint32_t, uint32_t>& rt_base_index = edram_bases_sorted[i];
-    uint32_t rt_bit_index = rt_base_index.second;
-    ChangeOwnership(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i],
-                    interlock_barrier_only ? nullptr : &last_update_transfers_[rt_bit_index]);
-  }
-
   if (interlock_barrier_only) {
+    for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+      ChangeOwnership(rt_keys[edram_bases_sorted[i].second], 0, rt_lengths_tiles[i], nullptr);
+    }
     // No copying transfers or render target bindings - only needed the barrier.
     return true;
+  }
+
+  // The same render targets and ranges as the previous draw, with nothing
+  // changed since: the ownership is already as needed.
+  bool memo_hit = REXCVAR_GET(gpu_update_memo) && update_memo_valid_ &&
+                  update_memo_generation_ == ownership_generation_ &&
+                  update_memo_rts_used_bits_ == depth_and_color_rts_used_bits;
+  for (uint32_t i = 0; memo_hit && i < edram_bases_sorted_count; ++i) {
+    const uint32_t rt_bit_index = edram_bases_sorted[i].second;
+    memo_hit = update_memo_keys_[rt_bit_index] == rt_keys[rt_bit_index] &&
+               update_memo_lengths_tiles_[rt_bit_index] == rt_lengths_tiles[i];
+  }
+  if (memo_hit) {
+    for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+      const uint32_t rt_bit_index = edram_bases_sorted[i].second;
+      rts[rt_bit_index] = update_memo_rts_[rt_bit_index];
+    }
+  } else {
+    update_memo_valid_ = false;
+    for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+      const uint32_t rt_bit_index = edram_bases_sorted[i].second;
+      RenderTarget* render_target = GetOrCreateRenderTarget(rt_keys[rt_bit_index]);
+      if (!render_target) {
+        return false;
+      }
+      rts[rt_bit_index] = render_target;
+    }
+    const uint64_t generation_before = ownership_generation_;
+    for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+      const uint32_t rt_bit_index = edram_bases_sorted[i].second;
+      ChangeOwnership(rt_keys[rt_bit_index], 0, rt_lengths_tiles[i],
+                      &last_update_transfers_[rt_bit_index]);
+    }
+    // Only when the calls changed nothing (a repeat is surely a no-op then).
+    update_memo_valid_ = ownership_generation_ == generation_before;
+    update_memo_generation_ = ownership_generation_;
+    update_memo_rts_used_bits_ = depth_and_color_rts_used_bits;
+    for (uint32_t i = 0; i < edram_bases_sorted_count; ++i) {
+      const uint32_t rt_bit_index = edram_bases_sorted[i].second;
+      update_memo_keys_[rt_bit_index] = rt_keys[rt_bit_index];
+      update_memo_lengths_tiles_[rt_bit_index] = rt_lengths_tiles[i];
+      update_memo_rts_[rt_bit_index] = rts[rt_bit_index];
+    }
   }
 
   // Transfers into what the draw overwrites anyway.
@@ -1279,6 +1316,7 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
 void RenderTargetCache::PixelShaderInterlockFullEdramBarrierPlaced() {
   assert_true(GetPath() == Path::kPixelShaderInterlock);
   // Clear ownership - any overlap of data written before the barrier is safe.
+  ++ownership_generation_;
   OwnershipRange empty_range(xenos::kEdramTileCount, RenderTargetKey(), RenderTargetKey(),
                              RenderTargetKey());
   if (ownership_ranges_.size() == 1) {
@@ -1464,6 +1502,7 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
       if (it_pre->second.end_tiles > extent_start &&
           !it_pre->second.IsOwnedBy(dest, host_depth_encoding_different)) {
         // Different render target overlapping the range - split the head.
+        ++ownership_generation_;
         ownership_ranges_.emplace(extent_start, it_pre->second);
         it_pre->second.end_tiles = extent_start;
         // Let the next loop do the transfer and needed merging and splitting
@@ -1484,6 +1523,7 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
       }
       // Take over the current range. Handle the tail - may be outside the range
       // (split in this case) or within it.
+      ++ownership_generation_;
       if (it->second.end_tiles > extent_end) {
         // Split the tail.
         ownership_ranges_.emplace(extent_end, it->second);

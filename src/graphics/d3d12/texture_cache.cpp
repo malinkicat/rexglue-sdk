@@ -2074,6 +2074,9 @@ bool D3D12TextureCache::DirectResolveToTexture(
   PendingDirectResolve& pending = pending_direct_resolves_.emplace_back();
   pending.start = extent_start;
   pending.length = extent_length;
+  pending_direct_resolves_start_ = std::min(pending_direct_resolves_start_, uint64_t(extent_start));
+  pending_direct_resolves_end_ =
+      std::max(pending_direct_resolves_end_, uint64_t(extent_start) + extent_length);
   pending.texture = target;
   pending.resource = target->resource();
   pending.orphan_state = D3D12_RESOURCE_STATE_COMMON;
@@ -2151,6 +2154,16 @@ void D3D12TextureCache::MaterializeDirectResolves(const std::pair<uint32_t, uint
   if (pending_direct_resolves_.empty()) {
     return;
   }
+  bool near_pending = false;
+  for (size_t j = 0; j < count && !near_pending; ++j) {
+    near_pending = ranges[j].first < pending_direct_resolves_end_ &&
+                   pending_direct_resolves_start_ < uint64_t(ranges[j].first) + ranges[j].second;
+  }
+  if (!near_pending) {
+    return;
+  }
+  // Exact again for what stays pending.
+  uint64_t remaining_start = UINT64_MAX, remaining_end = 0;
   for (size_t i = 0; i < pending_direct_resolves_.size();) {
     PendingDirectResolve& pending = pending_direct_resolves_[i];
     bool overlaps = false;
@@ -2167,6 +2180,8 @@ void D3D12TextureCache::MaterializeDirectResolves(const std::pair<uint32_t, uint
       overlaps = false;
     }
     if (!overlaps) {
+      remaining_start = std::min(remaining_start, uint64_t(pending.start));
+      remaining_end = std::max(remaining_end, uint64_t(pending.start) + pending.length);
       ++i;
       continue;
     }
@@ -2178,6 +2193,8 @@ void D3D12TextureCache::MaterializeDirectResolves(const std::pair<uint32_t, uint
             "Direct resolve: {:08X}+{} requested while a draw is set up - not written out there",
             pending.start, pending.length);
       }
+      remaining_start = std::min(remaining_start, uint64_t(pending.start));
+      remaining_end = std::max(remaining_end, uint64_t(pending.start) + pending.length);
       ++i;
       continue;
     }
@@ -2185,6 +2202,8 @@ void D3D12TextureCache::MaterializeDirectResolves(const std::pair<uint32_t, uint
     pending_direct_resolves_.erase(pending_direct_resolves_.begin() + i);
     MaterializeDirectResolve(materialized);
   }
+  pending_direct_resolves_start_ = remaining_start;
+  pending_direct_resolves_end_ = remaining_end;
 }
 
 void D3D12TextureCache::MaterializeDirectResolve(PendingDirectResolve& pending) {

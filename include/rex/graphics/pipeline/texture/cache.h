@@ -87,6 +87,12 @@ class TextureCache {
 
   virtual void ClearCache();
 
+  // Statistics (gpu_pass_profile): binding resets after a texture became
+  // outdated, bindings re-evaluated, and RequestTextures calls.
+  uint64_t outdated_binding_resets_ = 0;
+  uint64_t requested_bindings_ = 0;
+  uint64_t request_textures_calls_ = 0;
+
   virtual void CompletedSubmissionUpdated(uint64_t completed_submission_index);
   virtual void BeginSubmission(uint64_t new_submission_index);
   virtual void BeginFrame();

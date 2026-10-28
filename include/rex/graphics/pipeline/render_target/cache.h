@@ -703,6 +703,17 @@ class RenderTargetCache {
   // since standard containers use dynamic allocation for elements, though
   // changes to this throughout a frame are pretty rare.
   std::map<uint32_t, OwnershipRange> ownership_ranges_;
+  // Incremented whenever ownership_ranges_ or the render targets change.
+  uint64_t ownership_generation_ = 0;
+  // Update: the previous draw's render targets and ownership range lengths, if
+  // ownership_ranges_ has not changed since its ChangeOwnership calls - the
+  // same calls again would do nothing (most draws), so they're skipped.
+  bool update_memo_valid_ = false;
+  uint64_t update_memo_generation_ = 0;
+  uint32_t update_memo_rts_used_bits_ = 0;
+  RenderTargetKey update_memo_keys_[1 + xenos::kMaxColorRenderTargets];
+  uint32_t update_memo_lengths_tiles_[1 + xenos::kMaxColorRenderTargets] = {};
+  RenderTarget* update_memo_rts_[1 + xenos::kMaxColorRenderTargets] = {};
 
   // Render targets actually used by the draw call with the last successful
   // update. 0 is depth, color starting from 1, nullptr if not bound.

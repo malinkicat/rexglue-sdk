@@ -458,12 +458,18 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     // is rechecked in this draw and in subsequent ones to reload the new data
     // if needed.
     ResetTextureBindings();
+    ++outdated_binding_resets_;
   }
+  requested_bindings_ += uint32_t(rex::bit_count(used_texture_mask & ~texture_bindings_in_sync_));
+  ++request_textures_calls_;
 
   // Update the texture keys and the textures.
   uint32_t bindings_changed = 0;
-  std::vector<PendingTextureLoad> pending_texture_loads;
-  std::vector<PendingSharedMemoryRange> pending_shared_memory_ranges;
+  // Reused (called for every draw, on the command processor thread).
+  static thread_local std::vector<PendingTextureLoad> pending_texture_loads;
+  static thread_local std::vector<PendingSharedMemoryRange> pending_shared_memory_ranges;
+  pending_texture_loads.clear();
+  pending_shared_memory_ranges.clear();
   auto queue_pending_texture_load = [&](Texture* texture) {
     if (texture == nullptr) {
       return;
@@ -567,9 +573,9 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
                     uint32_t(pending_shared_memory_ranges.size()));
 
   bool batched_shared_memory_request_succeeded = true;
-  std::vector<std::pair<uint32_t, uint32_t>> pending_shared_memory_range_pairs;
+  static thread_local std::vector<std::pair<uint32_t, uint32_t>> pending_shared_memory_range_pairs;
+  pending_shared_memory_range_pairs.clear();
   if (!pending_shared_memory_ranges.empty()) {
-    pending_shared_memory_range_pairs.reserve(pending_shared_memory_ranges.size());
     for (const PendingSharedMemoryRange& pending_range : pending_shared_memory_ranges) {
       pending_shared_memory_range_pairs.emplace_back(pending_range.start, pending_range.length);
     }

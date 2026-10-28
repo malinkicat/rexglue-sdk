@@ -4089,6 +4089,18 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
     const Transfer::Rectangle* resolve_clear_rectangle) {
   assert_true(GetPath() == Path::kHostRenderTargets);
 
+  // Most draws: nothing to transfer or clear (called for every draw).
+  if (!render_target_resolve_clear_values) {
+    bool any_transfers = false;
+    for (uint32_t i = 0; i < render_target_count && !any_transfers; ++i) {
+      any_transfers = render_targets[i] && render_target_transfers &&
+                      !render_target_transfers[i].empty();
+    }
+    if (!any_transfers) {
+      return;
+    }
+  }
+
   // Transfers and clears write into these (for skipping unchanged dumps).
   for (uint32_t i = 0; i < render_target_count; ++i) {
     if (render_targets[i] &&

@@ -271,6 +271,8 @@ class D3D12TextureCache final : public TextureCache {
    private:
     Microsoft::WRL::ComPtr<ID3D12Resource> resource_;
     D3D12_RESOURCE_STATES resource_state_;
+    // Created with unordered access (a possible direct resolve target).
+    bool resource_desc_flags_uav_ = false;
     std::unique_ptr<D3D12Texture> texture_3d_as_2d_;
 
     // For bindful - indices in the non-shader-visible descriptor cache for
@@ -379,6 +381,67 @@ class D3D12TextureCache final : public TextureCache {
   }
 
   LoadShaderIndex GetLoadShaderIndex(TextureKey key) const;
+  // Whether textures with this key are created with unordered access for
+  // LoadTextureDataToTexture.
+  bool IsLoadToTextureKey(TextureKey key) const;
+
+ public:
+  // Direct resolve (gpu_direct_resolve): copies a k_8_8_8_8 (or, float32,
+  // k_32_FLOAT) render target
+  // (its shader resource view, the resource already in the non-pixel shader
+  // resource state) into the R8G8B8A8 texture that samples the destination,
+  // if there is one - instead of the dump, the resolve copy and the texture
+  // load. The guest memory gets the data later, only if something else needs
+  // it. Returns false if it can't be done (the usual resolve then).
+  // Multisampled render targets and kD24FS8 depth (DirectResolveToTexture's
+  // `source`; null - single-sampled, kD24S8).
+  struct DirectResolveSource {
+    bool msaa = false;
+    // Host sample indices averaged (the same twice for one sample).
+    uint32_t sample_a = 0;
+    uint32_t sample_b = 0;
+    bool float24 = false;
+    bool float24_round = false;
+    // Depth into a k_24_8_FLOAT texture rather than k_24_8.
+    bool dest_float24 = false;
+  };
+  bool DirectResolveToTexture(D3D12_CPU_DESCRIPTOR_HANDLE render_target_srv,
+                              uint32_t origin_x, uint32_t origin_y, uint32_t width,
+                              uint32_t height, uint32_t dest_base, uint32_t dest_pitch_aligned,
+                              uint32_t dest_endian, bool swap_red_blue, uint32_t extent_start,
+                              uint32_t extent_length, uint32_t fill_x = 0, uint32_t fill_y = 0,
+                              bool float32 = false, bool depth24 = false,
+                              D3D12_CPU_DESCRIPTOR_HANDLE stencil_srv = {},
+                              const DirectResolveSource* source = nullptr);
+  // Before a resolution-scaled resolve writes the scaled resolve memory range
+  // the usual way: direct resolves pending there that it replaces entirely are
+  // dropped, the ones it overlaps partially are written out first.
+  void PrepareScaledResolveWrite(uint32_t start, uint32_t length);
+  bool HasPendingDirectResolves() const { return !pending_direct_resolves_.empty(); }
+  // Writes the pending direct resolves overlapping the ranges out to memory now
+  // (records dispatches, may take new descriptors - not while a draw's bindings
+  // are set up).
+  void WriteOutDirectResolves(const std::pair<uint32_t, uint32_t>* ranges, size_t count) {
+    MaterializeDirectResolves(ranges, count);
+  }
+  // Before the texture cache is destroyed (draw resolution scale change): the
+  // pending direct resolves going to the guest memory copy (not resolution-
+  // scaled - the scaled resolve memory goes away anyway) are written out.
+  // Needs an open submission. Returns whether anything was recorded.
+  bool WriteOutUnscaledDirectResolves();
+  // While set (a draw's pipeline and bindings are already recorded), requests of
+  // ranges with pending direct resolves don't write them out (that would
+  // record dispatches and maybe change the descriptor heap in the middle of
+  // the draw) - they must have been written out before.
+  void SetDirectResolveWriteOutBlocked(bool blocked) { direct_resolve_write_out_blocked_ = blocked; }
+
+ private:
+  // Loads the base level straight into the texture, false if it can't be done
+  // that way (the buffer and copy way then).
+  bool LoadTextureDataToTexture(D3D12Texture& texture);
+  // Whether textures with this key can receive direct resolves (created with
+  // unordered access): single-level tiled R8G8B8A8 2D.
+  bool IsDirectResolveTargetKey(TextureKey key) const;
 
   static constexpr bool AreDimensionsCompatible(xenos::FetchOpDimension binding_dimension,
                                                 xenos::DataDimension resource_dimension) {
@@ -461,6 +524,10 @@ class D3D12TextureCache final : public TextureCache {
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, kLoadShaderCount> load_pipelines_;
   // Load pipelines for resolution-scaled resolve targets.
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, kLoadShaderCount> load_pipelines_scaled_;
+  // 2D tiled single-level R8G8B8A8 textures loaded straight into the texture
+  // through an R8G8B8A8_UINT UAV (gpu_texture_load_to_texture), null if not
+  // supported.
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> load_pipeline_32bpb_to_texture_;
 
   std::vector<SRVDescriptorCachePage> srv_descriptor_cache_;
   uint32_t srv_descriptor_cache_allocated_;
@@ -539,6 +606,84 @@ class D3D12TextureCache final : public TextureCache {
   // Range used in the last successful MakeScaledResolveRangeCurrent call.
   uint64_t scaled_resolve_current_range_start_scaled_;
   uint64_t scaled_resolve_current_range_length_scaled_;
+
+  std::deque<std::pair<uint64_t, Microsoft::WRL::ComPtr<ID3D12Resource>>>
+      retained_upload_buffers_;
+
+  // Direct resolve (gpu_direct_resolve): textures that may receive one, by
+  // guest base address.
+  std::unordered_multimap<uint32_t, D3D12Texture*> direct_resolve_targets_;
+  // Direct resolves whose data is only in the texture, not in the guest memory
+  // copy yet - written there (MaterializeDirectResolve) before anything else
+  // reads the range (SharedMemory::RequestRanges).
+  struct DirectResolveStencil;
+  struct PendingDirectResolve {
+    uint32_t start;
+    uint32_t length;
+    // Null once the texture object is destroyed (the resource is kept).
+    D3D12Texture* texture;
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+    D3D12_RESOURCE_STATES orphan_state;
+    uint32_t guest_offset;
+    uint32_t pitch_aligned;
+    uint32_t width;
+    uint32_t height;
+    // Texel of the texture with the data (a part of the texture: predicated
+    // tiling resolves it in strips), and whether it's not the whole texture.
+    uint32_t texture_x = 0;
+    uint32_t texture_y = 0;
+    bool partial = false;
+    uint32_t endian;
+    // Resolution scale of the data (above 1, it goes to the scaled resolve
+    // memory, in its layout, rather than to the guest memory copy).
+    uint32_t scale_x;
+    uint32_t scale_y;
+    // A k_32_FLOAT (R32_FLOAT) texture rather than a k_8_8_8_8 one.
+    bool float32;
+    // A k_24_8 (R32_FLOAT) texture with the stencil in `stencil`.
+    bool depth24 = false;
+    // k_24_8_FLOAT rather than k_24_8.
+    bool depth_float = false;
+    std::shared_ptr<DirectResolveStencil> stencil;
+  };
+  std::vector<PendingDirectResolve> pending_direct_resolves_;
+  // k_24_8 direct resolves: the stencil of the resolve, per texture (R8_UINT).
+  struct DirectResolveStencil {
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+    D3D12_RESOURCE_STATES state;
+    uint32_t width;
+    uint32_t height;
+  };
+  std::unordered_map<const D3D12Texture*, std::shared_ptr<DirectResolveStencil>>
+      direct_resolve_stencils_;
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> direct_resolve_depth_root_signature_;
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> texture_store_depth_root_signature_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> direct_resolve_depth_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> texture_store_depth_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> texture_store_depth_scaled_pipeline_;
+  void TransitionDirectResolveStencil(DirectResolveStencil& stencil,
+                                      D3D12_RESOURCE_STATES new_state);
+  bool direct_resolve_write_out_blocked_ = false;
+  uint64_t direct_resolve_write_out_blocked_count_ = 0;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> texture_store_scaled_pipeline_;
+  // k_32_FLOAT render targets and textures (null if not supported).
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> direct_resolve_f32_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> texture_store_f32_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> texture_store_f32_scaled_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> direct_resolve_pipeline_;
+  // Multisampled sources, kD24FS8 depth (DirectResolveSource).
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> direct_resolve_ms_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> direct_resolve_depth_ms_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> direct_resolve_depth_f24_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> direct_resolve_depth_f24_ms_pipeline_;
+  // While a direct resolve writes a part of a texture: the other parts of the
+  // same texture that are pending aren't written out (MaterializeDirectResolves).
+  const D3D12Texture* direct_resolve_keep_texture_ = nullptr;
+  uint32_t direct_resolve_keep_rect_[4] = {};
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> texture_store_pipeline_;
+  void MaterializeDirectResolves(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
+  void MaterializeDirectResolve(PendingDirectResolve& pending);
+  void RetainUntilSubmissionCompleted(Microsoft::WRL::ComPtr<ID3D12Resource> resource);
 };
 
 }  // namespace rex::graphics::d3d12

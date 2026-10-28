@@ -1402,7 +1402,15 @@ void DxbcShaderTranslator::ProcessTextureFetchInstruction(
       // Will be allocated for computed LOD only, and if not using basemap mip
       // filter.
       uint32_t grad_v_temp = UINT32_MAX;
-      if (instr.attributes.mip_filter != xenos::TextureFilter::kBaseMap) {
+      // Without anything the level of detail could choose (see
+      // Modification::PixelShaderModification::lod_free_fetch_mask), sampled
+      // at LOD 0 like with the basemap mip filter - no gradients.
+      bool lod_free = is_pixel_shader() && tfetch_index < 12 &&
+                      ((GetDxbcShaderModification().pixel.lod_free_fetch_mask >> tfetch_index) &
+                       1) &&
+                      (instr.dimension == xenos::FetchOpDimension::k1D ||
+                       instr.dimension == xenos::FetchOpDimension::k2D);
+      if (instr.attributes.mip_filter != xenos::TextureFilter::kBaseMap && !lod_free) {
         grad_h_lod_temp = PushSystemTemp();
         lod_src = dxbc::Src::R(grad_h_lod_temp, dxbc::Src::kWWWW);
         // Accumulate the explicit LOD sources (in D3D11.3 specification order:

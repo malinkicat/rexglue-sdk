@@ -29,6 +29,7 @@
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
@@ -65,6 +66,12 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DECLARE(bool, gpu_skip_overwritten_transfers);
+
+REXCVAR_DEFINE_BOOL(gpu_lod_free_texture_fetches, true, "GPU",
+                    "Pixel shaders sample textures that have a single mip level, the same "
+                    "minification and magnification filter and no anisotropic filtering at LOD 0 "
+                    "instead of computing gradients (the same result, less shader work)");
 namespace rex::graphics::d3d12 {
 
 // Generated with `xb buildshaders`.
@@ -2311,6 +2318,75 @@ Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_
   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);
 }
 
+uint32_t D3D12CommandProcessor::GetLodFreeFetchMask(const D3D12Shader& pixel_shader) {
+  // Texture fetches whose result can't depend on the level of detail: 1D / 2D,
+  // a single mip level in the fetch constant and in the texture actually bound
+  // (a texture pack replacement may have more), the same minification and
+  // magnification filter (only one level - the level of detail would only
+  // choose between them), no anisotropic filtering (it uses the gradients
+  // even with one level). As in D3D12TextureCache::GetSamplerParameters.
+  const RegisterFile& regs = *register_file_;
+  uint32_t candidates = 0, lod_dependent = 0;
+  for (const Shader::TextureBinding& binding : pixel_shader.texture_bindings()) {
+    const uint32_t fetch_constant = binding.fetch_constant;
+    if (fetch_constant >= 12) {
+      continue;
+    }
+    const ParsedTextureFetchInstruction& fetch_instr = binding.fetch_instr;
+    if (fetch_instr.opcode != ucode::FetchOpcode::kTextureFetch) {
+      continue;
+    }
+    const uint32_t fetch_constant_bit = uint32_t(1) << fetch_constant;
+    bool lod_free = fetch_instr.dimension == xenos::FetchOpDimension::k1D ||
+                    fetch_instr.dimension == xenos::FetchOpDimension::k2D;
+    if (lod_free) {
+      xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(fetch_constant);
+      xenos::TextureFilter mag_filter =
+          fetch_instr.attributes.mag_filter == xenos::TextureFilter::kUseFetchConst
+              ? fetch.mag_filter
+              : fetch_instr.attributes.mag_filter;
+      xenos::TextureFilter min_filter =
+          fetch_instr.attributes.min_filter == xenos::TextureFilter::kUseFetchConst
+              ? fetch.min_filter
+              : fetch_instr.attributes.min_filter;
+      xenos::AnisoFilter aniso_filter =
+          fetch_instr.attributes.aniso_filter == xenos::AnisoFilter::kUseFetchConst
+              ? fetch.aniso_filter
+              : fetch_instr.attributes.aniso_filter;
+      uint32_t mip_min_level, mip_max_level;
+      texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, nullptr,
+                                                     nullptr, &mip_min_level, &mip_max_level);
+      lod_free = mip_max_level == 0 && mip_min_level == 0 &&
+                 aniso_filter == xenos::AnisoFilter::kDisabled &&
+                 (mag_filter == xenos::TextureFilter::kLinear) ==
+                     (min_filter == xenos::TextureFilter::kLinear);
+    }
+    if (lod_free) {
+      candidates |= fetch_constant_bit;
+    } else {
+      lod_dependent |= fetch_constant_bit;
+    }
+  }
+  candidates &= ~lod_dependent;
+  if (!candidates) {
+    return 0;
+  }
+  // The textures that will be bound (requesting them is incremental - the
+  // draw's own request later only adds the rest).
+  SetGpuProfilePass(rex::perf::GpuPass::kTextureLoad);
+  texture_cache_->RequestTextures(candidates);
+  SetGpuProfilePass(rex::perf::GpuPass::kOther);
+  uint32_t lod_free_mask = 0;
+  uint32_t fetch_constant;
+  while (rex::bit_scan_forward(candidates, &fetch_constant)) {
+    candidates &= ~(uint32_t(1) << fetch_constant);
+    if (texture_cache_->IsActiveTextureSingleLevel(fetch_constant)) {
+      lod_free_mask |= uint32_t(1) << fetch_constant;
+    }
+  }
+  return lod_free_mask;
+}
+
 bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
                                       IndexBufferInfo* index_buffer_info,
                                       bool major_mode_explicit) {
@@ -2410,11 +2486,49 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           ? pipeline_cache_->GetCurrentPixelShaderModification(
                 *pixel_shader, interpolator_mask, ps_param_gen_pos, normalized_depth_control)
           : DxbcShaderTranslator::Modification(0);
+  if (pixel_shader && REXCVAR_GET(gpu_lod_free_texture_fetches)) {
+    pixel_shader_modification.pixel.lod_free_fetch_mask = GetLodFreeFetchMask(*pixel_shader);
+  }
 
   // Set up the render targets - this may perform dispatches and draws.
   uint32_t normalized_color_mask =
       pixel_shader ? draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets())
                    : 0;
+  // Color render targets this draw overwrites with no dependency on their old
+  // contents - the render target cache doesn't transfer old data into the
+  // part it certainly covers (gpu_skip_overwritten_transfers).
+  {
+    uint32_t draw_overwritten_color_rts = 0;
+    if (REXCVAR_GET(gpu_skip_overwritten_transfers) && pixel_shader && is_rasterization_done &&
+        !memexport_used && !pixel_shader->kills_pixels() &&
+        render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
+        (!normalized_depth_control.z_enable ||
+         normalized_depth_control.zfunc == xenos::CompareFunction::kAlways) &&
+        !normalized_depth_control.stencil_enable) {
+      auto rb_colorcontrol = regs.Get<reg::RB_COLORCONTROL>();
+      if ((!rb_colorcontrol.alpha_test_enable ||
+           rb_colorcontrol.alpha_func == xenos::CompareFunction::kAlways) &&
+          !rb_colorcontrol.alpha_to_mask_enable) {
+        for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+          if (((normalized_color_mask >> (4 * i)) & 0b1111) != 0b1111) {
+            continue;
+          }
+          auto blend_control =
+              regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]);
+          if (blend_control.color_srcblend == xenos::BlendFactor::kOne &&
+              blend_control.color_destblend == xenos::BlendFactor::kZero &&
+              blend_control.color_comb_fcn == xenos::BlendOp::kAdd &&
+              blend_control.alpha_srcblend == xenos::BlendFactor::kOne &&
+              blend_control.alpha_destblend == xenos::BlendFactor::kZero &&
+              blend_control.alpha_comb_fcn == xenos::BlendOp::kAdd) {
+            draw_overwritten_color_rts |= uint32_t(1) << i;
+          }
+        }
+      }
+    }
+    render_target_cache_->SetDrawOverwrittenColorRenderTargets(draw_overwritten_color_rts);
+  }
+  SetGpuProfilePass(rex::perf::GpuPass::kRenderTargets);
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
     return false;
@@ -2452,6 +2566,35 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (REXCVAR_GET(async_shader_compilation) &&
       pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
     return true;
+  }
+
+  // Direct resolve data (D3D12TextureCache) that the vertex fetches and the
+  // memory exports of this draw may read goes to the guest memory copy now:
+  // from binding the pipeline on, the shared memory requests below must not
+  // record dispatches or change the descriptor heap.
+  if (texture_cache_->HasPendingDirectResolves()) {
+    if (memexport_used) {
+      std::pair<uint32_t, uint32_t> everything(0, SharedMemory::kBufferSize);
+      texture_cache_->WriteOutDirectResolves(&everything, 1);
+    } else {
+      std::pair<uint32_t, uint32_t> vertex_ranges[96];
+      size_t vertex_range_count = 0;
+      const Shader::ConstantRegisterMap& vertex_constant_map =
+          vertex_shader->constant_register_map();
+      for (uint32_t i = 0; i < rex::countof(vertex_constant_map.vertex_fetch_bitmap); ++i) {
+        uint32_t vfetch_bits_remaining = vertex_constant_map.vertex_fetch_bitmap[i];
+        uint32_t j;
+        while (rex::bit_scan_forward(vfetch_bits_remaining, &j)) {
+          vfetch_bits_remaining &= ~(uint32_t(1) << j);
+          xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(i * 32 + j);
+          if (vertex_range_count < rex::countof(vertex_ranges)) {
+            vertex_ranges[vertex_range_count++] =
+                std::make_pair(vfetch_constant.address << 2, vfetch_constant.size << 2);
+          }
+        }
+      }
+      texture_cache_->WriteOutDirectResolves(vertex_ranges, vertex_range_count);
+    }
   }
 
   // Update the textures - this may bind pipelines.
@@ -2527,6 +2670,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     return false;
   }
   // Must not call anything that can change the descriptor heap from now on!
+  struct DirectResolveWriteOutBlock {
+    D3D12TextureCache& texture_cache;
+    explicit DirectResolveWriteOutBlock(D3D12TextureCache& cache) : texture_cache(cache) {
+      texture_cache.SetDirectResolveWriteOutBlocked(true);
+    }
+    ~DirectResolveWriteOutBlock() { texture_cache.SetDirectResolveWriteOutBlocked(false); }
+  } direct_resolve_write_out_block(*texture_cache_);
 
   // Ensure vertex buffers are resident.
   SetGpuProfilePass(rex::perf::GpuPass::kSharedMemory);
@@ -2606,6 +2756,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       return false;
     }
   }
+  texture_cache_->SetDirectResolveWriteOutBlocked(false);
 
   // Primitive topology.
   D3D_PRIMITIVE_TOPOLOGY primitive_topology;
@@ -2668,7 +2819,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         return false;
     }
   }
-  SetGpuProfilePass(memexport_used ? rex::perf::GpuPass::kDrawMemexport : rex::perf::GpuPass::kDraw);
+  rex::perf::GpuPass draw_profile_pass =
+      memexport_used ? rex::perf::GpuPass::kDrawMemexport : rex::perf::GpuPass::kDraw;
+  SetGpuProfilePass(draw_profile_pass);
   if (rex::perf::IsGpuProfiling()) {
     rex::perf::GetGpuProfileStats().draws.fetch_add(1, std::memory_order_relaxed);
   }
@@ -5090,19 +5243,6 @@ constexpr uint64_t kClearDrawPixelShaders[] = {0x2E372EA28CC404B7ull, 0x2B4F1D2C
 
 }  // namespace
 
-// amped3 clear census (temporary): how clear-like draws end, per source line.
-static bool ClearCensusResult(int line) {
-  static std::map<int, uint64_t> counts;
-  static uint64_t total = 0;
-  ++counts[line];
-  if (++total % 1000 == 0) {
-    std::string t;
-    for (auto& [l, c] : counts) t += fmt::format(" {}:{}", l, c);
-    REXGPU_INFO("CLEARCENSUS results (0 = cleared in place){}", t);
-  }
-  return false;
-}
-
 bool D3D12CommandProcessor::TryClearDrawInPlace(const Shader& vertex_shader,
                                                 const Shader* pixel_shader,
                                                 reg::RB_DEPTHCONTROL normalized_depth_control) {
@@ -5123,36 +5263,17 @@ bool D3D12CommandProcessor::TryClearDrawInPlace(const Shader& vertex_shader,
     return false;
   }
   const xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
-  {  // amped3 clear census (temporary)
-    static std::unordered_set<uint64_t> seen;
-    const uint64_t ps = pixel_shader ? pixel_shader->ucode_data_hash() : 0;
-    const uint64_t key = ps ^ (vertex_shader.ucode_data_hash() * 31) ^ (uint64_t(edram_mode) << 60) ^
-                         (uint64_t(normalized_depth_control.value) << 20);
-    if (seen.insert(key).second) {
-      REXGPU_INFO("CLEARCENSUS vs={:016X} ps={:016X} edram={} depthctl={:08X} colormask={:08X} "
-                  "blend0={:08X}",
-                  vertex_shader.ucode_data_hash(), ps, uint32_t(edram_mode),
-                  normalized_depth_control.value, regs[XE_GPU_REG_RB_COLOR_MASK],
-                  regs[XE_GPU_REG_RB_BLENDCONTROL0]);
-      if (pixel_shader) {
-        std::string d;
-        for (uint32_t i = 0; i < pixel_shader->ucode_dword_count(); ++i)
-          d += fmt::format("{:08X} ", pixel_shader->ucode_dwords()[i]);
-        REXGPU_INFO("CLEARCENSUS   ps ucode {}", d);
-      }
-    }
-  }
   if (edram_mode != xenos::EdramMode::kColorDepth && edram_mode != xenos::EdramMode::kDepthOnly) {
-    return ClearCensusResult(__LINE__);
+    return false;
   }
   const auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
   if (!rb_surface_info.surface_pitch || rb_surface_info.msaa_samples > xenos::MsaaSamples::k4X) {
-    return ClearCensusResult(__LINE__);
+    return false;
   }
   // Every sample written.
   if (rb_surface_info.msaa_samples != xenos::MsaaSamples::k1X &&
       (regs[XE_GPU_REG_PA_SC_AA_MASK] & 0xFFFF) != 0xFFFF) {
-    return ClearCensusResult(__LINE__);
+    return false;
   }
 
   // Depth / stencil: always passing and replacing everything, or not used.
@@ -5162,7 +5283,7 @@ bool D3D12CommandProcessor::TryClearDrawInPlace(const Shader& vertex_shader,
   if (depth_control.z_enable || depth_control.stencil_enable) {
     if (!depth_control.z_enable || !depth_control.z_write_enable ||
         depth_control.zfunc != xenos::CompareFunction::kAlways) {
-      return ClearCensusResult(__LINE__);
+      return false;
     }
     depth = true;
     if (depth_control.stencil_enable) {
@@ -5171,7 +5292,7 @@ bool D3D12CommandProcessor::TryClearDrawInPlace(const Shader& vertex_shader,
           (depth_control.stencilzpass != xenos::StencilOp::kReplace &&
            depth_control.stencilzpass != xenos::StencilOp::kZero) ||
           ref_mask.stencilwritemask != 0xFF || depth_control.backface_enable) {
-        return ClearCensusResult(__LINE__);
+        return false;
       }
       stencil = true;
       stencil_value =
@@ -5186,16 +5307,16 @@ bool D3D12CommandProcessor::TryClearDrawInPlace(const Shader& vertex_shader,
     const uint64_t ps_hash = pixel_shader->ucode_data_hash();
     if (std::find(std::begin(kClearDrawPixelShaders), std::end(kClearDrawPixelShaders), ps_hash) ==
         std::end(kClearDrawPixelShaders)) {
-      return ClearCensusResult(__LINE__);
+      return false;
     }
     const uint32_t color_mask =
         draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets());
     if (color_mask & ~uint32_t(0xF)) {
-      return ClearCensusResult(__LINE__);
+      return false;
     }
     if (color_mask) {
       if (color_mask != 0xF) {
-        return ClearCensusResult(__LINE__);
+        return false;
       }
       const auto blend = regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[0]);
       const auto color_control = regs.Get<reg::RB_COLORCONTROL>();
@@ -5208,24 +5329,24 @@ bool D3D12CommandProcessor::TryClearDrawInPlace(const Shader& vertex_shader,
           (color_control.alpha_test_enable &&
            color_control.alpha_func != xenos::CompareFunction::kAlways) ||
           color_control.alpha_to_mask_enable) {
-        return ClearCensusResult(__LINE__);
+        return false;
       }
       const auto color_info = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]);
       if (color_info.color_exp_bias) {
-        return ClearCensusResult(__LINE__);
+        return false;
       }
       color = true;
     }
   } else if (pixel_shader) {
-    return ClearCensusResult(__LINE__);
+    return false;
   }
   if (!depth && !color) {
-    return ClearCensusResult(__LINE__);
+    return false;
   }
 
   // The vertices, through the vertex shader on the CPU.
   if (!ShaderInterpreter::CanInterpretShader(vertex_shader)) {
-    return ClearCensusResult(__LINE__);
+    return false;
   }
   if (!clear_draw_interpreter_) {
     clear_draw_interpreter_ = std::make_unique<ShaderInterpreter>(regs, *memory_);
@@ -5266,14 +5387,14 @@ bool D3D12CommandProcessor::TryClearDrawInPlace(const Shader& vertex_shader,
   }
   interpreter.SetExportSink(nullptr);
   if (!vertices_valid) {
-    return ClearCensusResult(__LINE__);
+    return false;
   }
   // An axis-aligned rectangle with edges between pixels.
   float x_min = std::min({x[0], x[1], x[2]}), x_max = std::max({x[0], x[1], x[2]});
   float y_min = std::min({y[0], y[1], y[2]}), y_max = std::max({y[0], y[1], y[2]});
   for (uint32_t i = 0; i < 3; ++i) {
     if ((x[i] != x_min && x[i] != x_max) || (y[i] != y_min && y[i] != y_max)) {
-      return ClearCensusResult(__LINE__);
+      return false;
     }
   }
   // Pixel centers at integers with kD3DZero, at .5 otherwise.
@@ -5286,7 +5407,7 @@ bool D3D12CommandProcessor::TryClearDrawInPlace(const Shader& vertex_shader,
   if (!(x_min >= -8192.0f && x_max <= 16384.0f && y_min >= -8192.0f && y_max <= 16384.0f) ||
       x_min != std::floor(x_min) || x_max != std::floor(x_max) || y_min != std::floor(y_min) ||
       y_max != std::floor(y_max)) {
-    return ClearCensusResult(__LINE__);
+    return false;
   }
   int32_t rect_x0 = int32_t(x_min), rect_x1 = int32_t(x_max);
   int32_t rect_y0 = int32_t(y_min), rect_y1 = int32_t(y_max);
@@ -5306,7 +5427,7 @@ bool D3D12CommandProcessor::TryClearDrawInPlace(const Shader& vertex_shader,
   rect_x1 = std::min(rect_x1, int32_t(rb_surface_info.surface_pitch));
   if (rect_x1 <= rect_x0 || rect_y1 <= rect_y0) {
     // Nothing drawn - leave it to the normal path.
-    return ClearCensusResult(__LINE__);
+    return false;
   }
 
   D3D12RenderTargetCache::DrawnClear clear;
@@ -5333,7 +5454,7 @@ bool D3D12CommandProcessor::TryClearDrawInPlace(const Shader& vertex_shader,
       if (z[0] < 0.0f && z[0] > -1.0e-6f) {
         clear.depth_value = 0.0f;
       } else {
-        return ClearCensusResult(__LINE__);
+        return false;
       }
     }
   }
@@ -5346,28 +5467,11 @@ bool D3D12CommandProcessor::TryClearDrawInPlace(const Shader& vertex_shader,
   }
   GpuProfilePassScope pass_scope(*this, rex::perf::GpuPass::kResolveClear);
   if (!render_target_cache_->ClearDrawnInPlace(clear)) {
-    static std::unordered_set<uint64_t> seen_fail;
-    const uint64_t k = uint64_t(clear.color_format) | uint64_t(clear.depth_format) << 8 |
-                       uint64_t(clear.msaa_samples) << 16 | uint64_t(clear.color) << 20 |
-                       uint64_t(clear.depth) << 21 | uint64_t(clear.stencil) << 22 |
-                       uint64_t(clear.pitch_tiles_at_32bpp) << 24 | uint64_t(clear.x1) << 34 |
-                       uint64_t(clear.y1) << 48;
-    if (seen_fail.insert(k).second) {
-      REXGPU_INFO("CLEARCENSUS fail: color={} fmt={} cbase={} depth={} stencil={}({}) dfmt={} "
-                  "dbase={} z={} msaa={} pitch={} rect=({},{})-({},{}) rgba=({} {} {} {})",
-                  clear.color, uint32_t(clear.color_format), clear.color_base, clear.depth,
-                  clear.stencil, clear.stencil_value, uint32_t(clear.depth_format),
-                  clear.depth_base, clear.depth_value, uint32_t(clear.msaa_samples),
-                  clear.pitch_tiles_at_32bpp, clear.x0, clear.y0, clear.x1, clear.y1,
-                  clear.color_value[0], clear.color_value[1], clear.color_value[2],
-                  clear.color_value[3]);
-    }
-    return ClearCensusResult(__LINE__);
+    return false;
   }
   if (rex::perf::IsGpuProfiling()) {
     rex::perf::GetGpuProfileStats().clears_in_place.fetch_add(1, std::memory_order_relaxed);
   }
-  ClearCensusResult(0);
   return true;
 }
 

@@ -171,6 +171,15 @@ class RenderTargetCache {
 
   virtual void BeginFrame();
 
+  // For the next Update only: color render targets (bit i = color render
+  // target i) that the draw overwrites entirely - every sample it covers, with
+  // no dependency on the old contents (no blending, all components written, no
+  // pixel shader kill or alpha test, depth / stencil tests always passing). The
+  // ownership transfers into the parts of them that the draw certainly covers
+  // (EstimateCoveredRectangle) are dropped (gpu_skip_overwritten_transfers).
+  void SetDrawOverwrittenColorRenderTargets(uint32_t color_rt_bits) {
+    draw_overwritten_color_rts_ = color_rt_bits;
+  }
   virtual bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
                       uint32_t normalized_color_mask, const Shader& vertex_shader);
 
@@ -293,12 +302,23 @@ class RenderTargetCache {
     RenderTarget(RenderTarget&& render_target) = delete;
     RenderTarget& operator=(RenderTarget&& render_target) = delete;
     RenderTargetKey key() const { return key_; }
+    // Changes whenever the host render target may have been written (bound for
+    // a draw, transferred into, cleared), unique across all render targets
+    // ever created - lets a backend skip dumping contents it has already
+    // dumped and that are unchanged.
+    uint64_t write_stamp() const { return write_stamp_; }
+    void MarkWritten() { write_stamp_ = NextWriteStamp(); }
 
    protected:
-    RenderTarget(RenderTargetKey key) : key_(key) {}
+    RenderTarget(RenderTargetKey key) : key_(key), write_stamp_(NextWriteStamp()) {}
 
    private:
+    static uint64_t NextWriteStamp() {
+      static uint64_t next_write_stamp = 0;
+      return ++next_write_stamp;
+    }
     RenderTargetKey key_;
+    uint64_t write_stamp_;
   };
 
   struct Transfer {
@@ -707,6 +727,11 @@ class RenderTargetCache {
   // render targets. They are reordered so for one source, all transfers are
   // consecutive in the array.
   std::vector<Transfer> last_update_transfers_[1 + xenos::kMaxColorRenderTargets];
+  uint32_t draw_overwritten_color_rts_ = 0;
+  // Removes the tiles inside the rectangle (guest pixels) from the transfers.
+  static void DropTransfersInRectangle(RenderTargetKey dest,
+                                       const DrawExtentEstimator::Rectangle& rectangle,
+                                       std::vector<Transfer>& transfers);
 };
 
 }  // namespace rex::graphics

@@ -197,6 +197,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   // Returns the text to display in the GPU backend name in the window title.
   std::string GetWindowTitleText() const;
 
+  // DxbcShaderTranslator::Modification::PixelShaderModification::
+  // lod_free_fetch_mask for the current draw (may request textures).
+  uint32_t GetLodFreeFetchMask(const D3D12Shader& pixel_shader);
   // gpu_profile: the part of the frame the next recorded commands belong to.
   void SetGpuProfilePass(rex::perf::GpuPass pass) {
     deferred_command_list_.SetProfilePass(uint8_t(pass));

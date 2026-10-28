@@ -74,6 +74,17 @@ class TextureCache {
     return draw_resolution_scale_x_ > 1 || draw_resolution_scale_y_ > 1;
   }
 
+  // Rendering below 1x (draw_resolution_percent) is not ported: always 100.
+  uint32_t draw_resolution_percent() const { return 100; }
+  bool IsDrawResolutionDownscaled() const { return false; }
+  static uint32_t DownscaleFloor(uint32_t value, uint32_t) { return value; }
+  static uint32_t DownscaleCeil(uint32_t value, uint32_t) { return value; }
+  // For backends marking textures up to date outside loading.
+  std::unique_lock<std::recursive_mutex> AcquireGlobalLock() {
+    return global_critical_region_.Acquire();
+  }
+
+
   virtual void ClearCache();
 
   virtual void CompletedSubmissionUpdated(uint64_t completed_submission_index);
@@ -120,6 +131,17 @@ class TextureCache {
   uint8_t GetActiveTextureSwizzledSigns(uint32_t fetch_constant_index) const {
     const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
     return binding ? binding->swizzled_signs : kSwizzledSignsUnsigned;
+  }
+  // After RequestTextures for the fetch constant: whether the textures bound
+  // to it have a single mip level (a texture pack replacement may have mips
+  // the game's texture doesn't).
+  bool IsActiveTextureSingleLevel(uint32_t fetch_constant_index) const {
+    const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
+    if (!binding || !binding->texture) {
+      return false;
+    }
+    return !binding->texture->key().mip_max_level &&
+           (!binding->texture_signed || !binding->texture_signed->key().mip_max_level);
   }
   bool IsActiveTextureResolutionScaled(uint32_t fetch_constant_index) const {
     const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);

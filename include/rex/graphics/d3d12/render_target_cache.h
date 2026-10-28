@@ -743,12 +743,47 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   std::vector<DumpInvocation> dump_invocations_;
   std::vector<ResolveCopyDispatch> direct_resolve_dispatches_;
 
+  // Rectangles dumped to the EDRAM buffer that are still there unchanged: a
+  // resolve of the same render target contents (the game often copies one
+  // render target to several places with no draws in between) skips its dump.
+  // A record stays valid while the render target's write stamp is the same and
+  // no other dump (or other EDRAM buffer write) overlapped its tiles.
+  struct DumpRecord {
+    const RenderTarget* render_target;
+    uint64_t write_stamp;
+    uint32_t dump_base;
+    uint32_t dump_pitch;
+    uint32_t dump_row_length_used;
+    uint32_t row_first;
+    uint32_t rows;
+    uint32_t row_first_start;
+    uint32_t row_last_end;
+    // EDRAM tiles the dump may have written, [tile_first, tile_end), tile_end
+    // may be beyond the EDRAM size (addressing wraps).
+    uint32_t tile_first;
+    uint32_t tile_end;
+  };
+  std::vector<DumpRecord> dump_records_;
+  // Direct resolve to a texture (gpu_direct_resolve, D3D12TextureCache).
+  bool TryDirectResolveToTexture(const draw_util::ResolveInfo& resolve_info,
+                                 draw_util::ResolveCopyShaderIndex copy_shader,
+                                 bool draw_resolution_scaled, D3D12TextureCache& texture_cache);
+  std::vector<ResolveCopyDumpRectangle> direct_texture_rectangles_;
+  uint64_t direct_texture_resolves_ = 0;
+  void InvalidateDumpRecords() { dump_records_.clear(); }
+  uint64_t dumps_skipped_ = 0;
+
   ID3D12RootSignature* dump_root_signature_color_ = nullptr;
   ID3D12RootSignature* dump_root_signature_depth_ = nullptr;
   // Compute pipelines for copying host render target contents to the EDRAM
   // buffer. May be null if failed to create.
   std::unordered_map<DumpPipelineKey, ID3D12PipelineState*, DumpPipelineKey::Hasher>
       dump_pipelines_;
+  // Single-sampled, 4 / 8 samples per thread (gpu_dump_samples_per_thread).
+  std::unordered_map<DumpPipelineKey, ID3D12PipelineState*, DumpPipelineKey::Hasher>
+      dump_pipelines_x4_;
+  std::unordered_map<DumpPipelineKey, ID3D12PipelineState*, DumpPipelineKey::Hasher>
+      dump_pipelines_x8_;
   ID3D12RootSignature* direct_resolve_root_signature_color_ = nullptr;
   ID3D12RootSignature* direct_resolve_root_signature_depth_ = nullptr;
   std::unordered_map<DirectResolvePipelineKey, ID3D12PipelineState*,

@@ -11,6 +11,7 @@
  */
 
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -78,6 +79,13 @@ class SharedMemory {
   // the range has been fully updated and is usable.
   bool RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
   bool RequestRange(uint32_t start, uint32_t length);
+  // Called by RequestRanges with the (merged) ranges before anything else - for
+  // GPU data that is written to the shared memory only when it's needed.
+  using BeforeRangesRequestedCallback =
+      std::function<void(const std::pair<uint32_t, uint32_t>* ranges, size_t count)>;
+  void SetBeforeRangesRequestedCallback(BeforeRangesRequestedCallback callback) {
+    before_ranges_requested_ = std::move(callback);
+  }
 
   // Marks the range and, if not exact_range, potentially its surroundings
   // (to up to the first GPU-written page, as an access violation exception
@@ -141,6 +149,7 @@ class SharedMemory {
       const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) = 0;
 
  private:
+  BeforeRangesRequestedCallback before_ranges_requested_;
   memory::Memory& memory_;
 
   // Log2 of invalidation granularity (the system page size, but the dependency

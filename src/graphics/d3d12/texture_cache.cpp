@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <map>
 #include <array>
 #include <cfloat>
 #include <cstddef>
@@ -32,9 +33,30 @@
 #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
+REXCVAR_DECLARE(int32_t, gpu_debug_log_draws);
+REXCVAR_DEFINE_BOOL(gpu_debug_direct_resolve_write_out, false, "GPU/Debug",
+                    "Direct resolves: write every one out to memory right away and load the "
+                    "texture from there (tests the write out)");
+REXCVAR_DEFINE_STRING(gpu_debug_direct_resolve_exclude, "", "GPU/Debug",
+                      "Comma-separated destination addresses (hex) not resolved directly");
+
 namespace rex::graphics::d3d12 {
 
 // Generated with `xb buildshaders`.
+REXCVAR_DEFINE_BOOL(gpu_texture_load_to_texture, true, "GPU",
+                    "Load 2D single-level RGBA8 textures (copies of render targets the game "
+                    "reads every frame) straight into the texture, without a copy through a "
+                    "buffer - less memory traffic on slow GPUs. For textures created after a "
+                    "change.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(gpu_direct_resolve, true, "GPU",
+                    "Resolves of RGBA8 render targets the game reads back as textures: copy the "
+                    "render target straight into the texture (the guest memory gets the data "
+                    "only if something else reads it) - skips the EDRAM buffer and texture "
+                    "loading round trip. 1x resolution only.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/texture_load_128bpb_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/texture_load_128bpb_scaled_cs.h"
@@ -42,6 +64,20 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/texture_load_16bpb_scaled_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/texture_load_32bpb_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/texture_load_32bpb_scaled_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/texture_load_32bpb_to_texture_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_rt_to_texture_8888_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_rt_to_texture_8888_ms_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/texture_store_32bpb_tiled_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/texture_store_32bpb_tiled_scaled_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_rt_to_texture_f32_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/texture_store_f32_tiled_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/texture_store_f32_tiled_scaled_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_depth_to_texture_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_depth_to_texture_f24_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_depth_to_texture_f24_ms_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/resolve_depth_to_texture_ms_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/texture_store_depth24_tiled_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/texture_store_depth24_tiled_scaled_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/texture_load_64bpb_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/texture_load_64bpb_scaled_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/texture_load_8bpb_cs.h"
@@ -374,6 +410,8 @@ D3D12TextureCache::D3D12TextureCache(const RegisterFile& register_file,
       bindless_resources_used_(bindless_resources_used) {}
 
 D3D12TextureCache::~D3D12TextureCache() {
+  shared_memory().SetBeforeRangesRequestedCallback(nullptr);
+  pending_direct_resolves_.clear();
   // While the texture descriptor cache still exists (referenced by
   // ~D3D12Texture), destroy all textures.
   DestroyAllTextures(true);
@@ -591,6 +629,166 @@ bool D3D12TextureCache::Initialize() {
     }
   }
 
+  // Loading straight into R8G8B8A8 textures (optional - the buffer and copy
+  // way is used without it).
+  {
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT uint_uav_support = {};
+    uint_uav_support.Format = DXGI_FORMAT_R8G8B8A8_UINT;
+    if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &uint_uav_support,
+                                              sizeof(uint_uav_support))) &&
+        (uint_uav_support.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) &&
+        (uint_uav_support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE)) {
+      *(load_pipeline_32bpb_to_texture_.ReleaseAndGetAddressOf()) =
+          ui::d3d12::util::CreateComputePipeline(device, shaders::texture_load_32bpb_to_texture_cs,
+                                                 sizeof(shaders::texture_load_32bpb_to_texture_cs),
+                                                 load_root_signature_.Get());
+    }
+    if (!load_pipeline_32bpb_to_texture_) {
+      REXGPU_WARN(
+          "D3D12TextureCache: R8G8B8A8 textures are loaded through a buffer (no typed unordered "
+          "access to R8G8B8A8_UINT)");
+    } else {
+      *(direct_resolve_pipeline_.ReleaseAndGetAddressOf()) =
+          ui::d3d12::util::CreateComputePipeline(device, shaders::resolve_rt_to_texture_8888_cs,
+                                                 sizeof(shaders::resolve_rt_to_texture_8888_cs),
+                                                 load_root_signature_.Get());
+      *(direct_resolve_ms_pipeline_.ReleaseAndGetAddressOf()) =
+          ui::d3d12::util::CreateComputePipeline(device, shaders::resolve_rt_to_texture_8888_ms_cs,
+                                                 sizeof(shaders::resolve_rt_to_texture_8888_ms_cs),
+                                                 load_root_signature_.Get());
+      *(texture_store_pipeline_.ReleaseAndGetAddressOf()) =
+          ui::d3d12::util::CreateComputePipeline(device, shaders::texture_store_32bpb_tiled_cs,
+                                                 sizeof(shaders::texture_store_32bpb_tiled_cs),
+                                                 load_root_signature_.Get());
+      *(texture_store_scaled_pipeline_.ReleaseAndGetAddressOf()) =
+          ui::d3d12::util::CreateComputePipeline(
+              device, shaders::texture_store_32bpb_tiled_scaled_cs,
+              sizeof(shaders::texture_store_32bpb_tiled_scaled_cs), load_root_signature_.Get());
+      *(direct_resolve_f32_pipeline_.ReleaseAndGetAddressOf()) =
+          ui::d3d12::util::CreateComputePipeline(device, shaders::resolve_rt_to_texture_f32_cs,
+                                                 sizeof(shaders::resolve_rt_to_texture_f32_cs),
+                                                 load_root_signature_.Get());
+      *(texture_store_f32_pipeline_.ReleaseAndGetAddressOf()) =
+          ui::d3d12::util::CreateComputePipeline(device, shaders::texture_store_f32_tiled_cs,
+                                                 sizeof(shaders::texture_store_f32_tiled_cs),
+                                                 load_root_signature_.Get());
+      *(texture_store_f32_scaled_pipeline_.ReleaseAndGetAddressOf()) =
+          ui::d3d12::util::CreateComputePipeline(
+              device, shaders::texture_store_f32_tiled_scaled_cs,
+              sizeof(shaders::texture_store_f32_tiled_scaled_cs), load_root_signature_.Get());
+      if (!direct_resolve_pipeline_ || !texture_store_pipeline_) {
+        direct_resolve_pipeline_.Reset();
+        texture_store_pipeline_.Reset();
+        texture_store_scaled_pipeline_.Reset();
+      }
+      if (!direct_resolve_pipeline_ || !direct_resolve_f32_pipeline_ ||
+          !texture_store_f32_pipeline_ || !texture_store_f32_scaled_pipeline_) {
+        direct_resolve_f32_pipeline_.Reset();
+        texture_store_f32_pipeline_.Reset();
+        texture_store_f32_scaled_pipeline_.Reset();
+      }
+      // k_24_8 (depth): two sources / destinations - their own root signatures
+      // (single-descriptor tables, bindless descriptors aren't contiguous).
+      if (direct_resolve_pipeline_) {
+        auto create_root_signature = [&](uint32_t srv_count, uint32_t uav_count) {
+          D3D12_ROOT_PARAMETER parameters[5];
+          D3D12_DESCRIPTOR_RANGE ranges[4];
+          uint32_t parameter_count = 0, range_count = 0;
+          D3D12_ROOT_PARAMETER& constants_parameter = parameters[parameter_count++];
+          constants_parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+          constants_parameter.Constants.ShaderRegister = 0;
+          constants_parameter.Constants.RegisterSpace = 0;
+          constants_parameter.Constants.Num32BitValues = sizeof(LoadConstants) / sizeof(uint32_t);
+          constants_parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+          // 1 - t0, 2 - u0, 3 - t1, 4 - u1.
+          for (uint32_t i = 0; i < 2; ++i) {
+            for (uint32_t uav = 0; uav < 2; ++uav) {
+              if (i >= (uav ? uav_count : srv_count)) {
+                continue;
+              }
+              D3D12_DESCRIPTOR_RANGE& range = ranges[range_count++];
+              range.RangeType =
+                  uav ? D3D12_DESCRIPTOR_RANGE_TYPE_UAV : D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+              range.NumDescriptors = 1;
+              range.BaseShaderRegister = i;
+              range.RegisterSpace = 0;
+              range.OffsetInDescriptorsFromTableStart = 0;
+              D3D12_ROOT_PARAMETER& parameter = parameters[parameter_count++];
+              parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+              parameter.DescriptorTable.NumDescriptorRanges = 1;
+              parameter.DescriptorTable.pDescriptorRanges = &range;
+              parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+            }
+          }
+          D3D12_ROOT_SIGNATURE_DESC desc;
+          desc.NumParameters = parameter_count;
+          desc.pParameters = parameters;
+          desc.NumStaticSamplers = 0;
+          desc.pStaticSamplers = nullptr;
+          desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+          Microsoft::WRL::ComPtr<ID3D12RootSignature> root_signature;
+          *(root_signature.ReleaseAndGetAddressOf()) =
+              ui::d3d12::util::CreateRootSignature(provider, desc);
+          return root_signature;
+        };
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT r8_uint_support = {};
+        r8_uint_support.Format = DXGI_FORMAT_R8_UINT;
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT r32_float_support = {};
+        r32_float_support.Format = DXGI_FORMAT_R32_FLOAT;
+        if (SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &r8_uint_support,
+                                                  sizeof(r8_uint_support))) &&
+            (r8_uint_support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) &&
+            SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT,
+                                                  &r32_float_support, sizeof(r32_float_support))) &&
+            (r32_float_support.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE)) {
+          direct_resolve_depth_root_signature_ = create_root_signature(2, 2);
+          texture_store_depth_root_signature_ = create_root_signature(2, 1);
+        }
+        if (direct_resolve_depth_root_signature_ && texture_store_depth_root_signature_) {
+          *(direct_resolve_depth_pipeline_.ReleaseAndGetAddressOf()) =
+              ui::d3d12::util::CreateComputePipeline(
+                  device, shaders::resolve_depth_to_texture_cs,
+                  sizeof(shaders::resolve_depth_to_texture_cs),
+                  direct_resolve_depth_root_signature_.Get());
+          auto create_depth = [&](const void* bytecode, size_t size) {
+            return ui::d3d12::util::CreateComputePipeline(
+                device, bytecode, size, direct_resolve_depth_root_signature_.Get());
+          };
+          *(direct_resolve_depth_ms_pipeline_.ReleaseAndGetAddressOf()) =
+              create_depth(shaders::resolve_depth_to_texture_ms_cs,
+                           sizeof(shaders::resolve_depth_to_texture_ms_cs));
+          *(direct_resolve_depth_f24_pipeline_.ReleaseAndGetAddressOf()) =
+              create_depth(shaders::resolve_depth_to_texture_f24_cs,
+                           sizeof(shaders::resolve_depth_to_texture_f24_cs));
+          *(direct_resolve_depth_f24_ms_pipeline_.ReleaseAndGetAddressOf()) =
+              create_depth(shaders::resolve_depth_to_texture_f24_ms_cs,
+                           sizeof(shaders::resolve_depth_to_texture_f24_ms_cs));
+          *(texture_store_depth_pipeline_.ReleaseAndGetAddressOf()) =
+              ui::d3d12::util::CreateComputePipeline(
+                  device, shaders::texture_store_depth24_tiled_cs,
+                  sizeof(shaders::texture_store_depth24_tiled_cs),
+                  texture_store_depth_root_signature_.Get());
+          *(texture_store_depth_scaled_pipeline_.ReleaseAndGetAddressOf()) =
+              ui::d3d12::util::CreateComputePipeline(
+                  device, shaders::texture_store_depth24_tiled_scaled_cs,
+                  sizeof(shaders::texture_store_depth24_tiled_scaled_cs),
+                  texture_store_depth_root_signature_.Get());
+        }
+        if (!direct_resolve_depth_pipeline_ || !texture_store_depth_pipeline_ ||
+            !texture_store_depth_scaled_pipeline_) {
+          direct_resolve_depth_pipeline_.Reset();
+          texture_store_depth_pipeline_.Reset();
+          texture_store_depth_scaled_pipeline_.Reset();
+        }
+      }
+    }
+  }
+  // Direct resolve data goes to the guest memory copy before it's read.
+  shared_memory().SetBeforeRangesRequestedCallback(
+      [this](const std::pair<uint32_t, uint32_t>* ranges, size_t count) {
+        MaterializeDirectResolves(ranges, count);
+      });
+
   srv_descriptor_cache_allocated_ = 0;
 
   // Create a heap with null SRV descriptors, since it's faster to copy a
@@ -646,6 +844,12 @@ bool D3D12TextureCache::Initialize() {
 }
 
 void D3D12TextureCache::ClearCache() {
+  // The textures go away - their direct resolve data to the guest memory first.
+  while (!pending_direct_resolves_.empty()) {
+    PendingDirectResolve pending = std::move(pending_direct_resolves_.back());
+    pending_direct_resolves_.pop_back();
+    MaterializeDirectResolve(pending);
+  }
   TextureCache::ClearCache();
 
   // Clear texture descriptor cache.
@@ -1419,11 +1623,30 @@ D3D12TextureCache::D3D12Texture::D3D12Texture(D3D12TextureCache& texture_cache,
       resource_state_(resource_state) {
   ID3D12Device* device = texture_cache.command_processor_.GetD3D12Provider().GetDevice();
   D3D12_RESOURCE_DESC resource_desc = resource_->GetDesc();
+  resource_desc_flags_uav_ =
+      (resource_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
   SetHostMemoryUsage(device->GetResourceAllocationInfo(0, 1, &resource_desc).SizeInBytes);
 }
 
 D3D12TextureCache::D3D12Texture::~D3D12Texture() {
   auto& d3d12_texture_cache = static_cast<D3D12TextureCache&>(texture_cache());
+  if (resource_desc_flags_uav_) {
+    auto range = d3d12_texture_cache.direct_resolve_targets_.equal_range(key().base_page << 12);
+    for (auto it = range.first; it != range.second; ++it) {
+      if (it->second == this) {
+        d3d12_texture_cache.direct_resolve_targets_.erase(it);
+        break;
+      }
+    }
+    for (PendingDirectResolve& pending : d3d12_texture_cache.pending_direct_resolves_) {
+      if (pending.texture == this) {
+        pending.texture = nullptr;
+        pending.orphan_state = resource_state_;
+      }
+    }
+    // Pending write outs keep their reference.
+    d3d12_texture_cache.direct_resolve_stencils_.erase(this);
+  }
   for (const auto& descriptor_pair : srv_descriptors_) {
     d3d12_texture_cache.ReleaseTextureDescriptor(descriptor_pair.second);
   }
@@ -1542,8 +1765,11 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
   desc.SampleDesc.Quality = 0;
   desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
   // Untiling through a buffer instead of using unordered access because copying
-  // is not done that often.
-  desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+  // is not done that often - except for single-level RGBA8 2D textures, mostly
+  // copies of render targets the game reads every frame (IsLoadToTextureKey).
+  desc.Flags = (IsLoadToTextureKey(key) || IsDirectResolveTargetKey(key))
+                   ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+                   : D3D12_RESOURCE_FLAG_NONE;
   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
   ID3D12Device* device = provider.GetDevice();
   // Assuming untiling will be the next operation.
@@ -1554,13 +1780,689 @@ std::unique_ptr<TextureCache::Texture> D3D12TextureCache::CreateTexture(TextureK
                                              resource_state, nullptr, IID_PPV_ARGS(&resource)))) {
     return nullptr;
   }
-  return std::unique_ptr<Texture>(new D3D12Texture(*this, key, resource.Get(), resource_state));
+  auto texture = std::make_unique<D3D12Texture>(*this, key, resource.Get(), resource_state);
+  if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) {
+    direct_resolve_targets_.emplace(key.base_page << 12, texture.get());
+  }
+  return texture;
+}
+
+bool D3D12TextureCache::DirectResolveToTexture(
+    D3D12_CPU_DESCRIPTOR_HANDLE render_target_srv, uint32_t origin_x, uint32_t origin_y,
+    uint32_t width, uint32_t height, uint32_t dest_base, uint32_t dest_pitch_aligned,
+    uint32_t dest_endian, bool swap_red_blue, uint32_t extent_start, uint32_t extent_length,
+    uint32_t fill_x, uint32_t fill_y, bool float32, bool depth24,
+    D3D12_CPU_DESCRIPTOR_HANDLE stencil_srv, const DirectResolveSource* source) {
+  const DirectResolveSource single_sampled;
+  if (!source) {
+    source = &single_sampled;
+  }
+  // Above 1x, the origin and the size are in host pixels, and the data goes to
+  // the scaled resolve memory when it's needed elsewhere.
+  const bool upscaled = IsDrawResolutionScaled();
+  const uint32_t scale_x = upscaled ? draw_resolution_scale_x() : 1;
+  const uint32_t scale_y = upscaled ? draw_resolution_scale_y() : 1;
+  if (!direct_resolve_pipeline_ || !REXCVAR_GET(gpu_direct_resolve) ||
+      !REXCVAR_GET(gpu_texture_load_to_texture) || !extent_length ||
+      (upscaled && (!texture_store_scaled_pipeline_ || scale_x > 7 || scale_y > 7)) ||
+      (float32 && (!direct_resolve_f32_pipeline_ || swap_red_blue)) ||
+      (depth24 && (!direct_resolve_depth_pipeline_ || swap_red_blue || float32 ||
+                   !stencil_srv.ptr)) ||
+      (source->msaa && (float32 || (depth24 ? !direct_resolve_depth_ms_pipeline_
+                                            : !direct_resolve_ms_pipeline_))) ||
+      (source->float24 && !depth24)) {
+    return false;
+  }
+  {
+    const std::string& exclude = REXCVAR_GET(gpu_debug_direct_resolve_exclude);
+    size_t pos = 0;
+    while (pos < exclude.size()) {
+      size_t end = exclude.find(',', pos);
+      if (end == std::string::npos) {
+        end = exclude.size();
+      }
+      if (std::strtoul(exclude.substr(pos, end - pos).c_str(), nullptr, 16) == dest_base) {
+        return false;
+      }
+      pos = end + 1;
+    }
+  }
+  // The texture sampling the destination: the same place, format, pitch and
+  // byte order, the whole texture written by this resolve (the resolve may
+  // only be larger by its 8-pixel alignment).
+  // Or, a part of an up-to-date texture (predicated tiling resolves 32x32-tile
+  // aligned strips of one texture, the destination base advanced by the
+  // tiles): the rest of the texture stays as it is. dest_x / dest_y - the
+  // texel the resolve starts at, write_width / write_height - its part.
+  D3D12Texture* target = nullptr;
+  uint32_t target_width = 0, target_height = 0;
+  uint32_t dest_x = 0, dest_y = 0, write_width = 0, write_height = 0;
+  const uint32_t pitch_tiles = dest_pitch_aligned >> 5;
+  for (auto it = direct_resolve_targets_.begin();
+       !target && pitch_tiles && it != direct_resolve_targets_.end(); ++it) {
+    D3D12Texture* texture = it->second;
+    const uint32_t texture_base = texture->key().base_page << 12;
+    if (texture_base > dest_base || ((dest_base - texture_base) & 4095) || float32) {
+      if (texture_base != dest_base) {
+        continue;
+      }
+    }
+    TextureKey key = texture->key();
+    if (key.format != (depth24   ? (source->dest_float24 ? xenos::TextureFormat::k_24_8_FLOAT
+                                                         : xenos::TextureFormat::k_24_8)
+                       : float32 ? xenos::TextureFormat::k_32_FLOAT
+                                 : xenos::TextureFormat::k_8_8_8_8) ||
+        !key.tiled || key.mip_max_level ||
+        uint32_t(key.endianness) != dest_endian ||
+        key.dimension != xenos::DataDimension::k2DOrStacked || key.GetDepthOrArraySize() != 1) {
+      continue;
+    }
+    const texture_util::TextureGuestLayout& layout = texture->guest_layout();
+    if (!layout.packed_level || layout.base.row_pitch_bytes / 4 != dest_pitch_aligned) {
+      continue;
+    }
+    uint32_t texture_width = key.GetWidth(), texture_height = key.GetHeight();
+    if (key.scaled_resolve != uint32_t(IsDrawResolutionDownscaled() || upscaled)) {
+      continue;
+    }
+    if (key.scaled_resolve) {
+      if (upscaled) {
+        // The scaled stores write 4 guest blocks along X at once.
+        if (texture_width & 3) {
+          continue;
+        }
+        texture_width *= scale_x;
+        texture_height *= scale_y;
+      } else {
+        texture_width = DownscaleCeil(texture_width, draw_resolution_percent());
+        texture_height = DownscaleCeil(texture_height, draw_resolution_percent());
+      }
+    }
+    if (texture_width & 3) {
+      continue;
+    }
+    const uint32_t tile = (dest_base - texture_base) >> 12;
+    const uint32_t x = (tile % pitch_tiles) * 32 * scale_x, y = (tile / pitch_tiles) * 32 * scale_y;
+    if (x >= texture_width || y >= texture_height || (x + width > texture_width &&
+                                                      x + width - texture_width >= 8 * scale_x) ||
+        (y + height > texture_height && y + height - texture_height >= 8 * scale_y)) {
+      continue;
+    }
+    const uint32_t part_width = std::min(width, texture_width - x);
+    const uint32_t part_height = std::min(height, texture_height - y);
+    if (x || y || part_width < texture_width || part_height < texture_height) {
+      // Only a part: the rest must be what the texture should have.
+      if ((part_width & 3) || (x & 3) || texture->base_outdated(AcquireGlobalLock())) {
+        continue;
+      }
+    }
+    target = texture;
+    target_width = texture_width;
+    target_height = texture_height;
+    dest_x = x;
+    dest_y = y;
+    write_width = part_width;
+    write_height = part_height;
+  }
+  const bool partial =
+      target && (dest_x || dest_y || write_width < target_width || write_height < target_height);
+  if (!target) {
+    return false;
+  }
+  // k_24_8: the stencil next to the texture.
+  std::shared_ptr<DirectResolveStencil> stencil;
+  if (depth24) {
+    auto stencil_it = direct_resolve_stencils_.find(target);
+    if (stencil_it != direct_resolve_stencils_.end() &&
+        stencil_it->second->width == target_width && stencil_it->second->height == target_height) {
+      stencil = stencil_it->second;
+    } else {
+      D3D12_RESOURCE_DESC stencil_desc = {};
+      stencil_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+      stencil_desc.Width = target_width;
+      stencil_desc.Height = target_height;
+      stencil_desc.DepthOrArraySize = 1;
+      stencil_desc.MipLevels = 1;
+      stencil_desc.Format = DXGI_FORMAT_R8_UINT;
+      stencil_desc.SampleDesc.Count = 1;
+      stencil_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+      stencil_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+      Microsoft::WRL::ComPtr<ID3D12Resource> stencil_resource;
+      const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+      if (FAILED(provider.GetDevice()->CreateCommittedResource(
+              &ui::d3d12::util::kHeapPropertiesDefault, provider.GetHeapFlagCreateNotZeroed(),
+              &stencil_desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+              IID_PPV_ARGS(&stencil_resource)))) {
+        return false;
+      }
+      stencil = std::make_shared<DirectResolveStencil>();
+      stencil->resource = std::move(stencil_resource);
+      stencil->state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+      stencil->width = target_width;
+      stencil->height = target_height;
+      direct_resolve_stencils_[target] = stencil;
+    }
+  }
+
+  // Older direct resolves this one replaces entirely: their data is superseded
+  // (not parts of textures - tiled strips interleave in memory, so the range
+  // tells nothing about which texels they have).
+  const uint64_t extent_end = uint64_t(extent_start) + extent_length;
+  for (size_t i = 0; i < pending_direct_resolves_.size();) {
+    PendingDirectResolve& pending = pending_direct_resolves_[i];
+    const bool same_part = pending.texture == target && pending.texture_x >= dest_x &&
+                           pending.texture_y >= dest_y &&
+                           pending.texture_x + pending.width <= dest_x + write_width &&
+                           pending.texture_y + pending.height <= dest_y + write_height;
+    if (same_part || (!pending.partial && !partial && pending.start >= extent_start &&
+                      uint64_t(pending.start) + pending.length <= extent_end)) {
+      RetainUntilSubmissionCompleted(std::move(pending.resource));
+      if (pending.stencil) {
+        RetainUntilSubmissionCompleted(pending.stencil->resource);
+      }
+      pending_direct_resolves_.erase(pending_direct_resolves_.begin() + i);
+    } else {
+      ++i;
+    }
+  }
+  // Other parts of this texture pending stay in the texture.
+  direct_resolve_keep_texture_ = target;
+  direct_resolve_keep_rect_[0] = dest_x;
+  direct_resolve_keep_rect_[1] = dest_y;
+  direct_resolve_keep_rect_[2] = dest_x + write_width;
+  direct_resolve_keep_rect_[3] = dest_y + write_height;
+  if (upscaled) {
+    // Others' direct resolve data in the range is written out (the scaled
+    // resolve memory isn't the guest memory copy - nothing else to prepare).
+    std::pair<uint32_t, uint32_t> range(extent_start, extent_length);
+    MaterializeDirectResolves(&range, 1);
+  } else {
+    // Like the usual resolve: the CPU data around the copied area is in place
+    // (and others' direct resolve data in the range is written out).
+    if (!shared_memory().RequestRange(extent_start, extent_length)) {
+      direct_resolve_keep_texture_ = nullptr;
+      return false;
+    }
+  }
+  direct_resolve_keep_texture_ = nullptr;
+
+  DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+  ui::d3d12::util::DescriptorCpuGpuHandlePair descriptors[4];
+  if (!command_processor_.RequestOneUseSingleViewDescriptors(depth24 ? 4 : 2, descriptors)) {
+    return false;
+  }
+  device->CopyDescriptorsSimple(1, descriptors[0].first, render_target_srv,
+                                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  if (depth24) {
+    device->CopyDescriptorsSimple(1, descriptors[2].first, stencil_srv,
+                                  D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC stencil_uav_desc = {};
+    stencil_uav_desc.Format = DXGI_FORMAT_R8_UINT;
+    stencil_uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    device->CreateUnorderedAccessView(stencil->resource.Get(), nullptr, &stencil_uav_desc,
+                                      descriptors[3].first);
+    TransitionDirectResolveStencil(*stencil, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  }
+  D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
+  uav_desc.Format = (float32 || depth24) ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R8G8B8A8_UINT;
+  uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+  device->CreateUnorderedAccessView(target->resource(), nullptr, &uav_desc, descriptors[1].first);
+  D3D12_RESOURCE_STATES state_before =
+      target->SetResourceState(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  if (state_before == D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+    command_processor_.PushUAVBarrier(target->resource());
+  } else {
+    command_processor_.PushTransitionBarrier(target->resource(), state_before,
+                                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  }
+  uint32_t constants[9] = {origin_x,
+                           origin_y,
+                           write_width,
+                           write_height,
+                           uint32_t(swap_red_blue),
+                           fill_x,
+                           fill_y,
+                           dest_x | (dest_y << 16),
+                           source->sample_a | (source->sample_b << 8) |
+                               (uint32_t(source->float24_round) << 16) |
+                               (uint32_t(source->dest_float24) << 17)};
+  ID3D12PipelineState* pipeline;
+  if (depth24) {
+    if (source->float24) {
+      pipeline = source->msaa ? direct_resolve_depth_f24_ms_pipeline_.Get()
+                              : direct_resolve_depth_f24_pipeline_.Get();
+    } else {
+      pipeline = source->msaa ? direct_resolve_depth_ms_pipeline_.Get()
+                              : direct_resolve_depth_pipeline_.Get();
+    }
+  } else if (float32) {
+    pipeline = direct_resolve_f32_pipeline_.Get();
+  } else {
+    pipeline = source->msaa ? direct_resolve_ms_pipeline_.Get() : direct_resolve_pipeline_.Get();
+  }
+  if (!pipeline) {
+    return false;
+  }
+  command_processor_.SetExternalPipeline(pipeline);
+  command_list.D3DSetComputeRootSignature(depth24 ? direct_resolve_depth_root_signature_.Get()
+                                                  : load_root_signature_.Get());
+  command_list.D3DSetComputeRoot32BitConstants(0, 9, constants, 0);
+  command_list.D3DSetComputeRootDescriptorTable(1, descriptors[0].second);
+  command_list.D3DSetComputeRootDescriptorTable(2, descriptors[1].second);
+  if (depth24) {
+    command_list.D3DSetComputeRootDescriptorTable(3, descriptors[2].second);
+    command_list.D3DSetComputeRootDescriptorTable(4, descriptors[3].second);
+  }
+  command_processor_.SubmitBarriers();
+  command_list.D3DDispatch((write_width + 7) / 8, (write_height + 7) / 8, 1);
+  target->MarkAsUsed();
+
+  // The range is resolved (other textures there are outdated), but this
+  // texture has the data.
+  MarkRangeAsResolved(extent_start, extent_length);
+  const bool debug_write_out = REXCVAR_GET(gpu_debug_direct_resolve_write_out);
+  if (!debug_write_out) {
+    target->MakeUpToDateAndWatch(AcquireGlobalLock());
+  }
+  target->LogAction("Direct resolve");
+  if (REXCVAR_GET(gpu_debug_log_draws) > 0) {
+    REXGPU_INFO("DIRECT RESOLVE {:08X}+{} {}x{} from ({}, {}) scale {}x{}", extent_start,
+                extent_length, target_width, target_height, origin_x, origin_y, scale_x, scale_y);
+  }
+
+  PendingDirectResolve& pending = pending_direct_resolves_.emplace_back();
+  pending.start = extent_start;
+  pending.length = extent_length;
+  pending.texture = target;
+  pending.resource = target->resource();
+  pending.orphan_state = D3D12_RESOURCE_STATE_COMMON;
+  pending.guest_offset = dest_base;
+  pending.pitch_aligned = dest_pitch_aligned;
+  pending.width = write_width;
+  pending.height = write_height;
+  pending.texture_x = dest_x;
+  pending.texture_y = dest_y;
+  pending.partial = partial;
+  pending.endian = dest_endian;
+  pending.scale_x = scale_x;
+  pending.scale_y = scale_y;
+  pending.float32 = float32;
+  pending.depth24 = depth24;
+  pending.depth_float = depth24 && source->dest_float24;
+  pending.stencil = std::move(stencil);
+  if (debug_write_out) {
+    // The texture stays outdated and is loaded from what's written out.
+    PendingDirectResolve written_out = std::move(pending);
+    pending_direct_resolves_.pop_back();
+    MaterializeDirectResolve(written_out);
+  }
+  return true;
+}
+
+void D3D12TextureCache::PrepareScaledResolveWrite(uint32_t start, uint32_t length) {
+  if (pending_direct_resolves_.empty() || !length) {
+    return;
+  }
+  const uint64_t end = uint64_t(start) + length;
+  for (size_t i = 0; i < pending_direct_resolves_.size();) {
+    PendingDirectResolve& pending = pending_direct_resolves_[i];
+    if (!pending.partial && pending.start >= start &&
+        uint64_t(pending.start) + pending.length <= end) {
+      RetainUntilSubmissionCompleted(std::move(pending.resource));
+      if (pending.stencil) {
+        RetainUntilSubmissionCompleted(pending.stencil->resource);
+      }
+      pending_direct_resolves_.erase(pending_direct_resolves_.begin() + i);
+    } else {
+      ++i;
+    }
+  }
+  std::pair<uint32_t, uint32_t> range(start, length);
+  MaterializeDirectResolves(&range, 1);
+}
+
+bool D3D12TextureCache::WriteOutUnscaledDirectResolves() {
+  bool recorded = false;
+  for (size_t i = 0; i < pending_direct_resolves_.size();) {
+    PendingDirectResolve& pending = pending_direct_resolves_[i];
+    if (pending.scale_x > 1 || pending.scale_y > 1) {
+      ++i;
+      continue;
+    }
+    PendingDirectResolve materialized = std::move(pending);
+    pending_direct_resolves_.erase(pending_direct_resolves_.begin() + i);
+    MaterializeDirectResolve(materialized);
+    recorded = true;
+  }
+  return recorded;
+}
+
+void D3D12TextureCache::RetainUntilSubmissionCompleted(
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource) {
+  if (resource) {
+    retained_upload_buffers_.emplace_back(command_processor_.GetCurrentSubmission(),
+                                          std::move(resource));
+  }
+}
+
+void D3D12TextureCache::MaterializeDirectResolves(const std::pair<uint32_t, uint32_t>* ranges,
+                                                  size_t count) {
+  if (pending_direct_resolves_.empty()) {
+    return;
+  }
+  for (size_t i = 0; i < pending_direct_resolves_.size();) {
+    PendingDirectResolve& pending = pending_direct_resolves_[i];
+    bool overlaps = false;
+    for (size_t j = 0; j < count && !overlaps; ++j) {
+      overlaps = uint64_t(ranges[j].first) < uint64_t(pending.start) + pending.length &&
+                 uint64_t(pending.start) < uint64_t(ranges[j].first) + ranges[j].second;
+    }
+    if (overlaps && direct_resolve_keep_texture_ && pending.texture == direct_resolve_keep_texture_ &&
+        (pending.texture_x >= direct_resolve_keep_rect_[2] ||
+         pending.texture_x + pending.width <= direct_resolve_keep_rect_[0] ||
+         pending.texture_y >= direct_resolve_keep_rect_[3] ||
+         pending.texture_y + pending.height <= direct_resolve_keep_rect_[1])) {
+      // Another part of the texture being written now.
+      overlaps = false;
+    }
+    if (!overlaps) {
+      ++i;
+      continue;
+    }
+    if (direct_resolve_write_out_blocked_) {
+      // Should have been written out before the draw was set up - leaving it
+      // pending (stale data for this draw) rather than breaking the draw.
+      if (!direct_resolve_write_out_blocked_count_++) {
+        REXGPU_WARN(
+            "Direct resolve: {:08X}+{} requested while a draw is set up - not written out there",
+            pending.start, pending.length);
+      }
+      ++i;
+      continue;
+    }
+    PendingDirectResolve materialized = std::move(pending);
+    pending_direct_resolves_.erase(pending_direct_resolves_.begin() + i);
+    MaterializeDirectResolve(materialized);
+  }
+}
+
+void D3D12TextureCache::MaterializeDirectResolve(PendingDirectResolve& pending) {
+  if (!pending.resource || !texture_store_pipeline_ ||
+      (pending.depth24 && (!texture_store_depth_pipeline_ || !pending.stencil))) {
+    return;
+  }
+  if (REXCVAR_GET(gpu_debug_log_draws) > 0) {
+    REXGPU_INFO("DIRECT RESOLVE WRITTEN OUT {:08X}+{} base {:08X} {}x{} scale {}x{}", pending.start,
+                pending.length, pending.guest_offset, pending.width, pending.height,
+                pending.scale_x, pending.scale_y);
+  }
+  DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+  ui::d3d12::util::DescriptorCpuGpuHandlePair descriptors[3];
+  if (!command_processor_.RequestOneUseSingleViewDescriptors(pending.depth24 ? 3 : 2,
+                                                             descriptors)) {
+    REXGPU_WARN("Direct resolve: no descriptors to write {:08X} to the guest memory",
+                pending.start);
+    return;
+  }
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+  srv_desc.Format = (pending.float32 || pending.depth24) ? DXGI_FORMAT_R32_FLOAT
+                                                         : DXGI_FORMAT_R8G8B8A8_UINT;
+  srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  srv_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  srv_desc.Texture2D.MipLevels = 1;
+  device->CreateShaderResourceView(pending.resource.Get(), &srv_desc, descriptors[0].first);
+  if (pending.depth24) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC stencil_srv_desc = srv_desc;
+    stencil_srv_desc.Format = DXGI_FORMAT_R8_UINT;
+    device->CreateShaderResourceView(pending.stencil->resource.Get(), &stencil_srv_desc,
+                                     descriptors[2].first);
+  }
+  D3D12SharedMemory& d3d12_shared_memory = static_cast<D3D12SharedMemory&>(shared_memory());
+  const bool scaled = pending.scale_x > 1 || pending.scale_y > 1;
+  if (scaled) {
+    // The scaled resolve memory from the destination base (the offsets in the
+    // shader are relative to it), like for a resolve copy.
+    if (!texture_store_scaled_pipeline_ || !IsDrawResolutionScaled() ||
+        draw_resolution_scale_x() != pending.scale_x ||
+        draw_resolution_scale_y() != pending.scale_y || pending.start < pending.guest_offset ||
+        !EnsureScaledResolveMemoryCommitted(pending.start, pending.length) ||
+        !MakeScaledResolveRangeCurrent(pending.guest_offset,
+                                       pending.start - pending.guest_offset + pending.length,
+                                       4)) {
+      REXGPU_WARN("Direct resolve: couldn't write {:08X} to the scaled resolve memory",
+                  pending.start);
+      return;
+    }
+  }
+  ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor_dest;
+  if (scaled) {
+    descriptor_dest = descriptors[1];
+    CreateCurrentScaledResolveRangeUintPow2UAV(descriptor_dest.first, 4);
+  } else if (bindless_resources_used_) {
+    descriptor_dest = command_processor_.GetSharedMemoryUintPow2BindlessUAVHandlePair(4);
+  } else {
+    descriptor_dest = descriptors[1];
+    d3d12_shared_memory.WriteUintPow2UAVDescriptor(descriptor_dest.first, 4);
+  }
+  constexpr D3D12_RESOURCE_STATES kReadState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  D3D12_RESOURCE_STATES state_before;
+  if (pending.texture) {
+    state_before = pending.texture->SetResourceState(kReadState);
+  } else {
+    state_before = pending.orphan_state;
+    pending.orphan_state = kReadState;
+  }
+  command_processor_.PushTransitionBarrier(pending.resource.Get(), state_before, kReadState);
+  if (pending.depth24) {
+    TransitionDirectResolveStencil(*pending.stencil, kReadState);
+  }
+  if (scaled) {
+    TransitionCurrentScaledResolveRange(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  } else {
+    d3d12_shared_memory.UseForWriting();
+  }
+
+  LoadConstants constants = {};
+  constants.is_tiled_3d_endian_scale = 1 | (pending.endian << 2) | (pending.scale_x << 4) |
+                                       (pending.scale_y << 7) |
+                                       (uint32_t(pending.depth_float) << 10);
+  // Relative to the bound scaled resolve range, which starts at the base.
+  constants.guest_offset = scaled ? 0 : pending.guest_offset;
+  constants.guest_pitch_aligned = pending.pitch_aligned;
+  constants.size_blocks[0] = pending.width;
+  constants.size_blocks[1] = pending.height;
+  constants.size_blocks[2] = 1;
+  constants.height_texels = pending.height;
+  // The store shaders: the texel the data starts at.
+  constants.host_offset = pending.texture_x | (pending.texture_y << 16);
+  ID3D12PipelineState* store_pipeline;
+  if (pending.depth24) {
+    store_pipeline = scaled ? texture_store_depth_scaled_pipeline_.Get()
+                            : texture_store_depth_pipeline_.Get();
+  } else if (pending.float32) {
+    store_pipeline = scaled ? texture_store_f32_scaled_pipeline_.Get()
+                            : texture_store_f32_pipeline_.Get();
+  } else {
+    store_pipeline =
+        scaled ? texture_store_scaled_pipeline_.Get() : texture_store_pipeline_.Get();
+  }
+  command_processor_.SetExternalPipeline(store_pipeline);
+  command_list.D3DSetComputeRootSignature(pending.depth24
+                                              ? texture_store_depth_root_signature_.Get()
+                                              : load_root_signature_.Get());
+  command_list.D3DSetComputeRoot32BitConstants(0, sizeof(constants) / sizeof(uint32_t),
+                                               &constants, 0);
+  command_list.D3DSetComputeRootDescriptorTable(1, descriptors[0].second);
+  command_list.D3DSetComputeRootDescriptorTable(2, descriptor_dest.second);
+  if (pending.depth24) {
+    command_list.D3DSetComputeRootDescriptorTable(3, descriptors[2].second);
+  }
+  command_processor_.SubmitBarriers();
+  command_list.D3DDispatch((pending.width / 4 + 7) / 8, (pending.height + 15) / 16, 1);
+  if (scaled) {
+    MarkCurrentScaledResolveRangeUAVWritesCommitNeeded();
+  } else {
+    d3d12_shared_memory.MarkUAVWritesCommitNeeded();
+  }
+  if (pending.texture) {
+    pending.texture->MarkAsUsed();
+  }
+  RetainUntilSubmissionCompleted(std::move(pending.resource));
+  if (pending.stencil) {
+    RetainUntilSubmissionCompleted(pending.stencil->resource);
+    pending.stencil.reset();
+  }
+}
+
+void D3D12TextureCache::TransitionDirectResolveStencil(DirectResolveStencil& stencil,
+                                                       D3D12_RESOURCE_STATES new_state) {
+  if (stencil.state == new_state) {
+    if (new_state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+      command_processor_.PushUAVBarrier(stencil.resource.Get());
+    }
+    return;
+  }
+  command_processor_.PushTransitionBarrier(stencil.resource.Get(), stencil.state, new_state);
+  stencil.state = new_state;
+}
+
+bool D3D12TextureCache::IsDirectResolveTargetKey(TextureKey key) const {
+  if (!direct_resolve_pipeline_ || !REXCVAR_GET(gpu_direct_resolve) ||
+      !REXCVAR_GET(gpu_texture_load_to_texture) ||
+      key.dimension != xenos::DataDimension::k2DOrStacked || key.GetDepthOrArraySize() != 1 ||
+      !key.tiled || key.mip_max_level) {
+    return false;
+  }
+  if (key.format == xenos::TextureFormat::k_24_8 ||
+      key.format == xenos::TextureFormat::k_24_8_FLOAT) {
+    // Loaded the usual way (texture_load_depth_unorm / _float), but may receive
+    // direct resolves of kD24S8 / kD24FS8 depth.
+    return direct_resolve_depth_pipeline_ &&
+           (GetLoadShaderIndex(key) == kLoadShaderIndexDepthUnorm ||
+            GetLoadShaderIndex(key) == kLoadShaderIndexDepthFloat) &&
+           GetDXGIResourceFormat(key) == DXGI_FORMAT_R32_FLOAT;
+  }
+  if (GetLoadShaderIndex(key) != kLoadShaderIndex32bpb) {
+    return false;
+  }
+  switch (key.format) {
+    case xenos::TextureFormat::k_8_8_8_8:
+      // Resolution-scaled resolve textures (above 1x) aren't loaded through
+      // the unordered access view (IsLoadToTextureKey), but can receive direct
+      // resolves, with the data written to the scaled resolve memory if needed.
+      return texture_store_scaled_pipeline_ && key.scaled_resolve && IsDrawResolutionScaled() &&
+             GetDXGIResourceFormat(key) == DXGI_FORMAT_R8G8B8A8_TYPELESS;
+    case xenos::TextureFormat::k_32_FLOAT:
+      // Loaded the usual way, but may receive direct resolves.
+      return direct_resolve_f32_pipeline_ &&
+             GetDXGIResourceFormat(key) == DXGI_FORMAT_R32_FLOAT;
+    default:
+      return false;
+  }
+}
+
+bool D3D12TextureCache::IsLoadToTextureKey(TextureKey key) const {
+  return load_pipeline_32bpb_to_texture_ && REXCVAR_GET(gpu_texture_load_to_texture) &&
+         key.dimension == xenos::DataDimension::k2DOrStacked && key.GetDepthOrArraySize() == 1 &&
+         key.tiled && !key.mip_max_level &&
+         // Resolution-scaled resolve data has its own layout.
+         !(key.scaled_resolve && !IsDrawResolutionDownscaled()) &&
+         GetLoadShaderIndex(key) == kLoadShaderIndex32bpb &&
+         GetDXGIResourceFormat(key) == DXGI_FORMAT_R8G8B8A8_TYPELESS;
+}
+
+bool D3D12TextureCache::LoadTextureDataToTexture(D3D12Texture& texture) {
+  TextureKey texture_key = texture.key();
+  const texture_util::TextureGuestLayout& guest_layout = texture.guest_layout();
+  // (Other textures may have unordered access for direct resolves.)
+  if (!load_pipeline_32bpb_to_texture_ || !IsLoadToTextureKey(texture_key) ||
+      !texture_key.tiled || !guest_layout.packed_level ||
+      !(texture.resource()->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) {
+    return false;
+  }
+  uint32_t width = texture_key.GetWidth();
+  uint32_t height = texture_key.GetHeight();
+  if (texture_key.scaled_resolve) {
+    if (!IsDrawResolutionDownscaled()) {
+      return false;
+    }
+    // From the top-left part of the guest data, at the smaller size.
+    width = DownscaleCeil(width, draw_resolution_percent());
+    height = DownscaleCeil(height, draw_resolution_percent());
+  }
+
+  DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+  ui::d3d12::util::DescriptorCpuGpuHandlePair descriptors[2];
+  if (!command_processor_.RequestOneUseSingleViewDescriptors(bindless_resources_used_ ? 1 : 2,
+                                                             descriptors)) {
+    return false;
+  }
+  // The texture as R8G8B8A8_UINT (the same bits).
+  D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
+  uav_desc.Format = DXGI_FORMAT_R8G8B8A8_UINT;
+  uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+  device->CreateUnorderedAccessView(texture.resource(), nullptr, &uav_desc,
+                                    descriptors[0].first);
+  // The shared memory, 16 bytes per element.
+  D3D12SharedMemory& d3d12_shared_memory = static_cast<D3D12SharedMemory&>(shared_memory());
+  d3d12_shared_memory.UseForReading();
+  ui::d3d12::util::DescriptorCpuGpuHandlePair descriptor_source;
+  if (bindless_resources_used_) {
+    descriptor_source = command_processor_.GetSharedMemoryUintPow2BindlessSRVHandlePair(4);
+  } else {
+    descriptor_source = descriptors[1];
+    d3d12_shared_memory.WriteUintPow2SRVDescriptor(descriptor_source.first, 4);
+  }
+
+  D3D12_RESOURCE_STATES state_before =
+      texture.SetResourceState(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  if (state_before == D3D12_RESOURCE_STATE_UNORDERED_ACCESS) {
+    // Loaded again before being used - after the earlier load.
+    command_processor_.PushUAVBarrier(texture.resource());
+  } else {
+    command_processor_.PushTransitionBarrier(texture.resource(), state_before,
+                                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  }
+
+  LoadConstants load_constants = {};
+  load_constants.is_tiled_3d_endian_scale = uint32_t(texture_key.tiled) |
+                                            (uint32_t(texture_key.endianness) << 2) |
+                                            (UINT32_C(1) << 4) | (UINT32_C(1) << 7);
+  load_constants.guest_offset = texture_key.base_page << 12;
+  // In blocks for tiled textures (4 bytes per block).
+  load_constants.guest_pitch_aligned = guest_layout.base.row_pitch_bytes / 4;
+  load_constants.size_blocks[0] = width;
+  load_constants.size_blocks[1] = height;
+  load_constants.size_blocks[2] = 1;
+  load_constants.height_texels = height;
+
+  command_processor_.SetExternalPipeline(load_pipeline_32bpb_to_texture_.Get());
+  command_list.D3DSetComputeRootSignature(load_root_signature_.Get());
+  command_list.D3DSetComputeRoot32BitConstants(0, sizeof(load_constants) / sizeof(uint32_t),
+                                               &load_constants, 0);
+  command_list.D3DSetComputeRootDescriptorTable(1, descriptor_source.second);
+  command_list.D3DSetComputeRootDescriptorTable(2, descriptors[0].second);
+  command_processor_.SubmitBarriers();
+  // 32 x 16 blocks per group.
+  command_list.D3DDispatch((width + 31) / 32, (height + 15) / 16, 1);
+  texture.MarkAsUsed();
+  return true;
 }
 
 bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                               bool load_mips) {
   D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
   TextureKey texture_key = d3d12_texture.key();
+
+  // Copies of render targets: straight into the texture if it was made for
+  // that.
+  if (load_base && !texture_key.mip_max_level && REXCVAR_GET(gpu_texture_load_to_texture) &&
+      LoadTextureDataToTexture(d3d12_texture)) {
+    return true;
+  }
 
   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
   ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();

@@ -31,6 +31,16 @@ class DrawExtentEstimator {
   uint32_t EstimateVertexMaxY(const Shader& vertex_shader);
   uint32_t EstimateMaxY(bool try_to_estimate_vertex_max_y, const Shader& vertex_shader);
 
+  // For a draw of one axis-aligned rectangle (a 4-vertex quad list or triangle
+  // strip, positions from the vertex shader executed on the CPU) with clipping
+  // enabled: the rectangle of guest pixels whose every sample the draw
+  // certainly covers (with margins for the host's precision), within the
+  // viewport and the scissor. False if it can't be determined.
+  struct Rectangle {
+    uint32_t x0, y0, x1, y1;  // [x0, x1) x [y0, y1)
+  };
+  bool EstimateCoveredRectangle(const Shader& vertex_shader, Rectangle& rectangle_out);
+
  private:
   class PositionYExportSink : public ShaderInterpreter::ExportSink {
    public:
@@ -54,6 +64,19 @@ class DrawExtentEstimator {
     std::optional<float> position_w_;
     std::optional<float> point_size_;
     std::optional<uint32_t> vertex_kill_;
+  };
+
+  class PositionExportSink : public ShaderInterpreter::ExportSink {
+   public:
+    void Export(ucode::ExportRegister export_register, const float* value,
+                uint32_t value_mask) override;
+    void Reset() {
+      position_mask_ = 0;
+      vertex_kill_ = false;
+    }
+    float position_[4] = {};
+    uint32_t position_mask_ = 0;
+    bool vertex_kill_ = false;
   };
 
   const RegisterFile& register_file_;

@@ -176,6 +176,15 @@ class DxbcShaderTranslator : public ShaderTranslator {
       uint32_t dynamic_addressable_register_count : 8;
       // Non-ROV - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 2;
+      // PixelShaderDrawOverride::soft_texture_fetch_mask applies with this
+      // soft_texture_fetch_size (0 - not used).
+      uint32_t soft_texture_fetch_size : 4;
+      // Texture fetch constants 0-11 whose 1D / 2D fetches can't depend on the
+      // level of detail (a single mip level, the same minification and
+      // magnification filter, no anisotropic filtering - see
+      // gpu_lod_free_texture_fetches): sampled at LOD 0 instead of computing
+      // the gradients, with the same result.
+      uint32_t lod_free_fetch_mask : 12;
     } pixel;
 
     explicit Modification(uint64_t modification_value = 0) : value(modification_value) {

@@ -37,6 +37,12 @@ REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_for_psi_render_backend, tru
 REXCVAR_DEFINE_BOOL(snorm16_render_target_full_range, true, "GPU",
                     "Use full range for SNORM16 render targets");
 
+REXCVAR_DEFINE_BOOL(gpu_skip_overwritten_transfers, true, "GPU",
+                    "Don't copy old render target contents (EDRAM ownership transfers) into the "
+                    "area a full-screen draw is certain to overwrite entirely")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DECLARE(int32_t, gpu_debug_log_draws);
+
 REXCVAR_DEFINE_BOOL(direct_host_resolve, true, "GPU",
                     "Resolve from host render targets directly to shared memory when possible")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -402,6 +408,9 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
                                uint32_t normalized_color_mask, const Shader& vertex_shader) {
   const RegisterFile& regs = register_file();
   bool interlock_barrier_only = GetPath() == Path::kPixelShaderInterlock;
+  // Only for this draw.
+  const uint32_t draw_overwritten_color_rts = draw_overwritten_color_rts_;
+  draw_overwritten_color_rts_ = 0;
 
   auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
   xenos::MsaaSamples msaa_samples = rb_surface_info.msaa_samples;
@@ -695,10 +704,37 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     return true;
   }
 
+  // Transfers into what the draw overwrites anyway.
+  if (draw_overwritten_color_rts && GetPath() == Path::kHostRenderTargets &&
+      msaa_samples == xenos::MsaaSamples::k1X && REXCVAR_GET(gpu_skip_overwritten_transfers)) {
+    bool covered_known = false, covered_valid = false;
+    DrawExtentEstimator::Rectangle covered;
+    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
+      const uint32_t rt_bit_index = 1 + i;
+      std::vector<Transfer>& transfers = last_update_transfers_[rt_bit_index];
+      if (!(draw_overwritten_color_rts & (uint32_t(1) << i)) ||
+          !(depth_and_color_rts_used_bits & (uint32_t(1) << rt_bit_index)) || transfers.empty()) {
+        continue;
+      }
+      if (!covered_known) {
+        covered_known = true;
+        covered_valid = draw_extent_estimator_.EstimateCoveredRectangle(vertex_shader, covered);
+      }
+      if (!covered_valid) {
+        break;
+      }
+      DropTransfersInRectangle(rt_keys[rt_bit_index], covered, transfers);
+    }
+  }
+
   // If everything succeeded, update the used render targets.
   for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
     last_update_used_render_targets_[i] =
         (depth_and_color_rts_used_bits & (uint32_t(1) << i)) ? rts[i] : nullptr;
+    // The draw (and the ownership transfers before it) may write it.
+    if (last_update_used_render_targets_[i]) {
+      last_update_used_render_targets_[i]->MarkWritten();
+    }
   }
   if (are_accumulated_render_targets_valid_) {
     // Check if the only re-enabling a previously bound render target.
@@ -1351,6 +1387,54 @@ bool RenderTargetCache::WouldOwnershipChangeRequireTransfers(RenderTargetKey des
     }
   }
   return false;
+}
+
+void RenderTargetCache::DropTransfersInRectangle(RenderTargetKey dest,
+                                                 const DrawExtentEstimator::Rectangle& rectangle,
+                                                 std::vector<Transfer>& transfers) {
+  const uint32_t pitch_tiles = dest.GetPitchTiles();
+  if (!pitch_tiles || dest.msaa_samples != xenos::MsaaSamples::k1X) {
+    return;
+  }
+  const uint32_t tile_width = xenos::kEdramTileWidthSamples >> uint32_t(dest.Is64bpp());
+  const uint32_t tile_height = xenos::kEdramTileHeightSamples;
+  auto tile_covered = [&](uint32_t tile) {
+    uint32_t local = (tile + xenos::kEdramTileCount - dest.base_tiles) & (xenos::kEdramTileCount - 1);
+    uint32_t x = (local % pitch_tiles) * tile_width;
+    uint32_t y = (local / pitch_tiles) * tile_height;
+    return x >= rectangle.x0 && x + tile_width <= rectangle.x1 && y >= rectangle.y0 &&
+           y + tile_height <= rectangle.y1;
+  };
+  uint32_t tiles_dropped = 0;
+  std::vector<Transfer> kept;
+  kept.reserve(transfers.size() + 2);
+  for (const Transfer& transfer : transfers) {
+    uint32_t run_start = transfer.start_tiles;
+    for (uint32_t tile = transfer.start_tiles; tile < transfer.end_tiles; ++tile) {
+      if (!tile_covered(tile)) {
+        continue;
+      }
+      ++tiles_dropped;
+      if (tile > run_start) {
+        kept.emplace_back(run_start, tile, transfer.source, transfer.host_depth_source);
+      }
+      run_start = tile + 1;
+    }
+    if (transfer.end_tiles > run_start) {
+      kept.emplace_back(run_start, transfer.end_tiles, transfer.source,
+                        transfer.host_depth_source);
+    }
+  }
+  if (!tiles_dropped) {
+    return;
+  }
+  if (REXCVAR_GET(gpu_debug_log_draws) > 0) {
+    REXGPU_INFO("TRANSFER SKIPPED into {} - {} tiles overwritten by the draw ({}, {}) - ({}, {}), "
+                "{} transfer ranges left",
+                dest.GetDebugName(), tiles_dropped, rectangle.x0, rectangle.y0, rectangle.x1,
+                rectangle.y1, kept.size());
+  }
+  transfers = std::move(kept);
 }
 
 void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_tiles_base_relative,

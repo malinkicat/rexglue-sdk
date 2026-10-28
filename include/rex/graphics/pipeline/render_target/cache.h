@@ -714,6 +714,16 @@ class RenderTargetCache {
   RenderTargetKey update_memo_keys_[1 + xenos::kMaxColorRenderTargets];
   uint32_t update_memo_lengths_tiles_[1 + xenos::kMaxColorRenderTargets] = {};
   RenderTarget* update_memo_rts_[1 + xenos::kMaxColorRenderTargets] = {};
+  // Update: the registers and arguments the render targets and their ranges
+  // are derived from, for the previous draw whose result is in the memo above.
+  // The same inputs with a valid memo skip all the derivation.
+  static constexpr size_t kUpdateEarlyKeySize = 19;
+  uint32_t update_early_key_[kUpdateEarlyKeySize] = {};
+  bool update_early_key_valid_ = false;
+  bool FinishUpdate(uint32_t depth_and_color_rts_used_bits, RenderTarget* const* rts,
+                    const RenderTargetKey* rt_keys, uint32_t pitch_tiles_at_32bpp,
+                    xenos::MsaaSamples msaa_samples, uint32_t draw_overwritten_color_rts,
+                    const Shader& vertex_shader);
 
   // Render targets actually used by the draw call with the last successful
   // update. 0 is depth, color starting from 1, nullptr if not bound.

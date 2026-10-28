@@ -464,6 +464,49 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     }
   }
 
+  // Same inputs as the previous draw, whose render targets and ranges are
+  // still owned as needed: reuse them (the derivation below costs more than
+  // the rest of the update). Not with clipping disabled, where the height may
+  // be estimated from the vertices.
+  uint32_t early_key[kUpdateEarlyKeySize];
+  const bool early_key_usable = !interlock_barrier_only && REXCVAR_GET(gpu_update_memo) &&
+                                !regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable;
+  if (early_key_usable) {
+    early_key[0] = uint32_t(is_rasterization_done) |
+                   (uint32_t(REXCVAR_GET(mrt_edram_used_range_clamp_to_min)) << 1) |
+                   (uint32_t(normalized_depth_control.z_enable) << 2) |
+                   (uint32_t(normalized_depth_control.stencil_enable) << 3);
+    early_key[1] = normalized_color_mask;
+    early_key[2] = regs.values[XE_GPU_REG_RB_SURFACE_INFO];
+    early_key[3] = regs.values[XE_GPU_REG_RB_DEPTH_INFO];
+    early_key[4] = regs.values[XE_GPU_REG_RB_COLOR_INFO];
+    early_key[5] = regs.values[XE_GPU_REG_RB_COLOR1_INFO];
+    early_key[6] = regs.values[XE_GPU_REG_RB_COLOR2_INFO];
+    early_key[7] = regs.values[XE_GPU_REG_RB_COLOR3_INFO];
+    early_key[8] = regs.values[XE_GPU_REG_PA_SC_WINDOW_OFFSET];
+    early_key[9] = regs.values[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL];
+    early_key[10] = regs.values[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR];
+    early_key[11] = regs.values[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_BR];
+    early_key[12] = regs.values[XE_GPU_REG_PA_CL_CLIP_CNTL];
+    early_key[13] = regs.values[XE_GPU_REG_PA_CL_VTE_CNTL];
+    early_key[14] = regs.values[XE_GPU_REG_PA_SU_SC_MODE_CNTL];
+    early_key[15] = regs.values[XE_GPU_REG_PA_SU_VTX_CNTL];
+    early_key[16] = regs.values[XE_GPU_REG_PA_CL_VPORT_YOFFSET];
+    early_key[17] = regs.values[XE_GPU_REG_PA_CL_VPORT_YSCALE];
+    early_key[18] = uint32_t(GetPath());
+    if (update_early_key_valid_ && update_memo_valid_ &&
+        update_memo_generation_ == ownership_generation_ &&
+        !std::memcmp(early_key, update_early_key_, sizeof(early_key))) {
+      for (size_t i = 0; i < rex::countof(last_update_transfers_); ++i) {
+        last_update_transfers_[i].clear();
+      }
+      return FinishUpdate(update_memo_rts_used_bits_, update_memo_rts_, update_memo_keys_,
+                          pitch_tiles_at_32bpp, msaa_samples, draw_overwritten_color_rts,
+                          vertex_shader);
+    }
+  }
+  update_early_key_valid_ = false;
+
   // Get used render targets.
   // [0] is depth / stencil where relevant, [1...4] is color.
   // Depth / stencil testing / writing is before color in the pipeline.
@@ -740,7 +783,21 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
       update_memo_rts_[rt_bit_index] = rts[rt_bit_index];
     }
   }
+  if (early_key_usable && update_memo_valid_) {
+    std::memcpy(update_early_key_, early_key, sizeof(early_key));
+    update_early_key_valid_ = true;
+  }
 
+  return FinishUpdate(depth_and_color_rts_used_bits, rts, rt_keys, pitch_tiles_at_32bpp,
+                      msaa_samples, draw_overwritten_color_rts, vertex_shader);
+}
+
+bool RenderTargetCache::FinishUpdate(uint32_t depth_and_color_rts_used_bits,
+                                     RenderTarget* const* rts, const RenderTargetKey* rt_keys,
+                                     uint32_t pitch_tiles_at_32bpp,
+                                     xenos::MsaaSamples msaa_samples,
+                                     uint32_t draw_overwritten_color_rts,
+                                     const Shader& vertex_shader) {
   // Transfers into what the draw overwrites anyway.
   if (draw_overwritten_color_rts && GetPath() == Path::kHostRenderTargets &&
       msaa_samples == xenos::MsaaSamples::k1X && REXCVAR_GET(gpu_skip_overwritten_transfers)) {

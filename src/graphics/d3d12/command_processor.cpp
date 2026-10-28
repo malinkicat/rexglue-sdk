@@ -66,6 +66,11 @@ REXCVAR_DEFINE_BOOL(d3d12_submission_thread, true, "GPU/D3D12",
                     "Execute and submit command lists on another thread, so the command "
                     "processor continues with the next commands meanwhile");
 
+REXCVAR_DEFINE_BOOL(d3d12_reuse_float_constants, true, "GPU/D3D12",
+                    "Reuse the previous upload of a shader stage's float constants when the "
+                    "same values are needed again in the same frame")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(d3d12_present_on_submission_thread, true, "GPU/D3D12",
                     "With the submission thread, also present from it (in order after the "
                     "frame's command lists), so the command processor doesn't wait for them "
@@ -1987,13 +1992,17 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       }
       REXGPU_INFO("gpu_pass_profile: {:.2f} ms/frame:{} (clears in place {}/frame, direct "
                   "resolves pending {}, submissions {:.1f}/frame, texture binding resets "
-                  "{:.1f}/frame, bindings re-evaluated {:.1f}/frame, draws {:.0f}/frame)",
+                  "{:.1f}/frame, bindings re-evaluated {:.1f}/frame, draws {:.0f}/frame, "
+                  "float constant uploads {:.0f}/frame ({:.0f} KB), reused {:.0f}/frame)",
                   total / 1e6 / frames, line, stats.clears_in_place.exchange(0) / frames,
                   texture_cache_->GetPendingDirectResolveCount(),
                   double(stats.cp_submissions.exchange(0)) / frames,
                   double(std::exchange(texture_cache_->outdated_binding_resets_, 0)) / frames,
                   double(std::exchange(texture_cache_->requested_bindings_, 0)) / frames,
-                  double(draws) / frames);
+                  double(draws) / frames,
+                  double(std::exchange(float_constant_uploads_, 0)) / frames,
+                  double(std::exchange(float_constant_upload_bytes_, 0)) / 1024.0 / frames,
+                  double(std::exchange(float_constant_reuses_, 0)) / frames);
       frames = 0;
     }
   }
@@ -3832,6 +3841,55 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   return true;
 }
 
+bool D3D12CommandProcessor::UploadFloatConstants(uint32_t stage, const uint64_t* float_bitmap,
+                                                 uint32_t float_count, uint32_t first_register,
+                                                 D3D12_GPU_VIRTUAL_ADDRESS& address_out) {
+  const RegisterFile& regs = *register_file_;
+  // Even if the shader doesn't need any float constants, a valid binding must
+  // still be provided.
+  const size_t size = sizeof(float) * 4 * std::max(float_count, uint32_t(1));
+  // Gathered into cached memory first: compared with the last upload, and
+  // copied to the (write-combined) upload buffer in one go.
+  std::vector<uint8_t>& staging = float_constants_staging_;
+  staging.resize(size);
+  uint8_t* gathered = staging.data();
+  if (!float_count) {
+    std::memset(gathered, 0, size);
+  }
+  for (uint32_t i = 0; i < 4; ++i) {
+    uint64_t float_constant_map_entry = float_bitmap[i];
+    uint32_t float_constant_index;
+    while (rex::bit_scan_forward(float_constant_map_entry, &float_constant_index)) {
+      // Contiguous runs at once.
+      uint32_t run = uint32_t(std::countr_one(float_constant_map_entry >> float_constant_index));
+      float_constant_map_entry &= ~(((run < 64 ? (1ull << run) : 0ull) - 1) << float_constant_index);
+      std::memcpy(gathered, &regs[first_register + (i << 8) + (float_constant_index << 2)],
+                  4 * sizeof(float) * run);
+      gathered += 4 * sizeof(float) * run;
+    }
+  }
+  FloatConstantUpload& last = float_constants_last_[stage];
+  if (REXCVAR_GET(d3d12_reuse_float_constants) && last.frame == frame_current_ &&
+      last.data.size() == size && !std::memcmp(last.data.data(), staging.data(), size)) {
+    address_out = last.address;
+    ++float_constant_reuses_;
+    return true;
+  }
+  uint8_t* float_constants = constant_buffer_pool_->Request(
+      frame_current_, size, D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, nullptr, nullptr,
+      &address_out);
+  if (float_constants == nullptr) {
+    return false;
+  }
+  std::memcpy(float_constants, staging.data(), size);
+  ++float_constant_uploads_;
+  float_constant_upload_bytes_ += size;
+  last.data.assign(staging.begin(), staging.end());
+  last.frame = frame_current_;
+  last.address = address_out;
+  return true;
+}
+
 bool D3D12CommandProcessor::UseSubmissionThread() {
   if (!submission_thread_state_) {
     submission_thread_state_ = REXCVAR_GET(d3d12_submission_thread) ? 1 : -1;
@@ -4533,51 +4591,22 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     // still be provided, so if the first draw in the frame with the current
     // root signature doesn't have float constants at all, still allocate an
     // empty buffer.
-    uint8_t* float_constants = constant_buffer_pool_->Request(
-        frame_current_, sizeof(float) * 4 * std::max(float_constant_count_vertex, uint32_t(1)),
-        D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, nullptr, nullptr,
-        &cbuffer_binding_float_vertex_.address);
-    if (float_constants == nullptr) {
+    if (!UploadFloatConstants(0, float_constant_map_vertex.float_bitmap, float_constant_count_vertex,
+                              XE_GPU_REG_SHADER_CONSTANT_000_X,
+                              cbuffer_binding_float_vertex_.address)) {
       return false;
-    }
-    for (uint32_t i = 0; i < 4; ++i) {
-      uint64_t float_constant_map_entry = float_constant_map_vertex.float_bitmap[i];
-      uint32_t float_constant_index;
-      while (rex::bit_scan_forward(float_constant_map_entry, &float_constant_index)) {
-        float_constant_map_entry &= ~(1ull << float_constant_index);
-        std::memcpy(
-            float_constants,
-            &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (i << 8) + (float_constant_index << 2)],
-            4 * sizeof(float));
-        float_constants += 4 * sizeof(float);
-      }
     }
     cbuffer_binding_float_vertex_.up_to_date = true;
     current_graphics_root_up_to_date_ &= ~(1u << root_parameter_float_constants_vertex);
   }
   if (!cbuffer_binding_float_pixel_.up_to_date) {
-    uint8_t* float_constants = constant_buffer_pool_->Request(
-        frame_current_, sizeof(float) * 4 * std::max(float_constant_count_pixel, uint32_t(1)),
-        D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT, nullptr, nullptr,
-        &cbuffer_binding_float_pixel_.address);
-    if (float_constants == nullptr) {
+    static const uint64_t kNoFloatConstants[4] = {};
+    if (!UploadFloatConstants(
+            1,
+            pixel_shader ? pixel_shader->constant_register_map().float_bitmap : kNoFloatConstants,
+            float_constant_count_pixel, XE_GPU_REG_SHADER_CONSTANT_256_X,
+            cbuffer_binding_float_pixel_.address)) {
       return false;
-    }
-    if (pixel_shader != nullptr) {
-      const Shader::ConstantRegisterMap& float_constant_map_pixel =
-          pixel_shader->constant_register_map();
-      for (uint32_t i = 0; i < 4; ++i) {
-        uint64_t float_constant_map_entry = float_constant_map_pixel.float_bitmap[i];
-        uint32_t float_constant_index;
-        while (rex::bit_scan_forward(float_constant_map_entry, &float_constant_index)) {
-          float_constant_map_entry &= ~(1ull << float_constant_index);
-          std::memcpy(
-              float_constants,
-              &regs[XE_GPU_REG_SHADER_CONSTANT_256_X + (i << 8) + (float_constant_index << 2)],
-              4 * sizeof(float));
-          float_constants += 4 * sizeof(float);
-        }
-      }
     }
     cbuffer_binding_float_pixel_.up_to_date = true;
     current_graphics_root_up_to_date_ &= ~(1u << root_parameter_float_constants_pixel);

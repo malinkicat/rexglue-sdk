@@ -208,6 +208,21 @@ class D3D12CommandProcessor : public CommandProcessor {
   // fetch constants 0-11 and the bindings are unchanged.
   // Draws for gpu_pass_profile.
   uint64_t issued_draw_count_ = 0;
+  // Float constants as last uploaded per stage (0 vertex, 1 pixel), reused
+  // when the same bytes are needed again in the same frame
+  // (d3d12_reuse_float_constants).
+  struct FloatConstantUpload {
+    std::vector<uint8_t> data;
+    uint64_t frame = UINT64_MAX;
+    D3D12_GPU_VIRTUAL_ADDRESS address = 0;
+  };
+  FloatConstantUpload float_constants_last_[2];
+  std::vector<uint8_t> float_constants_staging_;
+  uint64_t float_constant_uploads_ = 0;
+  uint64_t float_constant_reuses_ = 0;
+  uint64_t float_constant_upload_bytes_ = 0;
+  bool UploadFloatConstants(uint32_t stage, const uint64_t* float_bitmap, uint32_t float_count,
+                            uint32_t first_register, D3D12_GPU_VIRTUAL_ADDRESS& address_out);
   const D3D12Shader* lod_free_cache_shader_ = nullptr;
   uint64_t lod_free_cache_generation_ = 0;
   uint32_t lod_free_cache_mask_ = 0;

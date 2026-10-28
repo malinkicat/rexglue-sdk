@@ -66,6 +66,11 @@ REXCVAR_DEFINE_BOOL(d3d12_submission_thread, true, "GPU/D3D12",
                     "Execute and submit command lists on another thread, so the command "
                     "processor continues with the next commands meanwhile");
 
+REXCVAR_DEFINE_BOOL(d3d12_present_on_submission_thread, true, "GPU/D3D12",
+                    "With the submission thread, also present from it (in order after the "
+                    "frame's command lists), so the command processor doesn't wait for them "
+                    "at swaps");
+
 REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -1656,6 +1661,14 @@ bool D3D12CommandProcessor::SetupContext() {
 }
 
 void D3D12CommandProcessor::ShutdownContext() {
+  if (presenter_tail_on_submission_thread_) {
+    // Paint inline again (after the pending tail) before the thread goes away.
+    ui::Presenter* presenter = graphics_system_ ? graphics_system_->presenter() : nullptr;
+    if (presenter) {
+      presenter->SetGuestOutputRefreshTailRunner(nullptr);
+    }
+    presenter_tail_on_submission_thread_ = false;
+  }
   AwaitAllQueueOperationsCompletion();
   ShutdownSubmissionThread();
   InvalidateAllVertexBufferResidency();
@@ -2057,6 +2070,18 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
+
+  const bool tail_on_submission_thread =
+      REXCVAR_GET(d3d12_present_on_submission_thread) && UseSubmissionThread();
+  if (tail_on_submission_thread != presenter_tail_on_submission_thread_) {
+    if (tail_on_submission_thread) {
+      presenter->SetGuestOutputRefreshTailRunner(
+          [this](std::function<void()> tail) { EnqueueSubmissionCallback(std::move(tail)); });
+    } else {
+      presenter->SetGuestOutputRefreshTailRunner(nullptr);
+    }
+    presenter_tail_on_submission_thread_ = tail_on_submission_thread;
+  }
 
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
@@ -3676,7 +3701,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     D3D12CommandProcessor* self;
     bool is_swap;
     ~AwaitOnSwap() {
-      if (is_swap) self->AwaitSubmissionThread();
+      if (is_swap && !self->presenter_tail_on_submission_thread_) self->AwaitSubmissionThread();
     }
   } await_on_swap{this, is_swap};
 
@@ -3836,6 +3861,16 @@ void D3D12CommandProcessor::SubmissionThreadMain() {
     submission_jobs_.pop_front();
     submission_thread_busy_ = true;
     lock.unlock();
+    if (job.callback) {
+      job.callback();
+      job.callback = nullptr;
+      lock.lock();
+      submission_thread_busy_ = false;
+      if (submission_jobs_.empty()) {
+        submission_jobs_done_.notify_all();
+      }
+      continue;
+    }
     job.command_allocator->Reset();
     command_list_->Reset(job.command_allocator, nullptr);
     list.SwapCommandStream(job.command_stream);
@@ -3853,6 +3888,18 @@ void D3D12CommandProcessor::SubmissionThreadMain() {
       submission_jobs_done_.notify_all();
     }
   }
+}
+
+void D3D12CommandProcessor::EnqueueSubmissionCallback(std::function<void()> callback) {
+  SubmissionJob job;
+  job.command_allocator = nullptr;
+  job.fence_value = 0;
+  job.callback = std::move(callback);
+  {
+    std::lock_guard lock(submission_mutex_);
+    submission_jobs_.push_back(std::move(job));
+  }
+  submission_job_added_.notify_one();
 }
 
 void D3D12CommandProcessor::AwaitSubmissionThread() {

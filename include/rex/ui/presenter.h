@@ -358,6 +358,13 @@ class Presenter {
   bool RefreshGuestOutput(uint32_t frontbuffer_width, uint32_t frontbuffer_height,
                           uint32_t display_aspect_ratio_x, uint32_t display_aspect_ratio_y,
                           std::function<bool(GuestOutputRefreshContext& context)> refresher);
+  // Optionally runs the end of RefreshGuestOutput (making the new image ready
+  // and painting it) through `runner` - for instance, on the thread that
+  // submits the refresher's GPU work, so presentation stays ordered after that
+  // work on the queue without the guest output thread waiting for it. The
+  // next refresh awaits the previous end. Pass nullptr to run it inline again
+  // (awaits the pending end). Call from the guest output thread.
+  void SetGuestOutputRefreshTailRunner(std::function<void(std::function<void()>)> runner);
   // The implementation must be callable from any thread, including from
   // multiple at the same time, and it should acquire the latest guest output
   // image via ConsumeGuestOutput.
@@ -715,6 +722,10 @@ class Presenter {
   //
   // Call via PaintAndPresent.
   virtual PaintResult PaintAndPresentImpl(bool execute_ui_drawers) = 0;
+  // Last among the virtual functions (keeps the vtable layout of the prebuilt SDK).
+  // Called after a successful RefreshGuestOutputImpl, before the image is made
+  // ready - on the tail runner's thread if one is set.
+  virtual void RefreshGuestOutputImplFinish(uint32_t /*mailbox_index*/) {}
 
   // For calling from the painting implementations if requested.
   void ExecuteUIDrawersFromUIThread(UIDrawContext& ui_draw_context);
@@ -1051,6 +1062,15 @@ class Presenter {
 
   std::thread dxgi_ui_tick_thread_;
 #endif  // XE_PLATFORM
+
+  // At the end (keeps the layout of the prebuilt SDK).
+  // The end of RefreshGuestOutput running elsewhere (SetGuestOutputRefreshTailRunner).
+  void AwaitGuestOutputRefreshTail();
+  std::function<void(std::function<void()>)> guest_output_refresh_tail_runner_;
+  std::mutex guest_output_refresh_tail_mutex_;
+  std::condition_variable guest_output_refresh_tail_cv_;
+  uint64_t guest_output_refresh_tails_queued_ = 0;
+  uint64_t guest_output_refresh_tails_done_ = 0;
 };
 
 }  // namespace ui

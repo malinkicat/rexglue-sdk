@@ -530,14 +530,22 @@ bool D3D12Presenter::RefreshGuestOutputImpl(
   }
   D3D12GuestOutputRefreshContext context(is_8bpc_out_ref, guest_output_resource_ref.second.Get());
   bool refresher_succeeded = refresher(context);
-  // Even if the refresher has returned false, it still might have submitted
-  // some commands referencing the resource. It's better to put an excessive
-  // signal and wait slightly longer, for nothing important, while shutting down
-  // than to destroy the resource while it's still in use.
-  guest_output_resource_ref.first =
+  if (!refresher_succeeded) {
+    // It still might have submitted some commands referencing the resource.
+    // It's better to put an excessive signal and wait slightly longer, for
+    // nothing important, while shutting down than to destroy the resource
+    // while it's still in use.
+    RefreshGuestOutputImplFinish(mailbox_index);
+  }
+  return refresher_succeeded;
+}
+
+void D3D12Presenter::RefreshGuestOutputImplFinish(uint32_t mailbox_index) {
+  // Signaled after the refresher's work on the queue (on the tail runner's
+  // thread if the refresher's submission is queued there).
+  guest_output_resources_[mailbox_index].first =
       guest_output_resource_refresher_submission_tracker_.GetCurrentSubmission();
   guest_output_resource_refresher_submission_tracker_.NextSubmission();
-  return refresher_succeeded;
 }
 
 void D3D12Presenter::PaintContext::DestroySwapChain() {

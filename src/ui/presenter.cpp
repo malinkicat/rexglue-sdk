@@ -550,6 +550,9 @@ bool Presenter::RefreshGuestOutput(
     uint32_t frontbuffer_width, uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
     uint32_t display_aspect_ratio_y,
     std::function<bool(GuestOutputRefreshContext& context)> refresher) {
+  // The previous refresh's end may still be running (on the tail runner): it
+  // owns the writable image index and the painting until it's done.
+  AwaitGuestOutputRefreshTail();
   GuestOutputProperties& writable_properties =
       guest_output_properties_[guest_output_mailbox_writable_];
   writable_properties.frontbuffer_width = frontbuffer_width;
@@ -576,77 +579,110 @@ bool Presenter::RefreshGuestOutput(
     guest_output_active_last_refresh_ = false;
   }
 
-  // Make the new image the next to present on the host (the "ready" one),
-  // replacing the one already specified as the next (dropping it instead of
-  // enqueueing the new image after it) to achieve the lowest latency (also,
-  // after switching from UI thread painting to doing it in the guest output
-  // thread, will immediately recover to having the latest frame always sent to
-  // the host present call on the CPU and all frames reaching a present call).
-  uint32_t last_acquired_and_ready =
-      guest_output_mailbox_acquired_and_ready_.load(std::memory_order_relaxed);
-  // Desired acquired = current acquired (changed only by the consumers).
-  // Desired ready = current writable.
-  // memory_order_acq_rel to acquire the new writable image and to release the
-  // current one (to let the consumers take it, from ready to acquired).
-  while (!guest_output_mailbox_acquired_and_ready_.compare_exchange_weak(
-      last_acquired_and_ready,
-      (last_acquired_and_ready & 3) | (guest_output_mailbox_writable_ << 2),
-      std::memory_order_acq_rel, std::memory_order_relaxed)) {}
-  // Now, it's known that `ready == writable` on the host presentation side.
-  // Take the next `writable` with this assumption about its current value in
-  // mind.
-  uint32_t last_acquired = last_acquired_and_ready & 3;
-  if (last_acquired == guest_output_mailbox_writable_) {
-    // The new image has already been acquired by the time the compare-exchange
-    // loop has finished (acquired == ready == currently writable).
-    // It's a valid situation from the ownership perspective, and the semantics
-    // of the weak compare-exchange explicitly permit spurious `false` results.
-    // (3 - a - b) % 3 cannot be used here, as (3 - a - a) % 3 results in `a` -
-    // the same index.
-    // Take any free image. Preferably using + 1, not ^ 1, so if the guest needs
-    // to await any GPU work referencing the image, it will wait for the frame 3
-    // frames ago, not 2, if this happens repeatedly.
-    guest_output_mailbox_writable_ = (guest_output_mailbox_writable_ + 1) % 3;
-  } else {
-    // Take the image other than the last acquired one and the new one,
-    // currently not accessible to the host presentation.
-    guest_output_mailbox_writable_ = (3 - last_acquired - guest_output_mailbox_writable_) % 3;
-  }
+  auto tail = [this, is_active]() {
+    if (is_active) {
+      RefreshGuestOutputImplFinish(guest_output_mailbox_writable_);
+    }
+    // Make the new image the next to present on the host (the "ready" one),
+    // replacing the one already specified as the next (dropping it instead of
+    // enqueueing the new image after it) to achieve the lowest latency (also,
+    // after switching from UI thread painting to doing it in the guest output
+    // thread, will immediately recover to having the latest frame always sent to
+    // the host present call on the CPU and all frames reaching a present call).
+    uint32_t last_acquired_and_ready =
+        guest_output_mailbox_acquired_and_ready_.load(std::memory_order_relaxed);
+    // Desired acquired = current acquired (changed only by the consumers).
+    // Desired ready = current writable.
+    // memory_order_acq_rel to acquire the new writable image and to release the
+    // current one (to let the consumers take it, from ready to acquired).
+    while (!guest_output_mailbox_acquired_and_ready_.compare_exchange_weak(
+        last_acquired_and_ready,
+        (last_acquired_and_ready & 3) | (guest_output_mailbox_writable_ << 2),
+        std::memory_order_acq_rel, std::memory_order_relaxed)) {}
+    // Now, it's known that `ready == writable` on the host presentation side.
+    // Take the next `writable` with this assumption about its current value in
+    // mind.
+    uint32_t last_acquired = last_acquired_and_ready & 3;
+    if (last_acquired == guest_output_mailbox_writable_) {
+      // The new image has already been acquired by the time the compare-exchange
+      // loop has finished (acquired == ready == currently writable).
+      // It's a valid situation from the ownership perspective, and the semantics
+      // of the weak compare-exchange explicitly permit spurious `false` results.
+      // (3 - a - b) % 3 cannot be used here, as (3 - a - a) % 3 results in `a` -
+      // the same index.
+      // Take any free image. Preferably using + 1, not ^ 1, so if the guest needs
+      // to await any GPU work referencing the image, it will wait for the frame 3
+      // frames ago, not 2, if this happens repeatedly.
+      guest_output_mailbox_writable_ = (guest_output_mailbox_writable_ + 1) % 3;
+    } else {
+      // Take the image other than the last acquired one and the new one,
+      // currently not accessible to the host presentation.
+      guest_output_mailbox_writable_ = (3 - last_acquired - guest_output_mailbox_writable_) % 3;
+    }
 
-  // Trigger the presentation on the host.
-  PaintResult paint_result = PaintResult::kNotPresented;
-  {
-    std::lock_guard<std::mutex> paint_mode_mutex_lock(paint_mode_mutex_);
-    switch (paint_mode_) {
-      case PaintMode::kNone:
-        // Neither painting nor window paint requesting is accessible.
-        break;
-      case PaintMode::kUIThreadOnRequest:
-        // Only window paint requesting is accessible.
-        RequestPaintOrConnectionRecoveryViaWindow(true);
-        break;
-      case PaintMode::kGuestOutputThreadImmediately:
-        // Both painting and window paint requesting are accessible.
-        if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable) {
-          paint_result = PaintAndPresent(false);
-          if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
-            RequestPaintOrConnectionRecoveryViaWindow(true);
+    // Trigger the presentation on the host.
+    PaintResult paint_result = PaintResult::kNotPresented;
+    {
+      std::lock_guard<std::mutex> paint_mode_mutex_lock(paint_mode_mutex_);
+      switch (paint_mode_) {
+        case PaintMode::kNone:
+          // Neither painting nor window paint requesting is accessible.
+          break;
+        case PaintMode::kUIThreadOnRequest:
+          // Only window paint requesting is accessible.
+          RequestPaintOrConnectionRecoveryViaWindow(true);
+          break;
+        case PaintMode::kGuestOutputThreadImmediately:
+          // Both painting and window paint requesting are accessible.
+          if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable) {
+            paint_result = PaintAndPresent(false);
+            if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
+              RequestPaintOrConnectionRecoveryViaWindow(true);
+            }
           }
-        }
-        break;
+          break;
+      }
     }
-  }
-  // Handle GPU loss when not in the middle of the function anymore, and
-  // lifecycle management from the GPU loss callback is fine on the UI thread.
-  if (host_gpu_loss_callback_) {
-    if (paint_result == PaintResult::kGpuLostResponsible) {
-      host_gpu_loss_callback_(true, false);
-    } else if (paint_result == PaintResult::kGpuLostExternally) {
-      host_gpu_loss_callback_(false, false);
+    // Handle GPU loss when not in the middle of the function anymore, and
+    // lifecycle management from the GPU loss callback is fine on the UI thread.
+    if (host_gpu_loss_callback_) {
+      if (paint_result == PaintResult::kGpuLostResponsible) {
+        host_gpu_loss_callback_(true, false);
+      } else if (paint_result == PaintResult::kGpuLostExternally) {
+        host_gpu_loss_callback_(false, false);
+      }
     }
+  };
+  if (guest_output_refresh_tail_runner_) {
+    {
+      std::lock_guard<std::mutex> lock(guest_output_refresh_tail_mutex_);
+      ++guest_output_refresh_tails_queued_;
+    }
+    guest_output_refresh_tail_runner_([this, tail = std::move(tail)]() {
+      tail();
+      {
+        std::lock_guard<std::mutex> lock(guest_output_refresh_tail_mutex_);
+        ++guest_output_refresh_tails_done_;
+      }
+      guest_output_refresh_tail_cv_.notify_all();
+    });
+  } else {
+    tail();
   }
 
   return is_active;
+}
+
+void Presenter::AwaitGuestOutputRefreshTail() {
+  std::unique_lock<std::mutex> lock(guest_output_refresh_tail_mutex_);
+  guest_output_refresh_tail_cv_.wait(
+      lock, [this] { return guest_output_refresh_tails_done_ == guest_output_refresh_tails_queued_; });
+}
+
+void Presenter::SetGuestOutputRefreshTailRunner(
+    std::function<void(std::function<void()>)> runner) {
+  AwaitGuestOutputRefreshTail();
+  guest_output_refresh_tail_runner_ = std::move(runner);
 }
 
 void Presenter::SetGuestOutputPaintConfigFromUIThread(const GuestOutputPaintConfig& new_config) {

@@ -511,7 +511,13 @@ class D3D12CommandProcessor : public CommandProcessor {
     std::vector<uintmax_t> command_stream;
     ID3D12CommandAllocator* command_allocator;
     uint64_t fence_value;
+    // If set, run instead of submitting (in order with the submissions).
+    std::function<void()> callback;
   };
+  void EnqueueSubmissionCallback(std::function<void()> callback);
+  // The presenter's refresh tail (paint and present) runs on the submission
+  // thread (d3d12_present_on_submission_thread).
+  bool presenter_tail_on_submission_thread_ = false;
   std::thread submission_thread_;
   std::mutex submission_mutex_;
   std::condition_variable submission_job_added_;

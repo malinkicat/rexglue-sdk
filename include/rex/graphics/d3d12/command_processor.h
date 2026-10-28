@@ -203,6 +203,14 @@ class D3D12CommandProcessor : public CommandProcessor {
   // DxbcShaderTranslator::Modification::PixelShaderModification::
   // lod_free_fetch_mask for the current draw (may request textures).
   uint32_t GetLodFreeFetchMask(const D3D12Shader& pixel_shader);
+  uint32_t ComputeLodFreeFetchMask(const D3D12Shader& pixel_shader);
+  // GetLodFreeFetchMask of the last pixel shader, valid while the texture
+  // fetch constants 0-11 and the bindings are unchanged.
+  // Draws for gpu_pass_profile.
+  uint64_t issued_draw_count_ = 0;
+  const D3D12Shader* lod_free_cache_shader_ = nullptr;
+  uint64_t lod_free_cache_generation_ = 0;
+  uint32_t lod_free_cache_mask_ = 0;
   // gpu_profile: the part of the frame the next recorded commands belong to.
   void SetGpuProfilePass(rex::perf::GpuPass pass) {
     deferred_command_list_.SetProfilePass(uint8_t(pass));

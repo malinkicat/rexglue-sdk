@@ -90,6 +90,7 @@ class TextureCache {
   // Statistics (gpu_pass_profile): binding resets after a texture became
   // outdated, bindings re-evaluated, and RequestTextures calls.
   uint64_t outdated_binding_resets_ = 0;
+  uint64_t fetch_constants_0_11_generation_ = 0;
   uint64_t requested_bindings_ = 0;
   uint64_t request_textures_calls_ = 0;
 
@@ -124,6 +125,16 @@ class TextureCache {
     uint32_t bit_count = last_index - first_index + 1;
     uint32_t mask = bit_count == 32 ? UINT32_MAX : ((UINT32_C(1) << bit_count) - 1) << first_index;
     texture_bindings_in_sync_ &= ~mask;
+    if (first_index < 12) {
+      ++fetch_constants_0_11_generation_;
+    }
+  }
+  // Changes when texture fetch constants 0-11 are written or the bindings are
+  // reset (for caching things derived from them and the bound textures).
+  uint64_t fetch_constants_0_11_generation() const { return fetch_constants_0_11_generation_; }
+  // A texture became outdated (its bindings are reset on the next request).
+  bool IsAnyTextureOutdatedPending() const {
+    return texture_became_outdated_.load(std::memory_order_relaxed);
   }
 
   virtual void RequestTextures(uint32_t used_texture_mask);

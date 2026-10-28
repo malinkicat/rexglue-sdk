@@ -998,6 +998,7 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
 }
 
 void TextureCache::ResetTextureBindings(bool from_destructor) {
+  ++fetch_constants_0_11_generation_;
   uint32_t bindings_reset = 0;
   for (size_t i = 0; i < texture_bindings_.size(); ++i) {
     TextureBinding& binding = texture_bindings_[i];

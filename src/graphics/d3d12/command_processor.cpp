@@ -1956,7 +1956,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       frames = 0;
       cycles_start = cycles_now;
     } else if (++frames == 300) {
-      const uint64_t draws = texture_cache_->request_textures_calls_;
+      const uint64_t draws = std::exchange(issued_draw_count_, 0);
       REXGPU_INFO("gpu_pass_profile: command processor {:.2f} Mcycles/frame, {:.0f} cycles/draw",
                   double(cycles_now - cycles_start) / 1e6 / frames,
                   draws ? double(cycles_now - cycles_start) / double(draws) : 0.0);
@@ -1980,7 +1980,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                   double(stats.cp_submissions.exchange(0)) / frames,
                   double(std::exchange(texture_cache_->outdated_binding_resets_, 0)) / frames,
                   double(std::exchange(texture_cache_->requested_bindings_, 0)) / frames,
-                  double(std::exchange(texture_cache_->request_textures_calls_, 0)) / frames);
+                  double(draws) / frames);
       frames = 0;
     }
   }
@@ -2342,6 +2342,24 @@ Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_
 }
 
 uint32_t D3D12CommandProcessor::GetLodFreeFetchMask(const D3D12Shader& pixel_shader) {
+  // The previous draw's result if nothing it depends on changed (most draws).
+  // RequestTextures below is still called after a texture became outdated,
+  // as ResetTextureBindings changes the generation.
+  // (The generation is read after RequestTextures in the computation below,
+  // which may itself reset the bindings.)
+  if (lod_free_cache_shader_ == &pixel_shader &&
+      lod_free_cache_generation_ == texture_cache_->fetch_constants_0_11_generation() &&
+      !texture_cache_->IsAnyTextureOutdatedPending()) {
+    return lod_free_cache_mask_;
+  }
+  const uint32_t mask = ComputeLodFreeFetchMask(pixel_shader);
+  lod_free_cache_shader_ = &pixel_shader;
+  lod_free_cache_generation_ = texture_cache_->fetch_constants_0_11_generation();
+  lod_free_cache_mask_ = mask;
+  return mask;
+}
+
+uint32_t D3D12CommandProcessor::ComputeLodFreeFetchMask(const D3D12Shader& pixel_shader) {
   // Texture fetches whose result can't depend on the level of detail: 1D / 2D,
   // a single mip level in the fetch constant and in the texture actually bound
   // (a texture pack replacement may have more), the same minification and
@@ -2419,6 +2437,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
 
   ID3D12Device* device = GetD3D12Provider().GetDevice();
   const RegisterFile& regs = *register_file_;
+  ++issued_draw_count_;
 
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {

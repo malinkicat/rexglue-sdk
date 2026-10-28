@@ -2125,6 +2125,20 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
     // polled for the last time without releasing the lock.
     SystemPageFlagsBlock& page_flags_block = system_page_flags_[i >> 6];
     uint64_t page_flags_bit = uint64_t(1) << (i & 63);
+    // Already watched (the common case - ranges are re-watched after every
+    // upload): nothing to do, for a whole block of 64 pages at once if possible.
+    if (enable_invalidation_notifications && !enable_data_providers &&
+        (page_flags_block.notify_on_invalidation & page_flags_bit)) {
+      if (protect_system_page_first != UINT32_MAX) {
+        rex::memory::Protect(protect_base + protect_system_page_first * system_page_size_,
+                             (i - protect_system_page_first) * system_page_size_, protect_access);
+        protect_system_page_first = UINT32_MAX;
+      }
+      if (!(i & 63) && page_flags_block.notify_on_invalidation == ~uint64_t(0)) {
+        i = std::min(i + 63, system_page_last);
+      }
+      continue;
+    }
     uint32_t guest_page_number =
         rex::sat_sub(i * system_page_size_, host_address_offset()) >> page_size_shift_;
     if (guest_page_number >= page_table_.size()) {

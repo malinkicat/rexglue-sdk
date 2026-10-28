@@ -36,6 +36,9 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
 
+REXCVAR_DEFINE_BOOL(gpu_read_pointer_progress, true, "GPU",
+                    "Write the ring buffer read pointer back after every primary ring packet "
+                    "(like the hardware), not only when the batch is done");
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 REXCVAR_DEFINE_BOOL(swap_times, false, "GPU",
                     "Debug: write the time of every guest swap to swaptimes.csv");
@@ -638,6 +641,14 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
       REXGPU_ERROR("**** PRIMARY RINGBUFFER: Failed to execute packet.");
       assert_always();
       break;
+    }
+    // Like the hardware (every RB_BLKSZ), report the progress while going: a
+    // guest waiting for ring space (Amped 3 spins on it) continues as soon as
+    // the packets before it are done, not after the whole batch. They are
+    // mostly indirect buffers, executed completely by now.
+    if (read_ptr_writeback_ptr_ && REXCVAR_GET(gpu_read_pointer_progress)) {
+      memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
+                                       uint32_t(reader.read_offset() / sizeof(uint32_t)));
     }
   } while (reader.read_count());
 

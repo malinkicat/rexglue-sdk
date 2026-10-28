@@ -1132,6 +1132,28 @@ uint32_t D3D12TextureCache::GetActiveTextureBindlessSRVIndex(
 D3D12TextureCache::SamplerParameters D3D12TextureCache::GetSamplerParameters(
     const D3D12Shader::SamplerBinding& binding) const {
   const auto& regs = register_file();
+  // The same inputs as the last time for this fetch constant (most draws).
+  const uint32_t* fetch_dwords =
+      &regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 6 * binding.fetch_constant];
+  const uint32_t binding_and_override =
+      uint32_t(binding.mag_filter) | (uint32_t(binding.min_filter) << 4) |
+      (uint32_t(binding.mip_filter) << 8) | (uint32_t(binding.aniso_filter) << 12) |
+      (uint32_t(REXCVAR_GET(anisotropic_override) + 1) << 16);
+  SamplerParametersCacheEntry& cache_entry = sampler_parameters_cache_[binding.fetch_constant & 31];
+  if (cache_entry.valid && cache_entry.binding_and_override == binding_and_override &&
+      !std::memcmp(cache_entry.fetch, fetch_dwords, sizeof(cache_entry.fetch))) {
+    return cache_entry.parameters;
+  }
+  std::memcpy(cache_entry.fetch, fetch_dwords, sizeof(cache_entry.fetch));
+  cache_entry.binding_and_override = binding_and_override;
+  cache_entry.valid = true;
+  cache_entry.parameters = ComputeSamplerParameters(binding);
+  return cache_entry.parameters;
+}
+
+D3D12TextureCache::SamplerParameters D3D12TextureCache::ComputeSamplerParameters(
+    const D3D12Shader::SamplerBinding& binding) const {
+  const auto& regs = register_file();
   xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(binding.fetch_constant);
 
   SamplerParameters parameters;

@@ -114,6 +114,7 @@ class D3D12TextureCache final : public TextureCache {
   uint32_t GetActiveTextureBindlessSRVIndex(const D3D12Shader::TextureBinding& host_shader_binding);
 
   SamplerParameters GetSamplerParameters(const D3D12Shader::SamplerBinding& binding) const;
+  SamplerParameters ComputeSamplerParameters(const D3D12Shader::SamplerBinding& binding) const;
   void WriteSampler(SamplerParameters parameters, D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
 
   // Returns whether the actual scale is not smaller than the requested one.
@@ -690,6 +691,15 @@ class D3D12TextureCache final : public TextureCache {
   void MaterializeDirectResolves(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
   void MaterializeDirectResolve(PendingDirectResolve& pending);
   void RetainUntilSubmissionCompleted(Microsoft::WRL::ComPtr<ID3D12Resource> resource);
+  // GetSamplerParameters results per fetch constant, for the same fetch
+  // constant dwords, binding filter overrides and anisotropic_override.
+  struct SamplerParametersCacheEntry {
+    uint32_t fetch[6];
+    uint32_t binding_and_override;
+    bool valid = false;
+    SamplerParameters parameters;
+  };
+  mutable SamplerParametersCacheEntry sampler_parameters_cache_[32];
 };
 
 }  // namespace rex::graphics::d3d12

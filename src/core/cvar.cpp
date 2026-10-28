@@ -595,7 +595,8 @@ std::vector<std::string> Init(int argc, char** argv) {
       app.add_option_function<std::string>(
           "--" + entry.name,
           [&entry](const std::string& val) { ApplyFromSource(entry, val, Source::kCommandLine); },
-          entry.description);
+          entry.description)
+          ->multi_option_policy(CLI::MultiOptionPolicy::TakeLast);
     }
   }
 

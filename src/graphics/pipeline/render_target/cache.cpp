@@ -934,6 +934,122 @@ void RenderTargetCache::GetResolveCopyDispatchesToDump(
   }
 }
 
+RenderTargetCache::RenderTarget* RenderTargetCache::GetSingleOwner(
+    uint32_t base_tiles, uint32_t start_tiles_base_relative, uint32_t length_tiles) const {
+  if (!length_tiles) {
+    return nullptr;
+  }
+  const uint32_t start = base_tiles + start_tiles_base_relative;
+  const uint32_t end = start + length_tiles;
+  if (end > xenos::kEdramTileCount) {
+    return nullptr;
+  }
+  // No gaps in the ranges - the one containing the start is the last one
+  // beginning at or before it.
+  auto it = ownership_ranges_.upper_bound(start);
+  if (it == ownership_ranges_.begin()) {
+    return nullptr;
+  }
+  --it;
+  const RenderTargetKey owner = it->second.render_target;
+  if (owner.IsEmpty()) {
+    return nullptr;
+  }
+  for (; it != ownership_ranges_.end() && it->first < end; ++it) {
+    if (it->second.render_target != owner) {
+      return nullptr;
+    }
+  }
+  auto rt_it = render_targets_.find(owner);
+  return rt_it != render_targets_.end() ? rt_it->second : nullptr;
+}
+
+bool RenderTargetCache::PrepareHostRenderTargetsDrawnClear(
+    uint32_t pitch_tiles_at_32bpp, uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1,
+    bool is_depth, uint32_t depth_base, uint32_t depth_format, bool is_color, uint32_t color_base,
+    uint32_t color_format, Transfer::Rectangle& clear_rectangle_out,
+    RenderTarget*& depth_render_target_out, std::vector<Transfer>& depth_transfers_out,
+    RenderTarget*& color_render_target_out, std::vector<Transfer>& color_transfers_out) {
+  assert_true(GetPath() == Path::kHostRenderTargets);
+  if (!pitch_tiles_at_32bpp || x1 <= x0 || y1 <= y0 || (!is_depth && !is_color)) {
+    return false;
+  }
+  const uint32_t pitch_pixels = pitch_tiles_at_32bpp * xenos::kEdramTileWidthSamples;
+  if (x1 > pitch_pixels || pitch_pixels * draw_resolution_scale_x() > GetMaxRenderTargetWidth() ||
+      y1 > GetRenderTargetHeight(pitch_tiles_at_32bpp, xenos::MsaaSamples::k1X)) {
+    return false;
+  }
+  Transfer::Rectangle clear_rectangle;
+  clear_rectangle.x_pixels = x0;
+  clear_rectangle.y_pixels = y0;
+  clear_rectangle.width_pixels = x1 - x0;
+  clear_rectangle.height_pixels = y1 - y0;
+  const uint32_t start_tiles = (y0 / xenos::kEdramTileHeightSamples) * pitch_tiles_at_32bpp +
+                               x0 / xenos::kEdramTileWidthSamples;
+  const uint32_t length_tiles = ((y1 - 1) / xenos::kEdramTileHeightSamples) * pitch_tiles_at_32bpp +
+                                (x1 - 1) / xenos::kEdramTileWidthSamples + 1 - start_tiles;
+  if (start_tiles + length_tiles > xenos::kEdramTileCount) {
+    return false;
+  }
+  RenderTarget* depth_render_target = nullptr;
+  RenderTargetKey depth_key;
+  if (is_depth) {
+    depth_key.base_tiles = depth_base;
+    depth_key.pitch_tiles_at_32bpp = pitch_tiles_at_32bpp;
+    depth_key.msaa_samples = xenos::MsaaSamples::k1X;
+    depth_key.is_depth = 1;
+    depth_key.resource_format = depth_format;
+    depth_render_target = GetOrCreateRenderTarget(depth_key);
+    if (!depth_render_target) {
+      return false;
+    }
+  }
+  RenderTarget* color_render_target = nullptr;
+  RenderTargetKey color_key;
+  if (is_color) {
+    color_key.base_tiles = color_base;
+    color_key.pitch_tiles_at_32bpp = pitch_tiles_at_32bpp;
+    color_key.msaa_samples = xenos::MsaaSamples::k1X;
+    color_key.is_depth = 0;
+    color_key.resource_format = color_format;
+    if (color_key.Is64bpp()) {
+      return false;
+    }
+    color_render_target = GetOrCreateRenderTarget(color_key);
+    if (!color_render_target) {
+      return false;
+    }
+  }
+  clear_rectangle_out = clear_rectangle;
+  depth_render_target_out = depth_render_target;
+  depth_transfers_out.clear();
+  color_render_target_out = color_render_target;
+  color_transfers_out.clear();
+  // Only the tiles the rectangle touches - row by row if it's narrower than
+  // the pitch, so the tiles between the rows keep their owners (and aren't
+  // copied).
+  const uint32_t tile_x0 = x0 / xenos::kEdramTileWidthSamples;
+  const uint32_t tile_x1 = (x1 - 1) / xenos::kEdramTileWidthSamples + 1;
+  const uint32_t tile_y0 = y0 / xenos::kEdramTileHeightSamples;
+  const uint32_t tile_y1 = (y1 - 1) / xenos::kEdramTileHeightSamples + 1;
+  auto change_ownership = [&](uint32_t start, uint32_t length) {
+    if (depth_render_target) {
+      ChangeOwnership(depth_key, start, length, &depth_transfers_out, &clear_rectangle);
+    }
+    if (color_render_target) {
+      ChangeOwnership(color_key, start, length, &color_transfers_out, &clear_rectangle);
+    }
+  };
+  if (tile_x0 == 0 && tile_x1 == pitch_tiles_at_32bpp) {
+    change_ownership(start_tiles, length_tiles);
+  } else {
+    for (uint32_t tile_y = tile_y0; tile_y < tile_y1; ++tile_y) {
+      change_ownership(tile_y * pitch_tiles_at_32bpp + tile_x0, tile_x1 - tile_x0);
+    }
+  }
+  return true;
+}
+
 bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
     const draw_util::ResolveInfo& resolve_info, Transfer::Rectangle& clear_rectangle_out,
     RenderTarget*& depth_render_target_out, std::vector<Transfer>& depth_transfers_out,

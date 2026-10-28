@@ -130,6 +130,8 @@ if(REXGLUE_ENABLE_TRACY)
         $<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PROFILING>)
 endif()
 
+target_sources(rexcore PRIVATE perf/frame_rate.cpp)
+
 if(REXGLUE_ENABLE_PERF_COUNTERS)
     target_sources(rexcore PRIVATE perf/counter.cpp)
     target_compile_definitions(rexcore PUBLIC

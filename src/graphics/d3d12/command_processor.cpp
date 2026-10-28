@@ -10,6 +10,12 @@
  */
 
 #include <algorithm>
+#include <cmath>
+#include <atomic>
+#include <bit>
+#include <chrono>
+#include <map>
+#include <unordered_set>
 #include <cstdarg>
 #include <cstring>
 #include <sstream>
@@ -41,6 +47,18 @@ REXCVAR_DEFINE_BOOL(d3d12_readback_memexport, false, "GPU/D3D12",
 
 REXCVAR_DEFINE_BOOL(d3d12_readback_resolve, false, "GPU/D3D12",
                     "Read render-to-texture results on the CPU")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(gpu_debug_log_draws, 0, "GPU/Debug",
+                     "Log the state of every draw for this many frames (counts down)");
+
+REXCVAR_DEFINE_BOOL(gpu_pass_profile, false, "GPU/Debug",
+                    "Log the GPU time per frame of each kind of pass every 300 frames");
+
+REXCVAR_DEFINE_BOOL(gpu_clear_draws_in_place, true, "GPU/D3D12",
+                    "Do clears the game draws as constant rectangles (like the Xbox 360 Direct3D 9 "
+                    "Clear through a 4x MSAA view) as render target clears where the data "
+                    "already is, without moving it between render targets")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
@@ -1913,12 +1931,37 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
 
   // Obtain the actual swap source texture size (resolution-scaled if it's a
   // resolve destination, or not otherwise).
+  if (REXCVAR_GET(gpu_pass_profile)) {
+    // GPU time per frame of each pass, every 300 frames.
+    rex::perf::GpuProfileStats& stats = rex::perf::GetGpuProfileStats();
+    static uint32_t frames = 0;
+    if (!stats.enabled.exchange(true)) {
+      frames = 0;
+    } else if (++frames == 300) {
+      std::string line;
+      double total = 0.0;
+      for (uint32_t i = 0; i < uint32_t(rex::perf::GpuPass::kCount); ++i) {
+        const uint64_t ns = stats.pass_ns[i].exchange(0);
+        const uint64_t count = stats.pass_count[i].exchange(0);
+        total += double(ns);
+        if (ns) {
+          line += fmt::format(" {}={:.2f}ms/{}", rex::perf::GetGpuPassName(rex::perf::GpuPass(i)),
+                              double(ns) / 1e6 / frames, count / frames);
+        }
+      }
+      REXGPU_INFO("gpu_pass_profile: {:.2f} ms/frame:{} (clears in place {}/frame)",
+                  total / 1e6 / frames, line, stats.clears_in_place.exchange(0) / frames);
+      frames = 0;
+    }
+  }
   D3D12_SHADER_RESOURCE_VIEW_DESC swap_texture_srv_desc;
   xenos::TextureFormat frontbuffer_format;
   uint32_t frontbuffer_width_unscaled = 0, frontbuffer_height_unscaled = 0;
+  SetGpuProfilePass(rex::perf::GpuPass::kTextureLoad);
   ID3D12Resource* swap_texture_resource =
       texture_cache_->RequestSwapTexture(swap_texture_srv_desc, frontbuffer_format,
                                          &frontbuffer_width_unscaled, &frontbuffer_height_unscaled);
+  SetGpuProfilePass(rex::perf::GpuPass::kSwap);
   if (!swap_texture_resource) {
     // Dump texture fetch constant 0 for debugging
     const auto& regs = *register_file_;
@@ -2331,6 +2374,14 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     return false;
   }
 
+  SetGpuProfilePass(rex::perf::GpuPass::kOther);
+
+  if (!memexport_used && !active_occlusion_query_.valid && REXCVAR_GET(gpu_clear_draws_in_place) &&
+      render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets &&
+      TryClearDrawInPlace(*vertex_shader, pixel_shader, draw_util::GetNormalizedDepthControl(regs))) {
+    return true;
+  }
+
   // Process primitives.
   PrimitiveProcessor::ProcessingResult primitive_processing_result;
   if (!primitive_processor_->Process(primitive_processing_result)) {
@@ -2407,7 +2458,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   uint32_t used_texture_mask =
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
+  SetGpuProfilePass(rex::perf::GpuPass::kTextureLoad);
   texture_cache_->RequestTextures(used_texture_mask);
+  SetGpuProfilePass(rex::perf::GpuPass::kOther);
 
   // Bind the pipeline after configuring it and doing everything that may bind
   // other pipelines.
@@ -2476,6 +2529,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   // Must not call anything that can change the descriptor heap from now on!
 
   // Ensure vertex buffers are resident.
+  SetGpuProfilePass(rex::perf::GpuPass::kSharedMemory);
   const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
   for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
     uint32_t vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
@@ -2613,6 +2667,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         assert_unhandled_case(primitive_processing_result.host_primitive_type);
         return false;
     }
+  }
+  SetGpuProfilePass(memexport_used ? rex::perf::GpuPass::kDrawMemexport : rex::perf::GpuPass::kDraw);
+  if (rex::perf::IsGpuProfiling()) {
+    rex::perf::GetGpuProfileStats().draws.fetch_add(1, std::memory_order_relaxed);
   }
   SetPrimitiveTopology(primitive_topology);
   // Must not call anything that may change the primitive topology from now on!
@@ -2877,6 +2935,10 @@ bool D3D12CommandProcessor::IssueCopy() {
   if (!BeginSubmission(true)) {
     return false;
   }
+  SetGpuProfilePass(rex::perf::GpuPass::kResolve);
+  if (rex::perf::IsGpuProfiling()) {
+    rex::perf::GetGpuProfileStats().resolves.fetch_add(1, std::memory_order_relaxed);
+  }
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     uint32_t written_address, written_length;
@@ -3137,7 +3199,19 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
     if (SUCCEEDED(
             submission_fence_->SetEventOnCompletion(await_submission, fence_completion_event_))) {
       PROFILE_CMD_BUFFER_STALL();
+      const bool profiling = rex::perf::IsGpuProfiling();
+      const auto wait_start =
+          profiling ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
       WaitForSingleObject(fence_completion_event_, INFINITE);
+      if (profiling) {
+        rex::perf::GpuProfileStats& stats = rex::perf::GetGpuProfileStats();
+        stats.fence_waits.fetch_add(1, std::memory_order_relaxed);
+        stats.fence_wait_ns.fetch_add(
+            uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now() - wait_start)
+                         .count()),
+            std::memory_order_relaxed);
+      }
       submission_completed_ = submission_fence_->GetCompletedValue();
     }
   }
@@ -3192,6 +3266,8 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
   primitive_processor_->CompletedSubmissionUpdated();
 
   texture_cache_->CompletedSubmissionUpdated(submission_completed_);
+
+  GpuProfileReadCompleted();
 }
 
 void D3D12CommandProcessor::LogDeviceRemovalDiagnostics(ID3D12Device* device, HRESULT reason) {
@@ -3302,6 +3378,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     // end of the submission (when async pipeline creation requests are
     // fulfilled).
     deferred_command_list_.Reset();
+    GpuProfileBeginSubmission();
 
     // Reset cached state of the command list.
     ff_viewport_update_needed_ = true;
@@ -3413,6 +3490,11 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     // Submit barriers now because resources with the queued barriers may be
     // destroyed between frames.
     SubmitBarriers();
+
+    GpuProfileEndSubmission();
+    if (rex::perf::IsGpuProfiling()) {
+      rex::perf::GetGpuProfileStats().cp_submissions.fetch_add(1, std::memory_order_relaxed);
+    }
 
     ID3D12CommandQueue* direct_queue = provider.GetDirectQueue();
 
@@ -4928,6 +5010,9 @@ bool D3D12CommandProcessor::EndGuestOcclusionQuery(
 
   uint32_t host_index = active_occlusion_query_.host_index;
   active_occlusion_query_ = {};
+  if (rex::perf::IsGpuProfiling()) {
+    rex::perf::GetGpuProfileStats().occlusion_queries.fetch_add(1, std::memory_order_relaxed);
+  }
 
   if (!BeginSubmission(true)) {
     return false;
@@ -4956,6 +5041,448 @@ bool D3D12CommandProcessor::EndGuestOcclusionQuery(
   samples = NormalizeOcclusionSamples(samples);
   WriteGuestOcclusionResult(sample_counts, samples);
   return true;
+}
+
+namespace {
+
+// Captures the position and interpolator 0 a vertex shader exports.
+class ClearDrawExportSink : public ShaderInterpreter::ExportSink {
+ public:
+  void Export(ucode::ExportRegister export_register, const float* value,
+              uint32_t value_mask) override {
+    float* dest = nullptr;
+    uint32_t* written = nullptr;
+    if (export_register == ucode::ExportRegister::kVSPosition) {
+      dest = position;
+      written = &position_written;
+    } else if (export_register == ucode::ExportRegister::kVSInterpolator0) {
+      dest = color;
+      written = &color_written;
+    } else if (export_register == ucode::ExportRegister::kVSPointSizeEdgeFlagKillVertex) {
+      other_written = true;
+      return;
+    } else {
+      return;
+    }
+    for (uint32_t i = 0; i < 4; ++i) {
+      if (value_mask & (uint32_t(1) << i)) {
+        dest[i] = value[i];
+      }
+    }
+    *written |= value_mask;
+  }
+  void Reset() {
+    position_written = 0;
+    color_written = 0;
+    other_written = false;
+  }
+  float position[4] = {};
+  float color[4] = {};
+  uint32_t position_written = 0;
+  uint32_t color_written = 0;
+  bool other_written = false;
+};
+
+// Pixel shaders of clears done by drawing: oC0 = interpolator 0.
+// 2E372EA28CC404B7: the Xbox 360 Direct3D 9 Clear (exec: max oC0, r0, r0).
+// 2B4F1D2C5EDCC366: the same in launch titles (Amped 3), other exec control words.
+constexpr uint64_t kClearDrawPixelShaders[] = {0x2E372EA28CC404B7ull, 0x2B4F1D2C5EDCC366ull};
+
+}  // namespace
+
+// amped3 clear census (temporary): how clear-like draws end, per source line.
+static bool ClearCensusResult(int line) {
+  static std::map<int, uint64_t> counts;
+  static uint64_t total = 0;
+  ++counts[line];
+  if (++total % 1000 == 0) {
+    std::string t;
+    for (auto& [l, c] : counts) t += fmt::format(" {}:{}", l, c);
+    REXGPU_INFO("CLEARCENSUS results (0 = cleared in place){}", t);
+  }
+  return false;
+}
+
+bool D3D12CommandProcessor::TryClearDrawInPlace(const Shader& vertex_shader,
+                                                const Shader* pixel_shader,
+                                                reg::RB_DEPTHCONTROL normalized_depth_control) {
+  const RegisterFile& regs = *register_file_;
+  // A screen-space rectangle (no clipping, no viewport transform), 3 vertices.
+  const auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+  if (vgt_draw_initiator.prim_type != xenos::PrimitiveType::kRectangleList ||
+      vgt_draw_initiator.source_select != xenos::SourceSelect::kAutoIndex ||
+      vgt_draw_initiator.num_indices != 3 ||
+      (xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type) &&
+       regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().path_select ==
+           xenos::VGTOutputPath::kTessellationEnable)) {
+    return false;
+  }
+  const auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
+  if ((vte.value & 0x3F) || !vte.vtx_xy_fmt || !vte.vtx_z_fmt ||
+      !regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable) {
+    return false;
+  }
+  const xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
+  {  // amped3 clear census (temporary)
+    static std::unordered_set<uint64_t> seen;
+    const uint64_t ps = pixel_shader ? pixel_shader->ucode_data_hash() : 0;
+    const uint64_t key = ps ^ (vertex_shader.ucode_data_hash() * 31) ^ (uint64_t(edram_mode) << 60) ^
+                         (uint64_t(normalized_depth_control.value) << 20);
+    if (seen.insert(key).second) {
+      REXGPU_INFO("CLEARCENSUS vs={:016X} ps={:016X} edram={} depthctl={:08X} colormask={:08X} "
+                  "blend0={:08X}",
+                  vertex_shader.ucode_data_hash(), ps, uint32_t(edram_mode),
+                  normalized_depth_control.value, regs[XE_GPU_REG_RB_COLOR_MASK],
+                  regs[XE_GPU_REG_RB_BLENDCONTROL0]);
+      if (pixel_shader) {
+        std::string d;
+        for (uint32_t i = 0; i < pixel_shader->ucode_dword_count(); ++i)
+          d += fmt::format("{:08X} ", pixel_shader->ucode_dwords()[i]);
+        REXGPU_INFO("CLEARCENSUS   ps ucode {}", d);
+      }
+    }
+  }
+  if (edram_mode != xenos::EdramMode::kColorDepth && edram_mode != xenos::EdramMode::kDepthOnly) {
+    return ClearCensusResult(__LINE__);
+  }
+  const auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+  if (!rb_surface_info.surface_pitch || rb_surface_info.msaa_samples > xenos::MsaaSamples::k4X) {
+    return ClearCensusResult(__LINE__);
+  }
+  // Every sample written.
+  if (rb_surface_info.msaa_samples != xenos::MsaaSamples::k1X &&
+      (regs[XE_GPU_REG_PA_SC_AA_MASK] & 0xFFFF) != 0xFFFF) {
+    return ClearCensusResult(__LINE__);
+  }
+
+  // Depth / stencil: always passing and replacing everything, or not used.
+  const reg::RB_DEPTHCONTROL depth_control = normalized_depth_control;
+  bool depth = false, stencil = false;
+  uint32_t stencil_value = 0;
+  if (depth_control.z_enable || depth_control.stencil_enable) {
+    if (!depth_control.z_enable || !depth_control.z_write_enable ||
+        depth_control.zfunc != xenos::CompareFunction::kAlways) {
+      return ClearCensusResult(__LINE__);
+    }
+    depth = true;
+    if (depth_control.stencil_enable) {
+      const auto ref_mask = regs.Get<reg::RB_STENCILREFMASK>();
+      if (depth_control.stencilfunc != xenos::CompareFunction::kAlways ||
+          (depth_control.stencilzpass != xenos::StencilOp::kReplace &&
+           depth_control.stencilzpass != xenos::StencilOp::kZero) ||
+          ref_mask.stencilwritemask != 0xFF || depth_control.backface_enable) {
+        return ClearCensusResult(__LINE__);
+      }
+      stencil = true;
+      stencil_value =
+          depth_control.stencilzpass == xenos::StencilOp::kReplace ? ref_mask.stencilref : 0;
+    }
+  }
+
+  // Color: only render target 0, all components, no blending, the clear
+  // pixel shader.
+  bool color = false;
+  if (edram_mode == xenos::EdramMode::kColorDepth && pixel_shader) {
+    const uint64_t ps_hash = pixel_shader->ucode_data_hash();
+    if (std::find(std::begin(kClearDrawPixelShaders), std::end(kClearDrawPixelShaders), ps_hash) ==
+        std::end(kClearDrawPixelShaders)) {
+      return ClearCensusResult(__LINE__);
+    }
+    const uint32_t color_mask =
+        draw_util::GetNormalizedColorMask(regs, pixel_shader->writes_color_targets());
+    if (color_mask & ~uint32_t(0xF)) {
+      return ClearCensusResult(__LINE__);
+    }
+    if (color_mask) {
+      if (color_mask != 0xF) {
+        return ClearCensusResult(__LINE__);
+      }
+      const auto blend = regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[0]);
+      const auto color_control = regs.Get<reg::RB_COLORCONTROL>();
+      if (blend.color_srcblend != xenos::BlendFactor::kOne ||
+          blend.color_destblend != xenos::BlendFactor::kZero ||
+          blend.color_comb_fcn != xenos::BlendOp::kAdd ||
+          blend.alpha_srcblend != xenos::BlendFactor::kOne ||
+          blend.alpha_destblend != xenos::BlendFactor::kZero ||
+          blend.alpha_comb_fcn != xenos::BlendOp::kAdd ||
+          (color_control.alpha_test_enable &&
+           color_control.alpha_func != xenos::CompareFunction::kAlways) ||
+          color_control.alpha_to_mask_enable) {
+        return ClearCensusResult(__LINE__);
+      }
+      const auto color_info = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]);
+      if (color_info.color_exp_bias) {
+        return ClearCensusResult(__LINE__);
+      }
+      color = true;
+    }
+  } else if (pixel_shader) {
+    return ClearCensusResult(__LINE__);
+  }
+  if (!depth && !color) {
+    return ClearCensusResult(__LINE__);
+  }
+
+  // The vertices, through the vertex shader on the CPU.
+  if (!ShaderInterpreter::CanInterpretShader(vertex_shader)) {
+    return ClearCensusResult(__LINE__);
+  }
+  if (!clear_draw_interpreter_) {
+    clear_draw_interpreter_ = std::make_unique<ShaderInterpreter>(regs, *memory_);
+  }
+  ShaderInterpreter& interpreter = *clear_draw_interpreter_;
+  ClearDrawExportSink sink;
+  interpreter.SetShader(vertex_shader);
+  interpreter.SetExportSink(&sink);
+  const uint32_t index_offset = regs.Get<reg::VGT_INDX_OFFSET>().indx_offset;
+  const uint32_t min_index = regs.Get<reg::VGT_MIN_VTX_INDX>().min_indx;
+  const uint32_t max_index = regs.Get<reg::VGT_MAX_VTX_INDX>().max_indx;
+  float x[3], y[3], z[3], rgba[4] = {};
+  bool vertices_valid = true;
+  for (uint32_t i = 0; i < 3 && vertices_valid; ++i) {
+    const uint32_t vertex_index = std::min(max_index, std::max(min_index, (i + index_offset) & 0xFFFFFF));
+    sink.Reset();
+    std::memset(interpreter.temp_registers(), 0, sizeof(float) * 4);
+    interpreter.temp_registers()[0] = float(vertex_index);
+    interpreter.Execute();
+    if (sink.other_written || (sink.position_written & 0b0111) != 0b0111 ||
+        (color && (sink.color_written & 0xF) != 0xF)) {
+      vertices_valid = false;
+      break;
+    }
+    x[i] = sink.position[0];
+    y[i] = sink.position[1];
+    z[i] = sink.position[2];
+    if (color) {
+      if (!i) {
+        std::memcpy(rgba, sink.color, sizeof(rgba));
+      } else if (std::memcmp(rgba, sink.color, sizeof(rgba))) {
+        vertices_valid = false;
+      }
+    }
+    if (i && z[i] != z[0]) {
+      vertices_valid = false;
+    }
+  }
+  interpreter.SetExportSink(nullptr);
+  if (!vertices_valid) {
+    return ClearCensusResult(__LINE__);
+  }
+  // An axis-aligned rectangle with edges between pixels.
+  float x_min = std::min({x[0], x[1], x[2]}), x_max = std::max({x[0], x[1], x[2]});
+  float y_min = std::min({y[0], y[1], y[2]}), y_max = std::max({y[0], y[1], y[2]});
+  for (uint32_t i = 0; i < 3; ++i) {
+    if ((x[i] != x_min && x[i] != x_max) || (y[i] != y_min && y[i] != y_max)) {
+      return ClearCensusResult(__LINE__);
+    }
+  }
+  // Pixel centers at integers with kD3DZero, at .5 otherwise.
+  const float center_offset =
+      regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero ? 0.5f : 0.0f;
+  x_min += center_offset;
+  x_max += center_offset;
+  y_min += center_offset;
+  y_max += center_offset;
+  if (!(x_min >= -8192.0f && x_max <= 16384.0f && y_min >= -8192.0f && y_max <= 16384.0f) ||
+      x_min != std::floor(x_min) || x_max != std::floor(x_max) || y_min != std::floor(y_min) ||
+      y_max != std::floor(y_max)) {
+    return ClearCensusResult(__LINE__);
+  }
+  int32_t rect_x0 = int32_t(x_min), rect_x1 = int32_t(x_max);
+  int32_t rect_y0 = int32_t(y_min), rect_y1 = int32_t(y_max);
+  if (regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable) {
+    const auto window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+    rect_x0 += window_offset.window_x_offset;
+    rect_x1 += window_offset.window_x_offset;
+    rect_y0 += window_offset.window_y_offset;
+    rect_y1 += window_offset.window_y_offset;
+  }
+  draw_util::Scissor scissor;
+  draw_util::GetScissor(regs, scissor);
+  rect_x0 = std::max(rect_x0, int32_t(scissor.offset[0]));
+  rect_y0 = std::max(rect_y0, int32_t(scissor.offset[1]));
+  rect_x1 = std::min(rect_x1, int32_t(scissor.offset[0] + scissor.extent[0]));
+  rect_y1 = std::min(rect_y1, int32_t(scissor.offset[1] + scissor.extent[1]));
+  rect_x1 = std::min(rect_x1, int32_t(rb_surface_info.surface_pitch));
+  if (rect_x1 <= rect_x0 || rect_y1 <= rect_y0) {
+    // Nothing drawn - leave it to the normal path.
+    return ClearCensusResult(__LINE__);
+  }
+
+  D3D12RenderTargetCache::DrawnClear clear;
+  const uint32_t msaa_x_log2 = uint32_t(rb_surface_info.msaa_samples >= xenos::MsaaSamples::k4X);
+  clear.pitch_tiles_at_32bpp =
+      ((rb_surface_info.surface_pitch << msaa_x_log2) + (xenos::kEdramTileWidthSamples - 1)) /
+      xenos::kEdramTileWidthSamples;
+  clear.msaa_samples = rb_surface_info.msaa_samples;
+  clear.x0 = uint32_t(rect_x0);
+  clear.y0 = uint32_t(rect_y0);
+  clear.x1 = uint32_t(rect_x1);
+  clear.y1 = uint32_t(rect_y1);
+  if (depth) {
+    const auto depth_info = regs.Get<reg::RB_DEPTH_INFO>();
+    clear.depth = true;
+    clear.depth_base = depth_info.depth_base;
+    clear.depth_format = depth_info.depth_format;
+    clear.depth_value = z[0];
+    clear.stencil = stencil;
+    clear.stencil_value = stencil_value;
+    if (!(z[0] >= 0.0f && z[0] <= 1.0f)) {
+      // Clamped on the host, but keep the exact path for unusual values -
+      // except tiny negative ones (0 written by the guest's math).
+      if (z[0] < 0.0f && z[0] > -1.0e-6f) {
+        clear.depth_value = 0.0f;
+      } else {
+        return ClearCensusResult(__LINE__);
+      }
+    }
+  }
+  if (color) {
+    const auto color_info = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]);
+    clear.color = true;
+    clear.color_base = color_info.color_base;
+    clear.color_format = color_info.color_format;
+    std::memcpy(clear.color_value, rgba, sizeof(rgba));
+  }
+  GpuProfilePassScope pass_scope(*this, rex::perf::GpuPass::kResolveClear);
+  if (!render_target_cache_->ClearDrawnInPlace(clear)) {
+    static std::unordered_set<uint64_t> seen_fail;
+    const uint64_t k = uint64_t(clear.color_format) | uint64_t(clear.depth_format) << 8 |
+                       uint64_t(clear.msaa_samples) << 16 | uint64_t(clear.color) << 20 |
+                       uint64_t(clear.depth) << 21 | uint64_t(clear.stencil) << 22 |
+                       uint64_t(clear.pitch_tiles_at_32bpp) << 24 | uint64_t(clear.x1) << 34 |
+                       uint64_t(clear.y1) << 48;
+    if (seen_fail.insert(k).second) {
+      REXGPU_INFO("CLEARCENSUS fail: color={} fmt={} cbase={} depth={} stencil={}({}) dfmt={} "
+                  "dbase={} z={} msaa={} pitch={} rect=({},{})-({},{}) rgba=({} {} {} {})",
+                  clear.color, uint32_t(clear.color_format), clear.color_base, clear.depth,
+                  clear.stencil, clear.stencil_value, uint32_t(clear.depth_format),
+                  clear.depth_base, clear.depth_value, uint32_t(clear.msaa_samples),
+                  clear.pitch_tiles_at_32bpp, clear.x0, clear.y0, clear.x1, clear.y1,
+                  clear.color_value[0], clear.color_value[1], clear.color_value[2],
+                  clear.color_value[3]);
+    }
+    return ClearCensusResult(__LINE__);
+  }
+  if (rex::perf::IsGpuProfiling()) {
+    rex::perf::GetGpuProfileStats().clears_in_place.fetch_add(1, std::memory_order_relaxed);
+  }
+  ClearCensusResult(0);
+  return true;
+}
+
+void D3D12CommandProcessor::GpuProfileBeginSubmission() {
+  if (!rex::perf::IsGpuProfiling() || gpu_profile_failed_) {
+    return;
+  }
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  if (!gpu_profile_query_heap_) {
+    ID3D12Device* device = provider.GetDevice();
+    UINT64 frequency = 0;
+    if (FAILED(provider.GetDirectQueue()->GetTimestampFrequency(&frequency)) || !frequency) {
+      gpu_profile_failed_ = true;
+      return;
+    }
+    gpu_profile_ns_per_tick_ = 1.0e9 / double(frequency);
+    D3D12_QUERY_HEAP_DESC heap_desc = {};
+    heap_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+    heap_desc.Count = kGpuProfileQueryCount;
+    D3D12_RESOURCE_DESC buffer_desc;
+    ui::d3d12::util::FillBufferResourceDesc(buffer_desc, sizeof(uint64_t) * kGpuProfileQueryCount,
+                                            D3D12_RESOURCE_FLAG_NONE);
+    void* mapping = nullptr;
+    D3D12_RANGE read_range = {0, sizeof(uint64_t) * kGpuProfileQueryCount};
+    if (FAILED(device->CreateQueryHeap(&heap_desc, IID_PPV_ARGS(&gpu_profile_query_heap_))) ||
+        FAILED(device->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesReadback, provider.GetHeapFlagCreateNotZeroed(),
+            &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&gpu_profile_readback_))) ||
+        FAILED(gpu_profile_readback_->Map(0, &read_range, &mapping))) {
+      REXGPU_WARN("gpu_profile: couldn't create the timestamp query heap");
+      gpu_profile_query_heap_.Reset();
+      gpu_profile_readback_.Reset();
+      gpu_profile_failed_ = true;
+      return;
+    }
+    gpu_profile_readback_mapping_ = static_cast<const uint64_t*>(mapping);
+    REXGPU_INFO("gpu_profile: timestamps at {} Hz", frequency);
+  }
+  // A range of the ring not used by submissions still in flight.
+  uint32_t first = gpu_profile_query_cursor_;
+  if (first + kGpuProfileQueriesPerSubmission > kGpuProfileQueryCount) {
+    first = 0;
+  }
+  for (const GpuProfileSubmission& pending : gpu_profile_submissions_) {
+    if (first < pending.first_query + pending.query_count &&
+        pending.first_query < first + kGpuProfileQueriesPerSubmission) {
+      rex::perf::GetGpuProfileStats().submissions_unprofiled.fetch_add(1,
+                                                                       std::memory_order_relaxed);
+      return;
+    }
+  }
+  deferred_command_list_.BeginProfiling(gpu_profile_query_heap_.Get(), first,
+                                        kGpuProfileQueriesPerSubmission);
+}
+
+void D3D12CommandProcessor::GpuProfileEndSubmission() {
+  const uint32_t query_count = deferred_command_list_.EndProfiling();
+  if (query_count < 2) {
+    return;
+  }
+  GpuProfileSubmission record;
+  record.submission = submission_current_;
+  record.passes = deferred_command_list_.profile_passes();
+  record.query_count = query_count;
+  record.first_query = 0;
+  // The first query is where BeginProfiling put it: the cursor or 0.
+  record.first_query = gpu_profile_query_cursor_;
+  if (record.first_query + kGpuProfileQueriesPerSubmission > kGpuProfileQueryCount) {
+    record.first_query = 0;
+  }
+  deferred_command_list_.D3DResolveQueryData(
+      gpu_profile_query_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, record.first_query, query_count,
+      gpu_profile_readback_.Get(), sizeof(uint64_t) * record.first_query);
+  gpu_profile_query_cursor_ = record.first_query + query_count;
+  gpu_profile_submissions_.push_back(std::move(record));
+}
+
+void D3D12CommandProcessor::GpuProfileReadCompleted() {
+  rex::perf::GpuProfileStats& stats = rex::perf::GetGpuProfileStats();
+  while (!gpu_profile_submissions_.empty() &&
+         gpu_profile_submissions_.front().submission <= submission_completed_) {
+    const GpuProfileSubmission& record = gpu_profile_submissions_.front();
+    const uint64_t* ticks = gpu_profile_readback_mapping_ + record.first_query;
+    if (stats.enabled.load(std::memory_order_relaxed)) {
+      for (uint32_t i = 0; i + 1 < record.query_count; ++i) {
+        const uint32_t pass = record.passes[i];
+        if (pass >= uint32_t(rex::perf::GpuPass::kCount) || ticks[i + 1] < ticks[i]) {
+          continue;
+        }
+        stats.pass_ns[pass].fetch_add(
+            uint64_t(double(ticks[i + 1] - ticks[i]) * gpu_profile_ns_per_tick_),
+            std::memory_order_relaxed);
+        stats.pass_count[pass].fetch_add(1, std::memory_order_relaxed);
+      }
+      const uint64_t start = ticks[0], end = ticks[record.query_count - 1];
+      if (end >= start) {
+        stats.submission_ns.fetch_add(uint64_t(double(end - start) * gpu_profile_ns_per_tick_),
+                                      std::memory_order_relaxed);
+        stats.submissions.fetch_add(1, std::memory_order_relaxed);
+      }
+      if (gpu_profile_last_end_tick_ && start > gpu_profile_last_end_tick_) {
+        const uint64_t gap =
+            uint64_t(double(start - gpu_profile_last_end_tick_) * gpu_profile_ns_per_tick_);
+        if (gap < 100000000) {
+          stats.gap_ns.fetch_add(gap, std::memory_order_relaxed);
+        }
+      }
+      gpu_profile_last_end_tick_ = end;
+    }
+    gpu_profile_submissions_.pop_front();
+  }
+  if (!stats.enabled.load(std::memory_order_relaxed)) {
+    gpu_profile_last_end_tick_ = 0;
+  }
 }
 
 uint64_t D3D12CommandProcessor::NormalizeOcclusionSamples(uint64_t samples) const {

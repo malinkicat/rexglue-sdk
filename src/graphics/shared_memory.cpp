@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <utility>
 
@@ -343,7 +344,14 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
   }
 
   // Some texture or buffer is empty, for example - safe to draw in this case.
-  std::vector<std::pair<uint32_t, uint32_t>> merged_ranges;
+  // amped3 cp perf: reuse a per-thread vector instead of allocating per draw.
+  static thread_local std::vector<std::pair<uint32_t, uint32_t>> spare_ranges;
+  std::vector<std::pair<uint32_t, uint32_t>> merged_ranges = std::move(spare_ranges);
+  merged_ranges.clear();
+  struct ReturnSpare {
+    std::vector<std::pair<uint32_t, uint32_t>>& ranges;
+    ~ReturnSpare() { spare_ranges = std::move(ranges); }
+  } return_spare{merged_ranges};
   merged_ranges.reserve(count);
   for (size_t i = 0; i < count; ++i) {
     uint32_t start = ranges[i].first;
@@ -403,7 +411,32 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
     }
     upload_ranges_.emplace_back(page_start, page_count);
   };
-  {
+  // amped3 cp perf: when every requested page is already valid (the common
+  // case), nothing needs uploading and the global lock - which game threads also
+  // take constantly - is skipped. A game thread invalidates pages before writing
+  // them and only then submits the draw through the ring buffer, which this
+  // thread reads with acquire ordering, so a relevant invalidation is visible.
+  bool all_valid = true;
+  for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
+    uint32_t page_first = range.first >> page_size_log2_;
+    uint32_t page_last = (range.first + range.second - 1) >> page_size_log2_;
+    for (uint32_t i = page_first >> 6; all_valid && i <= (page_last >> 6); ++i) {
+      uint64_t needed = UINT64_MAX;
+      if (i == (page_first >> 6)) {
+        needed &= ~((uint64_t(1) << (page_first & 63)) - 1);
+      }
+      if (i == (page_last >> 6) && (page_last & 63) != 63) {
+        needed &= (uint64_t(1) << ((page_last & 63) + 1)) - 1;
+      }
+      const uint64_t valid =
+          std::atomic_ref<uint64_t>(system_page_flags_valid_[i]).load(std::memory_order_acquire);
+      all_valid = (valid & needed) == needed;
+    }
+    if (!all_valid) {
+      break;
+    }
+  }
+  if (!all_valid) {
     auto global_lock = global_critical_region_.Acquire();
     for (const std::pair<uint32_t, uint32_t>& range : merged_ranges) {
       uint32_t page_first = range.first >> page_size_log2_;

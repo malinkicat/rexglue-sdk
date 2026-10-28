@@ -31,6 +31,16 @@
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
     .allowed({"none", "fxaa", "fxaa_extreme"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -158,6 +168,13 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
+#ifdef _WIN32
+        HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr,
+                                              CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                              TIMER_ALL_ACCESS);
+#endif
+        // Wake this long before a vblank and spin the rest, for timer slack.
+        const uint64_t spin_ticks = guest_tick_frequency / 2000;  // 0.5 ms
         while (vsync_worker_running_) {
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
           uint64_t interval_ticks =
@@ -166,8 +183,32 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
             MarkVblank();
             last_frame_time += interval_ticks;
           }
-          rex::thread::Sleep(std::chrono::milliseconds(1));
+          const uint64_t remaining = last_frame_time + interval_ticks - current_time;
+          // Spin only for real vblanks; with vsync off they come every 1 ms and
+          // spinning half of each would keep a core busy.
+          const uint64_t spin = interval_ticks >= guest_tick_frequency / 200 ? spin_ticks : 0;
+          if (remaining > spin) {
+#ifdef _WIN32
+            LARGE_INTEGER due;
+            due.QuadPart = -int64_t((remaining - spin) * 10000000 / guest_tick_frequency);
+            if (timer && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+              WaitForSingleObject(timer, INFINITE);
+            } else {
+              rex::thread::Sleep(std::chrono::milliseconds(1));
+            }
+#else
+            rex::thread::Sleep(std::chrono::microseconds(
+                (remaining - spin) * 1000000 / guest_tick_frequency));
+#endif
+          } else {
+            rex::thread::MaybeYield();
+          }
         }
+#ifdef _WIN32
+        if (timer) {
+          CloseHandle(timer);
+        }
+#endif
         return 0;
       }));
   // TODO: set_can_debugger_suspend not yet ported
@@ -316,6 +357,8 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
                                          rex::countof(args));
 }
 
+rex::thread::Event* VblankWakeEvent();  // command_processor.cpp
+
 void GraphicsSystem::MarkVblank() {
   // TODO: Enable profiling once ported
   // SCOPE_profile_cpu_f("gpu");
@@ -329,6 +372,7 @@ void GraphicsSystem::MarkVblank() {
   //     something wrong and the CP will block waiting for code that
   //     needs to be run in the interrupt.
   DispatchInterruptCallback(0, 2);
+  VblankWakeEvent()->Set();
 }
 
 void GraphicsSystem::ClearCaches() {

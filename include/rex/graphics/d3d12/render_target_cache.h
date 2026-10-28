@@ -72,6 +72,31 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   void WriteEdramUintPow2UAVDescriptor(D3D12_CPU_DESCRIPTOR_HANDLE handle,
                                        uint32_t element_size_bytes_pow2);
 
+  // A clear the guest does by drawing a constant rectangle (like Direct3D 9's
+  // Clear on the Xbox 360 through a 4x MSAA view of the surface): instead of
+  // moving the EDRAM range into the render target of that view and back -
+  // ownership transfers, with 8 passes for the stencil on hosts without
+  // pixel-shader stencil reference output - the value is written into the
+  // render targets already owning the range. Host render target path only;
+  // returns false (doing nothing) if that isn't possible exactly.
+  struct DrawnClear {
+    uint32_t pitch_tiles_at_32bpp;
+    xenos::MsaaSamples msaa_samples;
+    // In pixels of the draw (at its MSAA), not resolution-scaled.
+    uint32_t x0, y0, x1, y1;
+    bool depth = false;
+    uint32_t depth_base = 0;
+    xenos::DepthRenderTargetFormat depth_format = xenos::DepthRenderTargetFormat::kD24S8;
+    float depth_value = 0.0f;
+    bool stencil = false;  // with depth only
+    uint32_t stencil_value = 0;
+    bool color = false;
+    uint32_t color_base = 0;
+    xenos::ColorRenderTargetFormat color_format = xenos::ColorRenderTargetFormat::k_8_8_8_8;
+    float color_value[4] = {};
+  };
+  bool ClearDrawnInPlace(const DrawnClear& clear);
+
   // Performs the resolve to a shared memory area according to the current
   // register values, and also clears the render targets if needed. Must be in a
   // frame for calling.

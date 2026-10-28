@@ -540,6 +540,29 @@ class RenderTargetCache {
                                             RenderTarget*& color_render_target_out,
                                             std::vector<Transfer>& color_transfers_out);
 
+  // The host render target holding the up-to-date data of every tile in
+  // [base_tiles + start_tiles_base_relative, + length_tiles), or nullptr if the
+  // range isn't owned by a single render target (or wraps around the EDRAM).
+  RenderTarget* GetSingleOwner(uint32_t base_tiles, uint32_t start_tiles_base_relative,
+                               uint32_t length_tiles) const;
+
+  // A clear done by drawing a rectangle, given in single-sampled pixels (EDRAM
+  // samples) of a surface: moves the range to the single-sampled render
+  // targets with the bases and formats of the draw - like
+  // PrepareHostRenderTargetsResolveClear, with transfers only for the parts of
+  // the touched tiles outside the rectangle. depth_format / color_format are
+  // resource formats; pass is_depth / is_color false to leave one out.
+  bool PrepareHostRenderTargetsDrawnClear(uint32_t pitch_tiles_at_32bpp, uint32_t x0, uint32_t y0,
+                                          uint32_t x1, uint32_t y1, bool is_depth,
+                                          uint32_t depth_base, uint32_t depth_format,
+                                          bool is_color, uint32_t color_base,
+                                          uint32_t color_format,
+                                          Transfer::Rectangle& clear_rectangle_out,
+                                          RenderTarget*& depth_render_target_out,
+                                          std::vector<Transfer>& depth_transfers_out,
+                                          RenderTarget*& color_render_target_out,
+                                          std::vector<Transfer>& color_transfers_out);
+
   // For pixel shader interlock.
 
   virtual void RequestPixelShaderInterlockBarrier() {}

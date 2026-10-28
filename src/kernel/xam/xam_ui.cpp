@@ -17,8 +17,23 @@
 
 #include <imgui.h>
 
+#include <chrono>
+#include <thread>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 REXCVAR_DEFINE_BOOL(headless, false, "Kernel",
                     "Don't display any UI, using defaults for prompts as needed");
+REXCVAR_DEFINE_STRING(headless_keyboard_text, "", "Kernel",
+                      "With headless, text returned for keyboard prompts that have no default");
 #include <rex/kernel/xam/private.h>
 #include <rex/hook.h>
 #include <rex/types.h>
@@ -339,6 +354,38 @@ u32 XamShowMessageBoxUI_entry(u32 user_index, mapped_wstring title_ptr, mapped_w
   return result;
 }
 
+#ifdef _WIN32
+// Buttons held on any XInput controller. Game input is paused while a system
+// dialog is open, so dialogs read the pad directly.
+uint16_t PadButtonsForDialog() {
+  struct XInputState {
+    uint32_t packet;
+    uint16_t buttons;
+    uint8_t triggers[2];
+    int16_t thumbs[4];
+  };
+  using GetStateFn = uint32_t(__stdcall*)(uint32_t, XInputState*);
+  static GetStateFn get_state = [] {
+    for (const char* name : {"xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"}) {
+      if (HMODULE module = LoadLibraryA(name)) {
+        return reinterpret_cast<GetStateFn>(GetProcAddress(module, "XInputGetState"));
+      }
+    }
+    return GetStateFn(nullptr);
+  }();
+  uint16_t buttons = 0;
+  for (uint32_t user = 0; get_state && user < 4; ++user) {
+    XInputState state{};
+    if (get_state(user, &state) == 0) {
+      buttons |= state.buttons;
+    }
+  }
+  return buttons;
+}
+#else
+uint16_t PadButtonsForDialog() { return 0; }
+#endif
+
 class KeyboardInputDialog : public XamDialog {
  public:
   KeyboardInputDialog(rex::ui::ImGuiDrawer* imgui_drawer, std::string title,
@@ -357,7 +404,10 @@ class KeyboardInputDialog : public XamDialog {
         description_ = "";
       }
     }
-    text_ = default_text;
+    if (default_text_.empty()) {
+      default_text_ = REXCVAR_GET(headless_keyboard_text);
+    }
+    text_ = default_text_;
     text_buffer_.resize(max_length);
     rex::string::copy_truncating(text_buffer_.data(), default_text_, text_buffer_.size());
   }
@@ -381,13 +431,13 @@ class KeyboardInputDialog : public XamDialog {
       }
       if (ImGui::InputText("##body", text_buffer_.data(), text_buffer_.size(),
                            ImGuiInputTextFlags_EnterReturnsTrue)) {
-        text_ = std::string(text_buffer_.data(), text_buffer_.size());
+        text_ = std::string(text_buffer_.data());
         cancelled_ = false;
         ImGui::CloseCurrentPopup();
         Close();
       }
       if (ImGui::Button("OK")) {
-        text_ = std::string(text_buffer_.data(), text_buffer_.size());
+        text_ = std::string(text_buffer_.data());
         cancelled_ = false;
         ImGui::CloseCurrentPopup();
         Close();
@@ -399,7 +449,29 @@ class KeyboardInputDialog : public XamDialog {
         ImGui::CloseCurrentPopup();
         Close();
       }
+      ImGui::TextDisabled("Controller: A = OK, B = Cancel");
       ImGui::Spacing();
+      // Controller: A confirms, B cancels, on release: game input resumes when
+      // the dialog closes, and a still-held A would reopen the prompt. Buttons
+      // count only after all were released, so the press that opened the
+      // dialog does not confirm it.
+      const uint16_t pad = PadButtonsForDialog();
+      constexpr uint16_t kPadA = 0x1000, kPadB = 0x2000;
+      if (!pad_armed_) {
+        pad_armed_ = (pad & (kPadA | kPadB)) == 0;
+      } else if (pad & (kPadA | kPadB)) {
+        pad_pressed_ |= pad & (kPadA | kPadB);
+      } else if (pad_pressed_ & kPadA) {
+        text_ = std::string(text_buffer_.data());
+        cancelled_ = false;
+        ImGui::CloseCurrentPopup();
+        Close();
+      } else if (pad_pressed_ & kPadB) {
+        text_ = "";
+        cancelled_ = true;
+        ImGui::CloseCurrentPopup();
+        Close();
+      }
       ImGui::EndPopup();
     } else {
       Close();
@@ -412,6 +484,8 @@ class KeyboardInputDialog : public XamDialog {
   std::string description_;
   std::string default_text_;
   size_t max_length_ = 0;
+  bool pad_armed_ = false;
+  uint16_t pad_pressed_ = 0;
   std::vector<char> text_buffer_;
   std::string text_ = "";
   bool cancelled_ = true;
@@ -437,7 +511,11 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
   if (REXCVAR_GET(headless)) {
     auto run = [default_text, buffer, buffer_length, buffer_size]() -> X_RESULT {
       // Redirect default_text back into the buffer.
-      if (!default_text) {
+      const std::string fallback = REXCVAR_GET(headless_keyboard_text);
+      if ((!default_text || default_text.value().empty()) && !fallback.empty()) {
+        rex::string::copy_and_swap_truncating(buffer, std::u16string(fallback.begin(), fallback.end()),
+                                              buffer_length);
+      } else if (!default_text) {
         std::memset(buffer, 0, buffer_size);
       } else {
         rex::string::copy_and_swap_truncating(buffer, default_text.value(), buffer_length);
@@ -458,6 +536,15 @@ u32 XamShowKeyboardUI_entry(u32 user_index, u32 flags, mapped_wstring default_te
         rex::string::copy_and_swap_truncating(buffer, text, buffer_length);
         extended_error = X_ERROR_SUCCESS;
         length = 0;
+        // Keep game input paused a little longer: after a name is entered the
+        // game spends ~4.5 s creating and reading the save with its menu still
+        // live, and a second A there opened another prompt that was left
+        // behind when the game moved on.
+        ++xam_dialogs_shown_;
+        std::thread([] {
+          std::this_thread::sleep_for(std::chrono::seconds(5));
+          --xam_dialogs_shown_;
+        }).detach();
         return X_ERROR_SUCCESS;
       }
     };

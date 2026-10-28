@@ -26,6 +26,46 @@ DeferredCommandList::DeferredCommandList(const D3D12CommandProcessor& command_pr
 
 void DeferredCommandList::Reset() {
   command_stream_.clear();
+  profile_query_heap_ = nullptr;
+  profile_passes_.clear();
+}
+
+void DeferredCommandList::BeginProfiling(ID3D12QueryHeap* query_heap, uint32_t first_query,
+                                         uint32_t max_queries) {
+  profile_passes_.clear();
+  profile_query_heap_ = nullptr;
+  if (!query_heap || max_queries < 2) {
+    return;
+  }
+  profile_query_heap_ = query_heap;
+  profile_first_query_ = first_query;
+  profile_max_queries_ = max_queries;
+  // The opening timestamp, of the current pass.
+  profile_pass_current_ = uint8_t(~profile_pass_pending_);
+  WriteProfileTimestamp();
+}
+
+uint32_t DeferredCommandList::EndProfiling() {
+  if (!profile_query_heap_) {
+    return 0;
+  }
+  ID3D12QueryHeap* query_heap = profile_query_heap_;
+  profile_query_heap_ = nullptr;
+  const uint32_t index = profile_first_query_ + uint32_t(profile_passes_.size());
+  D3DEndQuery(query_heap, D3D12_QUERY_TYPE_TIMESTAMP, index);
+  return uint32_t(profile_passes_.size()) + 1;
+}
+
+void DeferredCommandList::WriteProfileTimestamp() {
+  profile_pass_current_ = profile_pass_pending_;
+  // Keep one query for the closing timestamp; past the limit, the rest of the
+  // submission counts for the last pass.
+  if (profile_passes_.size() + 2 > profile_max_queries_) {
+    return;
+  }
+  const uint32_t index = profile_first_query_ + uint32_t(profile_passes_.size());
+  profile_passes_.push_back(profile_pass_current_);
+  D3DEndQuery(profile_query_heap_, D3D12_QUERY_TYPE_TIMESTAMP, index);
 }
 
 void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
@@ -278,6 +318,9 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
 }
 
 void* DeferredCommandList::WriteCommand(Command command, size_t arguments_size_bytes) {
+  if (profile_query_heap_ && profile_pass_pending_ != profile_pass_current_) {
+    WriteProfileTimestamp();
+  }
   size_t arguments_size_elements =
       (arguments_size_bytes + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);
   size_t offset = command_stream_.size();

@@ -24,6 +24,14 @@
 #include <rex/thread.h>
 #include <rex/cvar.h>
 
+#include <cmath>
+#include <cstring>
+
+REXCVAR_DECLARE(bool, audio_levels);
+namespace rex::audio {
+void AudioLevelLog(const char* source, double rms);  // xma_context.cpp
+}  // namespace rex::audio
+
 REXCVAR_DEFINE_INT32(
     audio_maxqframes, 8, "Audio",
     "Max buffered audio frames (range 4-64). Lower reduces latency but may cause stuttering.");
@@ -270,6 +278,19 @@ void AudioSystem::SubmitFrame(size_t index, uint32_t samples_ptr) {
     submit_count++;
   }
 
+  if (REXCVAR_GET(audio_levels)) {
+    // 256 samples x 6 channels of big-endian float.
+    const auto* p = memory()->TranslateVirtual<const uint8_t*>(samples_ptr);
+    double sum = 0.0;
+    for (int i = 0; i < 256 * 6; ++i) {
+      uint32_t bits = (uint32_t(p[4 * i]) << 24) | (uint32_t(p[4 * i + 1]) << 16) |
+                      (uint32_t(p[4 * i + 2]) << 8) | p[4 * i + 3];
+      float f;
+      std::memcpy(&f, &bits, 4);
+      sum += double(f) * f;
+    }
+    AudioLevelLog("mix", std::sqrt(sum / (256 * 6)));
+  }
   auto global_lock = global_critical_region_.Acquire();
   assert_true(index < kMaximumClientCount);
   assert_true(clients_[index].driver != NULL);

@@ -47,6 +47,9 @@ REXCVAR_DEFINE_STRING(render_target_path_d3d12, "", "GPU/D3D12",
 
 REXCVAR_DEFINE_BOOL(native_stencil_value_output, true, "GPU", "Enable native stencil value output");
 
+// command_processor.cpp: also logs the render target ownership transfers.
+REXCVAR_DECLARE(int32_t, gpu_debug_log_draws);
+
 namespace rex::graphics::d3d12 {
 
 // Generated with `xb buildshaders`.
@@ -1180,6 +1183,18 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
     return true;
   }
 
+  if (REXCVAR_GET(gpu_debug_log_draws) > 0) {
+    REXGPU_INFO(
+        "RESOLVE {}x{} copy {} dest {:08X} len {} depth_copy {} clear depth {} color {} "
+        "base color {} depth {} dest fmt {}",
+        resolve_info.coordinate_info.width_div_8 * 8, resolve_info.height_div_8 * 8,
+        resolve_info.copy_dest_extent_length != 0, resolve_info.copy_dest_base,
+        resolve_info.copy_dest_extent_length, resolve_info.IsCopyingDepth(),
+        resolve_info.IsClearingDepth(), resolve_info.IsClearingColor(),
+        resolve_info.color_original_base, resolve_info.depth_original_base,
+        uint32_t(resolve_info.copy_dest_info.copy_dest_format));
+  }
+
   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
 
   // Copying.
@@ -1221,6 +1236,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
       }
 
       // Make sure there is memory to write to.
+      command_processor_.SetGpuProfilePass(rex::perf::GpuPass::kResolveCopy);
       bool copy_dest_committed;
       if (draw_resolution_scaled) {
         // Committing starting with the beginning of the potentially written
@@ -1331,6 +1347,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
   bool clear_depth = resolve_info.IsClearingDepth();
   bool clear_color = resolve_info.IsClearingColor();
   if (clear_depth || clear_color) {
+    command_processor_.SetGpuProfilePass(rex::perf::GpuPass::kResolveClear);
     switch (GetPath()) {
       case Path::kHostRenderTargets: {
         Transfer::Rectangle clear_rectangle;
@@ -1415,6 +1432,241 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
   }
 
   return copied && cleared;
+}
+
+bool D3D12RenderTargetCache::ClearDrawnInPlace(const DrawnClear& clear) {
+  if (GetPath() != Path::kHostRenderTargets || !clear.pitch_tiles_at_32bpp ||
+      clear.x1 <= clear.x0 || clear.y1 <= clear.y0 || (!clear.depth && !clear.color)) {
+    return false;
+  }
+  // The rectangle in samples, relative to the base of the surface.
+  const uint32_t samples_x_log2 = uint32_t(clear.msaa_samples >= xenos::MsaaSamples::k4X);
+  const uint32_t samples_y_log2 = uint32_t(clear.msaa_samples >= xenos::MsaaSamples::k2X);
+  const uint32_t sx0 = clear.x0 << samples_x_log2, sx1 = clear.x1 << samples_x_log2;
+  const uint32_t sy0 = clear.y0 << samples_y_log2, sy1 = clear.y1 << samples_y_log2;
+  const uint32_t pitch = clear.pitch_tiles_at_32bpp;
+  if (sx1 > pitch * xenos::kEdramTileWidthSamples) {
+    return false;
+  }
+  // The tiles from the first to the last touched.
+  const uint32_t start_tiles = (sy0 / xenos::kEdramTileHeightSamples) * pitch +
+                               sx0 / xenos::kEdramTileWidthSamples;
+  const uint32_t end_tiles = ((sy1 - 1) / xenos::kEdramTileHeightSamples) * pitch +
+                             (sx1 - 1) / xenos::kEdramTileWidthSamples + 1;
+  const uint32_t length_tiles = end_tiles - start_tiles;
+  if (clear.depth && clear.color) {
+    // Depth and color writing the same tiles (with EDRAM addressing wrapping).
+    const uint32_t depth_start = (clear.depth_base + start_tiles) % xenos::kEdramTileCount;
+    const uint32_t color_start = (clear.color_base + start_tiles) % xenos::kEdramTileCount;
+    const uint32_t distance = (color_start + xenos::kEdramTileCount - depth_start) %
+                              xenos::kEdramTileCount;
+    if (distance < length_tiles || xenos::kEdramTileCount - distance < length_tiles) {
+      return false;
+    }
+  }
+
+  struct Target {
+    D3D12RenderTarget* render_target;
+    D3D12_RECT rect;
+    bool is_depth;
+    D3D12_CLEAR_FLAGS depth_flags;
+    float depth;
+    uint8_t stencil;
+    float color[4];
+    D3D12_CPU_DESCRIPTOR_HANDLE view;
+  };
+  Target targets[2];
+  uint32_t target_count = 0;
+  // Floating-point depth (D24FS8, used by launch titles such as Amped 3) only
+  // for 0, which is the same bits and the same host value in both formats.
+  const bool depth_format_ok =
+      clear.depth_format == xenos::DepthRenderTargetFormat::kD24S8 ||
+      (clear.depth_format == xenos::DepthRenderTargetFormat::kD24FS8 && clear.depth_value == 0.0f);
+
+  // The rectangle in the pixels of a render target owning the range.
+  auto owner_rect = [&](RenderTarget* owner, uint32_t base, D3D12_RECT& rect) -> bool {
+    const RenderTargetKey key = owner->key();
+    if (key.base_tiles != base || key.pitch_tiles_at_32bpp != pitch || key.Is64bpp()) {
+      return false;
+    }
+    if (key.msaa_samples == xenos::MsaaSamples::k2X && !msaa_2x_supported_) {
+      return false;
+    }
+    const uint32_t owner_x_log2 = uint32_t(key.msaa_samples >= xenos::MsaaSamples::k4X);
+    const uint32_t owner_y_log2 = uint32_t(key.msaa_samples >= xenos::MsaaSamples::k2X);
+    if (((sx0 | sx1) & ((uint32_t(1) << owner_x_log2) - 1)) ||
+        ((sy0 | sy1) & ((uint32_t(1) << owner_y_log2) - 1))) {
+      return false;
+    }
+    rect.left = LONG((sx0 >> owner_x_log2) * draw_resolution_scale_x());
+    rect.right = LONG((sx1 >> owner_x_log2) * draw_resolution_scale_x());
+    rect.top = LONG((sy0 >> owner_y_log2) * draw_resolution_scale_y());
+    rect.bottom = LONG((sy1 >> owner_y_log2) * draw_resolution_scale_y());
+    D3D12_RESOURCE_DESC desc = static_cast<D3D12RenderTarget*>(owner)->resource()->GetDesc();
+    return uint64_t(rect.right) <= desc.Width && uint32_t(rect.bottom) <= desc.Height;
+  };
+
+  // 1) Where the data is: the render targets owning the range get the value.
+  auto prepare_in_place = [&]() -> bool {
+  if (clear.depth) {
+    RenderTarget* owner = GetSingleOwner(clear.depth_base, start_tiles, length_tiles);
+    if (!owner) {
+      return false;
+    }
+    Target& target = targets[target_count++];
+    target.render_target = static_cast<D3D12RenderTarget*>(owner);
+    if (!owner_rect(owner, clear.depth_base, target.rect)) {
+      return false;
+    }
+    const RenderTargetKey key = owner->key();
+    if (key.is_depth) {
+      // Same guest format - the host value is what drawing would write.
+      if (!depth_format_ok || key.GetDepthFormat() != clear.depth_format) {
+        return false;
+      }
+      target.is_depth = true;
+      target.depth_flags =
+          D3D12_CLEAR_FLAG_DEPTH | (clear.stencil ? D3D12_CLEAR_FLAG_STENCIL : D3D12_CLEAR_FLAGS(0));
+      target.depth = std::min(std::max(clear.depth_value, 0.0f), 1.0f);
+      target.stencil = uint8_t(clear.stencil_value);
+      target.view = target.render_target->descriptor_draw().GetHandle();
+    } else {
+      // The EDRAM range is color data now: only the all-zero depth and stencil
+      // word, which is zero in every 32bpp color format, without knowing how
+      // the formats alias.
+      if (!clear.stencil || clear.stencil_value || clear.depth_value != 0.0f) {
+        return false;
+      }
+      target.is_depth = false;
+      std::memset(target.color, 0, sizeof(target.color));
+      target.view = target.render_target->descriptor_load_separate().IsValid()
+                        ? target.render_target->descriptor_load_separate().GetHandle()
+                        : target.render_target->descriptor_draw().GetHandle();
+    }
+  }
+  if (clear.color) {
+    RenderTarget* owner = GetSingleOwner(clear.color_base, start_tiles, length_tiles);
+    if (!owner) {
+      return false;
+    }
+    Target& target = targets[target_count++];
+    target.render_target = static_cast<D3D12RenderTarget*>(owner);
+    if (!owner_rect(owner, clear.color_base, target.rect)) {
+      return false;
+    }
+    const RenderTargetKey key = owner->key();
+    // Unsigned normalized formats the draw would have written the same way.
+    if (key.is_depth || (clear.color_format != xenos::ColorRenderTargetFormat::k_8_8_8_8 &&
+                         clear.color_format != xenos::ColorRenderTargetFormat::k_2_10_10_10) ||
+        key.GetColorFormat() != clear.color_format) {
+      return false;
+    }
+    target.is_depth = false;
+    for (uint32_t i = 0; i < 4; ++i) {
+      const float value = clear.color_value[i];
+      // NaN to 0, like a conversion to unorm.
+      target.color[i] = value >= 0.0f ? std::min(value, 1.0f) : 0.0f;
+    }
+    target.view = target.render_target->descriptor_draw().GetHandle();
+  }
+  return true;
+  };
+
+  if (!prepare_in_place()) {
+    // 2) Into the single-sampled render targets at the bases, with the pitch
+    // and the formats of the draw (what the game usually draws with next) -
+    // ownership moves there without copying the cleared part.
+    if (clear.depth && (!clear.stencil || !depth_format_ok)) {
+      return false;
+    }
+    if (clear.color && clear.color_format != xenos::ColorRenderTargetFormat::k_8_8_8_8 &&
+        clear.color_format != xenos::ColorRenderTargetFormat::k_2_10_10_10) {
+      return false;
+    }
+    if (sy1 > GetRenderTargetHeight(pitch, xenos::MsaaSamples::k1X)) {
+      return false;
+    }
+    // Guest bit patterns, converted to the host values like resolve clears.
+    uint64_t clear_values[2] = {};
+    if (clear.depth) {
+      const double depth_value = std::min(std::max(double(clear.depth_value), 0.0), 1.0);
+      clear_values[0] = (uint64_t(std::llround(depth_value * double(0xFFFFFF))) << 8) |
+                        (clear.stencil_value & 0xFF);
+    }
+    if (clear.color) {
+      auto unorm = [](float value, uint32_t max) -> uint64_t {
+        const double clamped = value >= 0.0f ? std::min(double(value), 1.0) : 0.0;
+        return uint64_t(std::llround(clamped * double(max)));
+      };
+      if (clear.color_format == xenos::ColorRenderTargetFormat::k_8_8_8_8) {
+        clear_values[1] = unorm(clear.color_value[0], 255) | (unorm(clear.color_value[1], 255) << 8) |
+                          (unorm(clear.color_value[2], 255) << 16) |
+                          (unorm(clear.color_value[3], 255) << 24);
+      } else {
+        clear_values[1] = unorm(clear.color_value[0], 1023) |
+                          (unorm(clear.color_value[1], 1023) << 10) |
+                          (unorm(clear.color_value[2], 1023) << 20) |
+                          (unorm(clear.color_value[3], 3) << 30);
+      }
+    }
+    Transfer::Rectangle clear_rectangle;
+    RenderTarget* clear_render_targets[2] = {};
+    if (!PrepareHostRenderTargetsDrawnClear(
+            pitch, sx0, sy0, sx1, sy1, clear.depth, clear.depth_base, uint32_t(clear.depth_format),
+            clear.color, clear.color_base, uint32_t(clear.color_format), clear_rectangle,
+            clear_render_targets[0], clear_transfers_[0], clear_render_targets[1],
+            clear_transfers_[1])) {
+      return false;
+    }
+    PerformTransfersAndResolveClears(2, clear_render_targets, clear_transfers_, clear_values,
+                                     &clear_rectangle);
+    if (REXCVAR_GET(gpu_debug_log_draws) > 0) {
+      for (uint32_t i = 0; i < 2; ++i) {
+        if (clear_render_targets[i]) {
+          REXGPU_INFO("CLEAR INTO 1X {} rect ({}, {}) {}x{} value {:08X} transfers {}",
+                      clear_render_targets[i]->key().GetDebugName(), clear_rectangle.x_pixels,
+                      clear_rectangle.y_pixels, clear_rectangle.width_pixels,
+                      clear_rectangle.height_pixels, clear_values[i], clear_transfers_[i].size());
+        }
+      }
+    }
+    return true;
+  }
+
+  DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
+  for (uint32_t i = 0; i < target_count; ++i) {
+    Target& target = targets[i];
+    const D3D12_RESOURCE_STATES state = target.render_target->key().is_depth
+                                            ? D3D12_RESOURCE_STATE_DEPTH_WRITE
+                                            : D3D12_RESOURCE_STATE_RENDER_TARGET;
+    command_processor_.PushTransitionBarrier(target.render_target->resource(),
+                                             target.render_target->SetResourceState(state), state);
+  }
+  command_processor_.SubmitBarriers();
+  for (uint32_t i = 0; i < target_count; ++i) {
+    const Target& target = targets[i];
+    if (target.is_depth) {
+      command_list.D3DClearDepthStencilView(target.view, target.depth_flags, target.depth,
+                                            target.stencil, 1, &target.rect);
+    } else {
+      command_list.D3DClearRenderTargetView(target.view, target.color, 1, &target.rect);
+    }
+  }
+  if (REXCVAR_GET(gpu_debug_log_draws) > 0) {
+    for (uint32_t i = 0; i < target_count; ++i) {
+      const Target& target = targets[i];
+      REXGPU_INFO("CLEAR IN PLACE {} rect ({}, {})-({}, {}) {}",
+                  target.render_target->key().GetDebugName(), target.rect.left, target.rect.top,
+                  target.rect.right, target.rect.bottom,
+                  target.is_depth ? fmt::format("depth {} stencil {} flags {}", target.depth,
+                                                uint32_t(target.stencil),
+                                                uint32_t(target.depth_flags))
+                                  : fmt::format("color ({} {} {} {})", target.color[0],
+                                                target.color[1], target.color[2],
+                                                target.color[3]));
+    }
+  }
+  return true;
 }
 
 DXGI_FORMAT D3D12RenderTargetCache::GetColorResourceDXGIFormat(
@@ -4536,6 +4788,34 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
         }
 
         // Draw the transfer rectangles.
+        const rex::perf::GpuPass transfer_pass_before = command_processor_.GetGpuProfilePass();
+        command_processor_.SetGpuProfilePass(is_stencil_bit ? rex::perf::GpuPass::kRtTransferStencil
+                                             : dest_rt_key.is_depth
+                                                 ? rex::perf::GpuPass::kRtTransferDepth
+                                                 : rex::perf::GpuPass::kRenderTargets);
+        if (REXCVAR_GET(gpu_debug_log_draws) > 0) {
+          uint32_t transfer_pixels = 0;
+          for (auto it_merged = it_merged_first; it_merged <= it_merged_last; ++it_merged) {
+            Transfer::Rectangle rects[Transfer::kMaxRectanglesWithCutout];
+            uint32_t rect_count = it_merged->transfer.GetRectangles(
+                dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
+                rects, resolve_clear_rectangle);
+            for (uint32_t r = 0; r < rect_count; ++r) {
+              transfer_pixels += rects[r].width_pixels * rects[r].height_pixels;
+            }
+          }
+          REXGPU_INFO("TRANSFER mode {} {} <- {}{} rects {} pixels {} (unscaled){}",
+                      uint32_t(transfer_shader_key.mode), dest_rt_key.GetDebugName(),
+                      source_d3d12_rt.key().GetDebugName(),
+                      host_depth_source_d3d12_rt
+                          ? fmt::format(" +hostdepth {}{}",
+                                        host_depth_source_d3d12_rt->key().GetDebugName(),
+                                        transfer_shader_key.host_depth_source_is_copy ? " (copy)"
+                                                                                      : "")
+                          : std::string(),
+                      transfer_rectangle_count, transfer_pixels,
+                      is_stencil_bit ? " x8 stencil bits" : "");
+        }
         command_processor_.SubmitBarriers();
         for (uint32_t j = 0; j <= uint32_t(is_stencil_bit) * 7; ++j) {
           if (is_stencil_bit) {
@@ -4548,6 +4828,7 @@ void D3D12RenderTargetCache::PerformTransfersAndResolveClears(
           command_processor_.SetExternalPipeline(transfer_pipelines[j]);
           command_list.D3DDrawInstanced(transfer_vertex_count, 1, 0, 0);
         }
+        command_processor_.SetGpuProfilePass(transfer_pass_before);
       }
     }
 

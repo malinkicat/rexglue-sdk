@@ -10,9 +10,98 @@
 */
 
 #include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <unordered_map>
 
 #include <rex/audio/xma/context.h>
+#include <rex/cvar.h>
+#include <rex/logging.h>
+
+REXCVAR_DEFINE_BOOL(audio_levels, false, "Audio",
+                    "Debug: log the RMS of decoded XMA chunks and mixed frames to audio_levels.csv");
+REXCVAR_DEFINE_STRING(xma_mute, "", "Audio",
+                      "Debug: silence the XMA context at this guest address (e.g. FFCA6040)");
+REXCVAR_DEFINE_BOOL(xma_single_music, false, "Audio",
+                    "Keep one music stream audible: after 2 s of two playing together, "
+                    "silence the older (Amped 3 resumes paused menu music next to the next song)");
+
+namespace rex::audio {
+namespace {
+// --xma_single_music state per context id.
+struct MusicStream {
+  std::chrono::steady_clock::time_point started{}, last_output{}, overlap_since{};
+  bool superseded = false;
+};
+std::mutex music_mutex;
+std::unordered_map<uint32_t, MusicStream> music_streams;
+
+void ForgetMusicStream(uint32_t id) {
+  std::lock_guard lock(music_mutex);
+  music_streams.erase(id);
+}
+
+// Called for each decoded chunk; true when this context's output should be silent.
+bool SupersededMusic(uint32_t id, const XMA_CONTEXT_DATA& data) {
+  const bool is_music =
+      data.is_stereo &&
+      std::max(data.input_buffer_0_packet_count, data.input_buffer_1_packet_count) >= 128;
+  std::lock_guard lock(music_mutex);
+  if (!is_music) {
+    music_streams.erase(id);
+    return false;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  auto [it, inserted] = music_streams.try_emplace(id);
+  MusicStream& self = it->second;
+  if (inserted) {
+    self.started = now;
+  }
+  self.last_output = now;
+  if (self.superseded) {
+    return true;
+  }
+  bool overlapping = false, older = false;
+  for (const auto& [other_id, other] : music_streams) {
+    if (other_id != id && now - other.last_output < std::chrono::milliseconds(300)) {
+      overlapping = true;
+      older |= self.started < other.started;
+    }
+  }
+  if (!overlapping) {
+    self.overlap_since = {};
+    return false;
+  }
+  if (self.overlap_since == std::chrono::steady_clock::time_point{}) {
+    self.overlap_since = now;
+  }
+  if (older && now - self.overlap_since > std::chrono::seconds(2)) {
+    self.superseded = true;
+    REXAPU_INFO("XmaContext {:08X}: music superseded by a newer stream; silenced", id);
+    return true;
+  }
+  return false;
+}
+}  // namespace
+
+// Debug (--audio_levels): one line per decoded chunk or mixed frame.
+void AudioLevelLog(const char* source, double rms) {
+  static std::mutex mutex;
+  static std::FILE* file = nullptr;
+  static const auto start = std::chrono::steady_clock::now();
+  std::lock_guard lock(mutex);
+  if (!file && !(file = std::fopen("audio_levels.csv", "w"))) {
+    return;
+  }
+  std::fprintf(file, "%.4f,%s,%.6f\n",
+               std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(),
+               source, rms);
+}
+}  // namespace rex::audio
 #include <rex/audio/xma/decoder.h>
 #include <rex/audio/xma/helpers.h>
 #include <rex/dbg.h>
@@ -168,6 +257,7 @@ bool XmaContext::Block(bool poll) {
 }
 
 void XmaContext::Clear() {
+  ForgetMusicStream(id());  // --xma_single_music: a new stream starts here.
   std::lock_guard<std::mutex> lock(lock_);
   REXAPU_NOISY_DEBUG("XmaContext: reset context {}", id());
 
@@ -457,8 +547,26 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA* 
       ((kBytesPerFrameChannel / kOutputBytesPerBlock) << data->is_stereo) -
       current_frame_remaining_subframes_;
 
-  output_rb->Write(raw_frame_.data() + (kOutputBytesPerBlock * raw_frame_read_offset),
+  static const std::array<uint8_t, kBytesPerFrameChannel * 2> silence{};
+  char context_name[16];
+  std::snprintf(context_name, sizeof(context_name), "%08X", guest_ptr());
+  const bool muted = (!REXCVAR_GET(xma_mute).empty() && REXCVAR_GET(xma_mute) == context_name) ||
+                     (REXCVAR_GET(xma_single_music) && SupersededMusic(id(), *data));
+  output_rb->Write((muted ? silence.data() : raw_frame_.data()) +
+                       (kOutputBytesPerBlock * raw_frame_read_offset),
                    subframes_to_write * kOutputBytesPerBlock);
+  if (REXCVAR_GET(audio_levels)) {
+    const uint8_t* pcm = raw_frame_.data() + (kOutputBytesPerBlock * raw_frame_read_offset);
+    const size_t samples = subframes_to_write * kOutputBytesPerBlock / 2;
+    double sum = 0.0;
+    for (size_t i = 0; i < samples; ++i) {
+      const double s = int16_t((pcm[2 * i] << 8) | pcm[2 * i + 1]) / 32768.0;
+      sum += s * s;
+    }
+    char source[16];
+    std::snprintf(source, sizeof(source), "%08X", guest_ptr());
+    AudioLevelLog(source, samples ? std::sqrt(sum / samples) : 0.0);
+  }
 
   const int8_t headroom = (current_frame_remaining_subframes_ - subframes_to_write == 0)
                               ? data->output_buffer_padding

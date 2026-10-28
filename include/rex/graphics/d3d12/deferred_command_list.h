@@ -451,6 +451,18 @@ class DeferredCommandList {
     std::memcpy(args_ptr + sizeof(DebugMarkerHeader), label_name, label_len + 1);
   }
 
+  // GPU timestamp profiling (gpu_profile debug command). While a query heap is
+  // set, a timestamp is written before the first command recorded after the
+  // pass (rex::perf::GpuPass) changes - commands up to the next timestamp
+  // belong to that pass. Passes without commands cost nothing.
+  void BeginProfiling(ID3D12QueryHeap* query_heap, uint32_t first_query, uint32_t max_queries);
+  // Writes the closing timestamp; returns the number of timestamps written (0
+  // if not profiling). The passes of all but the last are in profile_passes().
+  uint32_t EndProfiling();
+  void SetProfilePass(uint8_t pass) { profile_pass_pending_ = pass; }
+  uint8_t GetProfilePass() const { return profile_pass_pending_; }
+  const std::vector<uint8_t>& profile_passes() const { return profile_passes_; }
+
  private:
   enum class Command {
     kD3DClearDepthStencilView,
@@ -639,8 +651,16 @@ class DeferredCommandList {
   };
 
   void* WriteCommand(Command command, size_t arguments_size_bytes);
+  void WriteProfileTimestamp();
 
   const D3D12CommandProcessor& command_processor_;
+
+  ID3D12QueryHeap* profile_query_heap_ = nullptr;
+  uint32_t profile_first_query_ = 0;
+  uint32_t profile_max_queries_ = 0;
+  uint8_t profile_pass_pending_ = 0;
+  uint8_t profile_pass_current_ = 0;
+  std::vector<uint8_t> profile_passes_;
 
   // uintmax_t to ensure uint64_t and pointer alignment of all structures.
   std::vector<uintmax_t> command_stream_;

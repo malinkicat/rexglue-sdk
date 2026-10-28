@@ -33,9 +33,11 @@
 #include <rex/graphics/d3d12/texture_cache.h>
 #include <rex/graphics/pipeline/shader/dxbc.h>
 #include <rex/graphics/pipeline/shader/dxbc_translator.h>
+#include <rex/graphics/pipeline/shader/interpreter.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/xenos.h>
+#include <rex/perf/frame_rate.h>
 #include <rex/system/kernel_state.h>
 #include <rex/ui/d3d12/d3d12_descriptor_heap_pool.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
@@ -194,6 +196,30 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   // Returns the text to display in the GPU backend name in the window title.
   std::string GetWindowTitleText() const;
+
+  // gpu_profile: the part of the frame the next recorded commands belong to.
+  void SetGpuProfilePass(rex::perf::GpuPass pass) {
+    deferred_command_list_.SetProfilePass(uint8_t(pass));
+  }
+  rex::perf::GpuPass GetGpuProfilePass() const {
+    return rex::perf::GpuPass(deferred_command_list_.GetProfilePass());
+  }
+  // Sets a pass for a scope, restoring the previous one after it.
+  class GpuProfilePassScope {
+   public:
+    GpuProfilePassScope(D3D12CommandProcessor& command_processor, rex::perf::GpuPass pass)
+        : command_processor_(command_processor),
+          previous_(command_processor.GetGpuProfilePass()) {
+      command_processor_.SetGpuProfilePass(pass);
+    }
+    ~GpuProfilePassScope() { command_processor_.SetGpuProfilePass(previous_); }
+    GpuProfilePassScope(const GpuProfilePassScope&) = delete;
+    GpuProfilePassScope& operator=(const GpuProfilePassScope&) = delete;
+
+   private:
+    D3D12CommandProcessor& command_processor_;
+    rex::perf::GpuPass previous_;
+  };
 
  protected:
   bool SetupContext() override;
@@ -659,6 +685,36 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint32_t host_index = UINT32_MAX;
     bool valid = false;
   } active_occlusion_query_;
+
+  // gpu_profile: timestamps between the parts of each submission.
+  static constexpr uint32_t kGpuProfileQueryCount = 65536;
+  static constexpr uint32_t kGpuProfileQueriesPerSubmission = 8192;
+  Microsoft::WRL::ComPtr<ID3D12QueryHeap> gpu_profile_query_heap_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> gpu_profile_readback_;
+  const uint64_t* gpu_profile_readback_mapping_ = nullptr;
+  bool gpu_profile_failed_ = false;
+  double gpu_profile_ns_per_tick_ = 0.0;
+  uint32_t gpu_profile_query_cursor_ = 0;
+  struct GpuProfileSubmission {
+    uint64_t submission;
+    uint32_t first_query;
+    uint32_t query_count;
+    std::vector<uint8_t> passes;
+  };
+  std::deque<GpuProfileSubmission> gpu_profile_submissions_;
+  uint64_t gpu_profile_last_end_tick_ = 0;
+  void GpuProfileBeginSubmission();
+  void GpuProfileEndSubmission();
+  void GpuProfileReadCompleted();
+
+  // gpu_clear_draws_in_place: a draw that is a clear (a constant rectangle,
+  // like Direct3D 9's Clear on the Xbox 360) done as a render target clear
+  // where the data already is, without ownership transfers. Returns true if
+  // the draw has been done this way.
+  bool TryClearDrawInPlace(const Shader& vertex_shader, const Shader* pixel_shader,
+                           reg::RB_DEPTHCONTROL normalized_depth_control);
+  std::unique_ptr<ShaderInterpreter> clear_draw_interpreter_;
+
   struct VertexBufferState {
     uint32_t address = UINT32_MAX;
     uint32_t size = UINT32_MAX;

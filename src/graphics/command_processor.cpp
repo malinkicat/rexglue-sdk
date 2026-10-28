@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <string_view>
 
@@ -36,10 +37,14 @@
 #include <rex/system/user_module.h>
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+REXCVAR_DEFINE_BOOL(swap_times, false, "GPU",
+                    "Debug: write the time of every guest swap to swaptimes.csv");
 
-REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
-                    "Refresh page-valid state from GPU-written memory at frame end. "
-                    "Disable for minor CPU overhead reduction, but may break memory coherency.")
+REXCVAR_DEFINE_BOOL(clear_memory_page_state, false, "GPU",
+                    "At the end of every frame, forget which pages the GPU has from the CPU, so "
+                    "everything used is uploaded again (a coherency safety net for titles writing "
+                    "memory unnoticed; CPU writes are normally caught by write watches). Costly: "
+                    "about 10 MB of uploads a frame in Burst Limit.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(occlusion_query_enable, true, "GPU", "Enable host occlusion query handling")
@@ -355,7 +360,15 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
   // Volatile for the WAIT_REG_MEM loop.
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
-  if (!regs.GetRegisterInfo(index)) {
+  // amped3 cp perf: known registers from a bitmap built once, not the switch.
+  static const auto known_registers = [] {
+    std::vector<bool> known(RegisterFile::kRegisterCount);
+    for (uint32_t i = 0; i < RegisterFile::kRegisterCount; ++i) {
+      known[i] = RegisterFile::GetRegisterInfo(i) != nullptr;
+    }
+    return known;
+  }();
+  if (!known_registers[index]) {
     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
   }
 
@@ -702,10 +715,14 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
 
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
+  if (!write_one_reg) {
+    // amped3 cp perf: consecutive registers through the range path, which
+    // copies whole constant ranges at once (as in Xenia Canary).
+    WriteRegisterRangeFromRing(reader, base_index, count);
+    return true;
+  }
   for (uint32_t m = 0; m < count; m++) {
-    uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
-    uint32_t target_index = write_one_reg ? base_index : base_index + m;
-    WriteRegister(target_index, reg_data);
+    WriteRegister(base_index, reader->ReadAndSwap<uint32_t>());
   }
 
   return true;
@@ -958,6 +975,21 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
 
+  if (REXCVAR_GET(swap_times)) {
+    static std::FILE* csv = nullptr;
+    static uint64_t first = 0, last = 0, n = 0;
+    const uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+    const double freq = double(rex::chrono::Clock::QueryHostTickFrequency());
+    if (!csv && (csv = std::fopen("swaptimes.csv", "w"))) {
+      std::fputs("time_s,frame_ms\n", csv);
+      first = last = now;
+    }
+    if (csv) {
+      std::fprintf(csv, "%.5f,%.3f\n", (now - first) / freq, (now - last) * 1000.0 / freq);
+      last = now;
+      if (++n % 120 == 0) std::fflush(csv);
+    }
+  }
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
 
   ++counter_;
@@ -973,6 +1005,12 @@ bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* re
   list_length &= 0xFFFFF;
   ExecuteIndirectBuffer(GpuToCpu(list_ptr), list_length);
   return true;
+}
+
+// Signaled by GraphicsSystem::MarkVblank after the vblank interrupt has run.
+rex::thread::Event* VblankWakeEvent() {
+  static auto event = rex::thread::Event::CreateAutoResetEvent(false);
+  return event.get();
 }
 
 bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reader, uint32_t packet,
@@ -1037,7 +1075,8 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
           // User wants it fast and dangerous.
           rex::thread::MaybeYield();
         } else {
-          rex::thread::Sleep(std::chrono::milliseconds(wait / 0x100));
+          rex::thread::Wait(VblankWakeEvent(), false,
+                            std::chrono::milliseconds(wait / 0x100));
         }
         rex::thread::SyncMemory();
         ReturnFromWait();

@@ -19,11 +19,15 @@
 #include <rex/graphics/d3d12/shared_memory.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/perf/frame_rate.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
 REXCVAR_DEFINE_BOOL(d3d12_tiled_shared_memory, true, "GPU/D3D12",
                     "Use tiled shared memory on D3D12")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+// command_processor.cpp: also logs the uploads.
+REXCVAR_DECLARE(int32_t, gpu_debug_log_draws);
 
 namespace rex::graphics::d3d12 {
 
@@ -309,6 +313,23 @@ bool D3D12SharedMemory::UploadRanges(
   CommitUAVWritesAndTransitionBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
   command_processor_.SubmitBarriers();
   auto& command_list = command_processor_.GetDeferredCommandList();
+  if (rex::perf::IsGpuProfiling()) {
+    uint64_t pages = 0;
+    for (auto upload_range : upload_page_ranges) {
+      pages += upload_range.second;
+    }
+    rex::perf::GpuProfileStats& stats = rex::perf::GetGpuProfileStats();
+    stats.memory_upload_batches.fetch_add(1, std::memory_order_relaxed);
+    stats.memory_upload_bytes.fetch_add(pages << page_size_log2(), std::memory_order_relaxed);
+  }
+  if (REXCVAR_GET(gpu_debug_log_draws) > 0) {
+    std::string ranges;
+    for (auto upload_range : upload_page_ranges) {
+      ranges += fmt::format(" {:08X}+{}K", upload_range.first << page_size_log2(),
+                            (upload_range.second << page_size_log2()) >> 10);
+    }
+    REXGPU_INFO("UPLOAD{}", ranges);
+  }
   for (auto upload_range : upload_page_ranges) {
     uint32_t upload_range_start = upload_range.first;
     uint32_t upload_range_length = upload_range.second;

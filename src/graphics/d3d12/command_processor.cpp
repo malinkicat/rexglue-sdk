@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <set>
 #include <chrono>
 #include <intrin.h>
 #include <cmath>
@@ -54,6 +55,9 @@ REXCVAR_DEFINE_BOOL(d3d12_draw_timing_sections, true, "GPU/D3D12",
                     "Debug: with d3d12_draw_timing, also time each IssueDraw section (the "
                     "timer reads cost about 1 ms per frame); false logs only the command "
                     "processor's busy time per frame and per draw");
+REXCVAR_DEFINE_BOOL(d3d12_debug_prim_stats, false, "GPU/D3D12",
+                    "Debug: log draws per frame by primitive type, and skip the types whose bits "
+                    "are set in debug_skip_prims.txt (hex mask, re-read every 60 frames)");
 REXCVAR_DEFINE_BOOL(d3d12_readback_resolve, false, "GPU/D3D12",
                     "Read render-to-texture results on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -95,6 +99,16 @@ extern bool amped3_make_valid_timing;
 extern uint64_t amped3_make_valid_lock_tsc, amped3_make_valid_protect_tsc;
 }  // namespace rex::graphics
 namespace {
+// amped3 debug (--d3d12_debug_prim_stats): draws per primitive type, and the
+// types to skip (finding which kind of draw makes an artefact).
+uint64_t g_prim_counts[64];
+uint64_t g_prim_skip_mask;
+// Also skip draws numbered [g_skip_first, g_skip_end) within the frame (counting
+// all draws, from 0 after each swap), and the frame's draw count.
+uint32_t g_skip_first, g_skip_end, g_frame_draw_index, g_frame_draws_last;
+// Pixel shaders (ucode hashes) of the triangle-list draws seen, logged every 120
+// frames, and the ones whose draws are skipped (further lines of the file).
+std::set<uint64_t> g_ps_seen, g_ps_skip;
 uint64_t g_draw_timing_last;
 uint64_t g_draw_timing_draws;
 bool g_draw_timing_on;
@@ -2012,6 +2026,59 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   rex::graphics::amped3_make_valid_timing = REXCVAR_GET(d3d12_draw_timing);
+  if (REXCVAR_GET(d3d12_debug_prim_stats)) {
+    static uint32_t prim_swaps = 0;
+    g_frame_draws_last = g_frame_draw_index;
+    g_frame_draw_index = 0;
+    if (++prim_swaps % 30 == 0) {
+      // "mask [first end]": primitive types (hex) and a range of draw numbers.
+      uint64_t mask = 0;
+      uint32_t first = 0, end = 0;
+      if (std::FILE* f = std::fopen("debug_skip_prims.txt", "r")) {
+        unsigned long long value = 0;
+        if (std::fscanf(f, "%llx", &value) == 1) {
+          mask = value;
+          unsigned a = 0, b = 0;
+          if (std::fscanf(f, "%u %u", &a, &b) == 2) {
+            first = a;
+            end = b;
+          }
+          std::set<uint64_t> ps_skip;
+          while (std::fscanf(f, "%llx", &value) == 1) {
+            ps_skip.insert(value);
+          }
+          if (ps_skip != g_ps_skip) {
+            g_ps_skip = std::move(ps_skip);
+            REXGPU_INFO("d3d12_debug_prim_stats: skipping {} pixel shaders", g_ps_skip.size());
+          }
+        }
+        std::fclose(f);
+      }
+      if (mask != g_prim_skip_mask || first != g_skip_first || end != g_skip_end) {
+        g_prim_skip_mask = mask;
+        g_skip_first = first;
+        g_skip_end = end;
+        REXGPU_INFO("d3d12_debug_prim_stats: skipping types {:X} draws {}-{} (frame had {} draws)",
+                    mask, first, end, g_frame_draws_last);
+      }
+    }
+    if (prim_swaps % 120 == 0) {
+      std::string counts;
+      for (uint32_t i = 0; i < 64; ++i) {
+        if (g_prim_counts[i]) {
+          counts += fmt::format(" {:02X}:{:.1f}", i, double(g_prim_counts[i]) / 120);
+        }
+      }
+      REXGPU_INFO("d3d12_debug_prim_stats: draws per frame by primitive type:{}", counts);
+      std::string shaders;
+      for (uint64_t hash : g_ps_seen) {
+        shaders += fmt::format(" {:016X}", hash);
+      }
+      REXGPU_INFO("d3d12_debug_prim_stats: triangle-list pixel shaders:{}", shaders);
+      g_ps_seen.clear();
+      std::fill(std::begin(g_prim_counts), std::end(g_prim_counts), 0);
+    }
+  }
   rex::graphics::g_amped3_count_packets = REXCVAR_GET(d3d12_draw_timing);
   if (REXCVAR_GET(d3d12_draw_timing)) {
     static uint32_t swaps = 0;
@@ -2640,6 +2707,17 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     return copy_result;
   }
 
+  // (After the copies: skipping those would freeze the picture.)
+  if (REXCVAR_GET(d3d12_debug_prim_stats)) {
+    uint32_t type = uint32_t(primitive_type) & 63;
+    ++g_prim_counts[type];
+    uint32_t draw_index = g_frame_draw_index++;
+    if (((g_prim_skip_mask >> type) & 1) ||
+        (draw_index >= g_skip_first && draw_index < g_skip_end)) {
+      return true;
+    }
+  }
+
   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
 
   // Vertex shader analysis.
@@ -2677,6 +2755,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     // cache.
     if (!memexport_used_vertex) {
       // This draw has no effect.
+      return true;
+    }
+  }
+  if (REXCVAR_GET(d3d12_debug_prim_stats) && primitive_type == xenos::PrimitiveType::kTriangleList) {
+    uint64_t ps_hash = pixel_shader ? pixel_shader->ucode_data_hash() : 0;
+    g_ps_seen.insert(ps_hash);
+    if (g_ps_skip.count(ps_hash)) {
       return true;
     }
   }

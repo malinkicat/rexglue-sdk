@@ -183,8 +183,16 @@ void D3D12CommandProcessor::InvalidateVertexBufferResidencyRange(uint32_t first_
     return;
   }
   last_vfetch = std::min(last_vfetch, uint32_t(vertex_buffer_states_.size() - 1));
-  for (uint32_t vfetch_index = first_vfetch; vfetch_index <= last_vfetch; ++vfetch_index) {
-    InvalidateVertexBufferResidency(vfetch_index);
+  // Whole 64-bit words of the bitmap at once.
+  for (uint32_t word = first_vfetch >> 6; word <= last_vfetch >> 6; ++word) {
+    uint64_t mask = ~uint64_t(0);
+    if (word == first_vfetch >> 6) {
+      mask &= ~uint64_t(0) << (first_vfetch & 63);
+    }
+    if (word == last_vfetch >> 6) {
+      mask &= ~uint64_t(0) >> (63 - (last_vfetch & 63));
+    }
+    vertex_buffers_in_sync_[word] &= ~mask;
   }
 }
 

@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <array>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -348,6 +349,19 @@ uint32_t CommandProcessor::ReadRegisterValue(uint32_t index) const {
   return it != extended_register_values_.end() ? it->second : 0;
 }
 
+namespace {
+// Registers with RegisterFile::GetRegisterInfo, for the unknown write log.
+const std::array<uint64_t, (RegisterFile::kRegisterCount + 63) / 64> kKnownRegisters = [] {
+  std::array<uint64_t, (RegisterFile::kRegisterCount + 63) / 64> known{};
+  for (uint32_t i = 0; i < RegisterFile::kRegisterCount; ++i) {
+    if (RegisterFile::GetRegisterInfo(i)) {
+      known[i >> 6] |= uint64_t(1) << (i & 63);
+    }
+  }
+  return known;
+}();
+}  // namespace
+
 void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   RegisterFile& regs = *register_file_;
   if (index >= RegisterFile::kRegisterCount) {
@@ -363,15 +377,9 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
   // Volatile for the WAIT_REG_MEM loop.
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
-  // amped3 cp perf: known registers from a bitmap built once, not the switch.
-  static const auto known_registers = [] {
-    std::vector<bool> known(RegisterFile::kRegisterCount);
-    for (uint32_t i = 0; i < RegisterFile::kRegisterCount; ++i) {
-      known[i] = RegisterFile::GetRegisterInfo(i) != nullptr;
-    }
-    return known;
-  }();
-  if (!known_registers[index]) {
+  // amped3 cp perf: known registers from a bitmap built at load, not the switch
+  // (and no function-local static guard on every write).
+  if (!(kKnownRegisters[index >> 6] & (uint64_t(1) << (index & 63)))) {
     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
   }
 

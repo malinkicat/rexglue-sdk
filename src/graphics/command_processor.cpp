@@ -21,6 +21,10 @@
 #include <fmt/format.h>
 
 #include <rex/cvar.h>
+#include <rex/platform.h>
+#if REX_PLATFORM_WIN32
+#include <windows.h>
+#endif
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
 #include <rex/chrono/clock.h>
@@ -42,9 +46,13 @@ REXCVAR_DEFINE_BOOL(gpu_read_pointer_progress, true, "GPU",
                     "Write the ring buffer read pointer back after every primary ring packet "
                     "(like the hardware), not only when the batch is done");
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
-REXCVAR_DEFINE_BOOL(gpu_cp_split, false, "GPU",
-                    "Run the command processor in two threads: one reads the command buffers "
-                    "and register writes, the other executes the draws");
+REXCVAR_DEFINE_INT32(gpu_cp_split, -1, "GPU",
+                     "Run the command processor in two threads: one reads the command buffers "
+                     "and register writes, the other executes the draws: -1 auto (on under "
+                     "Proton/Wine, measured on the Steam Deck; off on Windows), 0 off, 1 on");
+REXCVAR_DEFINE_INT32(gpu_cp_split_spin, 200000, "GPU",
+                     "gpu_cp_split: pause instructions the draw thread spins for before sleeping "
+                     "when it runs out of work (waking it again takes a system call)");
 REXCVAR_DEFINE_BOOL(swap_times, false, "GPU",
                     "Debug: write the time of every guest swap to swaptimes.csv");
 
@@ -189,7 +197,14 @@ bool CommandProcessor::Initialize() {
   worker_thread_->set_name("GPU Commands");
   worker_thread_->Create();
 
-  if (REXCVAR_GET(gpu_cp_split)) {
+  bool split = REXCVAR_GET(gpu_cp_split) > 0;
+  if (REXCVAR_GET(gpu_cp_split) < 0) {
+#if REX_PLATFORM_WIN32
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    split = ntdll && GetProcAddress(ntdll, "wine_get_version");
+#endif
+  }
+  if (split) {
     amped3_split_ = std::make_unique<Amped3Split>();
     amped3_split_->thread = system::object_ref<system::XHostThread>(
         new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
@@ -1173,6 +1188,7 @@ void CommandProcessor::Amped3SplitExecutorMain() {
   Amped3Split& split = *amped3_split_;
   uint64_t read = 0, write = 0, signaled_read = 0;
   uint64_t busy_start = __rdtsc();
+  const uint32_t spin_limit = uint32_t(std::max(REXCVAR_GET(gpu_cp_split_spin), 0));
   while (true) {
     if (read == write) {
       write = split.write_pos.load(std::memory_order_acquire);
@@ -1186,7 +1202,7 @@ void CommandProcessor::Amped3SplitExecutorMain() {
           if (!split.running.load(std::memory_order_relaxed)) {
             return;
           }
-          if (spins < 2000) {
+          if (spins < spin_limit) {
             _mm_pause();
           } else {
             split.executor_sleeping.store(true);

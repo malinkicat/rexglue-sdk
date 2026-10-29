@@ -598,6 +598,12 @@ class RenderTargetCache {
 
   DrawExtentEstimator draw_extent_estimator_;
 
+ public:
+  // amped3 (gpu_screen_extents=2).
+  DrawExtentEstimator& amped3_draw_extent_estimator() { return draw_extent_estimator_; }
+
+ private:
+
   // For host render targets.
 
   struct OwnershipRange {

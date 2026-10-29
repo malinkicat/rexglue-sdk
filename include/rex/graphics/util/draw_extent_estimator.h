@@ -41,6 +41,12 @@ class DrawExtentEstimator {
   };
   bool EstimateCoveredRectangle(const Shader& vertex_shader, Rectangle& rectangle_out);
 
+  // amped3 (gpu_screen_extents=2, test): the screen-space bounding box of the
+  // draw's vertices in guest pixels (the vertex shader on the CPU for every
+  // vertex), before the scissor. False if unknown (a vertex behind the camera,
+  // tessellation, immediate indices...): then the whole screen applies.
+  bool Amped3EstimateScreenExtents(const Shader& vertex_shader, float extents_out[4]);
+
  private:
   class PositionYExportSink : public ShaderInterpreter::ExportSink {
    public:

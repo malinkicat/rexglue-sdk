@@ -475,6 +475,127 @@ bool DrawExtentEstimator::EstimateCoveredRectangle(const Shader& vertex_shader,
   return true;
 }
 
+bool DrawExtentEstimator::Amped3EstimateScreenExtents(const Shader& vertex_shader,
+                                                      float extents_out[4]) {
+  const RegisterFile& regs = register_file_;
+  auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+  if (!vgt_draw_initiator.num_indices ||
+      vgt_draw_initiator.prim_type == xenos::PrimitiveType::kPointList ||
+      (vgt_draw_initiator.source_select != xenos::SourceSelect::kDMA &&
+       vgt_draw_initiator.source_select != xenos::SourceSelect::kAutoIndex)) {
+    return false;
+  }
+  if (xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type) &&
+      regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().path_select ==
+          xenos::VGTOutputPath::kTessellationEnable) {
+    return false;
+  }
+  if (!vertex_shader.is_ucode_analyzed() || !ShaderInterpreter::CanInterpretShader(vertex_shader)) {
+    return false;
+  }
+  auto vgt_dma_size = regs.Get<reg::VGT_DMA_SIZE>();
+  const void* index_buffer = nullptr;
+  xenos::Endian index_endian = vgt_dma_size.swap_mode;
+  if (vgt_draw_initiator.source_select == xenos::SourceSelect::kDMA) {
+    uint32_t index_buffer_base = regs[XE_GPU_REG_VGT_DMA_BASE];
+    if (vgt_draw_initiator.index_size == xenos::IndexFormat::kInt16) {
+      if (index_endian == xenos::Endian::k8in32) {
+        index_endian = xenos::Endian::k8in16;
+      } else if (index_endian == xenos::Endian::k16in32) {
+        index_endian = xenos::Endian::kNone;
+      }
+      index_buffer_base &= ~uint32_t(sizeof(uint16_t) - 1);
+    } else {
+      index_buffer_base &= ~uint32_t(sizeof(uint32_t) - 1);
+    }
+    index_buffer = memory_.TranslatePhysical(index_buffer_base);
+    if (!index_buffer) {
+      return false;
+    }
+  }
+  auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+  auto pa_cl_vte_cntl = regs.Get<reg::PA_CL_VTE_CNTL>();
+  uint32_t reset_index = regs.Get<reg::VGT_MULTI_PRIM_IB_RESET_INDX>().reset_indx;
+  uint32_t index_offset = regs.Get<reg::VGT_INDX_OFFSET>().indx_offset;
+  uint32_t min_index = regs.Get<reg::VGT_MIN_VTX_INDX>().min_indx;
+  uint32_t max_index = regs.Get<reg::VGT_MAX_VTX_INDX>().max_indx;
+  float scale_xy[2] = {
+      pa_cl_vte_cntl.vport_x_scale_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE) : 1.0f,
+      pa_cl_vte_cntl.vport_y_scale_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE) : 1.0f,
+  };
+  float offset_xy[2] = {
+      pa_cl_vte_cntl.vport_x_offset_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET) : 0.0f,
+      pa_cl_vte_cntl.vport_y_offset_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET) : 0.0f,
+  };
+  if (pa_su_sc_mode_cntl.vtx_window_offset_enable) {
+    auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+    offset_xy[0] += float(pa_sc_window_offset.window_x_offset);
+    offset_xy[1] += float(pa_sc_window_offset.window_y_offset);
+  }
+  float lo[2] = {FLT_MAX, FLT_MAX}, hi[2] = {-FLT_MAX, -FLT_MAX};
+  shader_interpreter_.SetShader(vertex_shader);
+  PositionExportSink sink;
+  shader_interpreter_.SetExportSink(&sink);
+  bool valid = true;
+  uint32_t vertex_count = 0;
+  for (uint32_t i = 0; i < vgt_draw_initiator.num_indices && valid; ++i) {
+    uint32_t vertex_index = i;
+    if (index_buffer) {
+      if (i >= vgt_dma_size.num_words) {
+        break;
+      }
+      if (vgt_draw_initiator.index_size == xenos::IndexFormat::kInt16) {
+        vertex_index = static_cast<const uint16_t*>(index_buffer)[i];
+      } else {
+        vertex_index = static_cast<const uint32_t*>(index_buffer)[i];
+      }
+      vertex_index = xenos::GpuSwap(vertex_index, index_endian) & 0xFFFFFF;
+      if (pa_su_sc_mode_cntl.multi_prim_ib_ena && vertex_index == reset_index) {
+        continue;
+      }
+    }
+    vertex_index =
+        std::min(max_index, std::max(min_index, (vertex_index + index_offset) & 0xFFFFFF));
+    sink.Reset();
+    shader_interpreter_.temp_registers()[0] = float(vertex_index);
+    shader_interpreter_.Execute();
+    if (sink.position_mask_ != 0b1111) {
+      valid = false;
+      break;
+    }
+    float x = sink.position_[0], y = sink.position_[1], w = sink.position_[3];
+    if (!pa_cl_vte_cntl.vtx_xy_fmt) {
+      // Behind the camera (or on its plane): clipping makes the extents
+      // unbounded as far as this estimate goes.
+      if (!(w > 0.0f)) {
+        valid = false;
+        break;
+      }
+      x /= w;
+      y /= w;
+    }
+    if (!std::isfinite(x) || !std::isfinite(y)) {
+      valid = false;
+      break;
+    }
+    float sx = x * scale_xy[0] + offset_xy[0], sy = y * scale_xy[1] + offset_xy[1];
+    lo[0] = std::min(lo[0], sx);
+    hi[0] = std::max(hi[0], sx);
+    lo[1] = std::min(lo[1], sy);
+    hi[1] = std::max(hi[1], sy);
+    ++vertex_count;
+  }
+  shader_interpreter_.SetExportSink(nullptr);
+  if (!valid || !vertex_count) {
+    return false;
+  }
+  extents_out[0] = lo[0];
+  extents_out[1] = hi[0];
+  extents_out[2] = lo[1];
+  extents_out[3] = hi[1];
+  return true;
+}
+
 uint32_t DrawExtentEstimator::EstimateMaxY(bool try_to_estimate_vertex_max_y,
                                            const Shader& vertex_shader) {
   SCOPE_profile_cpu_f("gpu");

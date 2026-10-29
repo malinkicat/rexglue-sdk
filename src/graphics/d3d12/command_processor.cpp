@@ -2589,6 +2589,13 @@ void D3D12CommandProcessor::OnPrimaryBufferEnd() {
   }
 }
 
+bool D3D12CommandProcessor::Amped3ScreenExtents(float extents_out[4]) {
+  Shader* vertex_shader = active_vertex_shader();
+  return vertex_shader && render_target_cache_ &&
+         render_target_cache_->amped3_draw_extent_estimator().Amped3EstimateScreenExtents(
+             *vertex_shader, extents_out);
+}
+
 Shader* D3D12CommandProcessor::LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                                           const uint32_t* host_address, uint32_t dword_count) {
   return pipeline_cache_->LoadShader(shader_type, host_address, dword_count);

@@ -220,6 +220,10 @@ class CommandProcessor {
   virtual bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                          IndexBufferInfo* index_buffer_info, bool major_mode_explicit) = 0;
   virtual bool IssueCopy() = 0;
+  // amped3 (gpu_screen_extents=2, test): the previous draw's screen extents in
+  // guest pixels (min x, max x, min y, max y), false if unknown.
+  virtual bool Amped3ScreenExtents(float extents_out[4]) { return false; }
+  void Amped3FillScreenExtents(uint16_t extents[6], uint32_t address);
 
   // "Actual" is for the command processor thread, to be read by the
   // implementations.

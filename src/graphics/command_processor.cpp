@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <deque>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -50,6 +51,14 @@ REXCVAR_DEFINE_INT32(gpu_cp_split, -1, "GPU",
                      "Run the command processor in two threads: one reads the command buffers "
                      "and register writes, the other executes the draws: -1 auto (on under "
                      "Proton/Wine, measured on the Steam Deck; off on Windows), 0 off, 1 on");
+REXCVAR_DEFINE_INT32(gpu_screen_extents, 0, "GPU",
+                     "Test: the screen extents EVENT_WRITE_EXT reports for the previous draw: "
+                     "0 the whole screen (Xenia's), 1 a single 8x8 tile at the origin, 2 the "
+                     "draw's vertices' bounding box from its vertex shader run on the CPU (slow)");
+REXCVAR_DEFINE_INT32(gpu_screen_extents_delay, 0, "GPU",
+                     "Test (gpu_screen_extents=2): write the measured extents this many frames "
+                     "late (the whole screen until then), as a GPU measurement would arrive; -1: at "
+                     "the next EVENT_WRITE_SHD or swap (the end of the frame's GPU work)");
 REXCVAR_DEFINE_INT32(gpu_cp_split_spin, 200000, "GPU",
                      "gpu_cp_split: pause instructions the draw thread spins for before sleeping "
                      "when it runs out of work (waking it again takes a system call)");
@@ -772,6 +781,17 @@ uint64_t g_amped3_cp_busy_tsc;
 bool g_amped3_count_packets;
 uint64_t g_amped3_opcode_counts[128];
 uint64_t g_amped3_type0_packets, g_amped3_type0_registers;
+// amped3 debug: one frame of type-3 packets to tiling_trace.txt, started by
+// creating trace_tiling.txt next to the exe (single-threaded command processor).
+std::FILE* g_amped3_tiling_trace;
+struct Amped3DelayedExtents {
+  uint32_t frame;
+  uint32_t address;
+  uint16_t extents[6];
+};
+// gpu_screen_extents_delay: measured extents waiting to be written.
+std::deque<Amped3DelayedExtents> g_amped3_delayed_extents;
+uint32_t g_amped3_extents_frame;
 // gpu_cp_split: the executor's busy time (g_amped3_cp_busy_tsc is the parser's).
 uint64_t g_amped3_cp_exec_busy_tsc;
 
@@ -1120,7 +1140,8 @@ bool CommandProcessor::Amped3SplitParsePacket(memory::RingBuffer* reader) {
       }
       break;
     case PM4_EVENT_WRITE_EXT:
-      if (count == 2) {
+      // (gpu_screen_extents=2 measures the previous draw: on the executor.)
+      if (count == 2 && REXCVAR_GET(gpu_screen_extents) != 2) {
         // Fake screen extents (as ExecutePacketType3_EVENT_WRITE_EXT): not
         // dependent on drawing.
         uint32_t initiator = reader->ReadAndSwap<uint32_t>();
@@ -1133,6 +1154,7 @@ bool CommandProcessor::Amped3SplitParsePacket(memory::RingBuffer* reader) {
             0 >> 3, xenos::kTexture2DCubeMaxWidthHeight >> 3,
             0,      1,
         };
+        Amped3FillScreenExtents(extents, address);
         memory::copy_and_swap_16_unaligned(memory_->TranslatePhysical(address), extents,
                                            rex::countof(extents));
         return true;
@@ -1328,6 +1350,16 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
   auto data_start_offset = reader->read_offset();
   if (g_amped3_count_packets) {
     ++g_amped3_opcode_counts[opcode];
+  }
+  if (g_amped3_tiling_trace) {
+    const uint8_t* data = reinterpret_cast<const uint8_t*>(reader->read_ptr());
+    uint32_t d[3] = {};
+    for (uint32_t i = 0; i < 3 && i < count && (i + 1) * 4 <= reader->read_count(); ++i) {
+      d[i] = rex::byte_swap(reinterpret_cast<const uint32_t*>(data)[i]);
+    }
+    std::fprintf(g_amped3_tiling_trace, "%02X n=%u p=%u sel=%llX mask=%llX at=%08X %08X %08X %08X\n",
+                 opcode, count, packet & 1, (unsigned long long)bin_select_,
+                 (unsigned long long)bin_mask_, uint32_t(reader->read_ptr() - uintptr_t(memory_->TranslatePhysical(0))), d[0], d[1], d[2]);
   }
 
   if (reader->read_count() < count * sizeof(uint32_t)) {
@@ -1539,6 +1571,32 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   }
 #endif
   rex::perf::Profiler::Flip();
+  ++g_amped3_extents_frame;
+  while (!g_amped3_delayed_extents.empty() &&
+         (REXCVAR_GET(gpu_screen_extents_delay) < 0 ||
+          g_amped3_extents_frame - g_amped3_delayed_extents.front().frame >=
+              uint32_t(REXCVAR_GET(gpu_screen_extents_delay)))) {
+    const Amped3DelayedExtents& delayed = g_amped3_delayed_extents.front();
+    memory::copy_and_swap_16_unaligned(memory_->TranslatePhysical(delayed.address),
+                                       delayed.extents, 6);
+    g_amped3_delayed_extents.pop_front();
+  }
+  // (Several frames: trace_tiling.txt may hold the frame count, default 1.)
+  static int tiling_trace_frames = 0;
+  if (g_amped3_tiling_trace) {
+    std::fprintf(g_amped3_tiling_trace, "SWAP\n");
+    if (--tiling_trace_frames <= 0) {
+      std::fclose(g_amped3_tiling_trace);
+      g_amped3_tiling_trace = nullptr;
+    }
+  } else if (std::FILE* trigger = std::fopen("trace_tiling.txt", "r")) {
+    if (std::fscanf(trigger, "%d", &tiling_trace_frames) != 1) {
+      tiling_trace_frames = 1;
+    }
+    std::fclose(trigger);
+    std::remove("trace_tiling.txt");
+    g_amped3_tiling_trace = std::fopen("tiling_trace.txt", "w");
+  }
 
   // Xenia-specific VdSwap hook.
   // VdSwap will post this to tell us we need to swap the screen/fire an
@@ -1820,6 +1878,13 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
 
   // Writeback initiator.
   WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
+  if (REXCVAR_GET(gpu_screen_extents_delay) < 0) {
+    for (const Amped3DelayedExtents& delayed : g_amped3_delayed_extents) {
+      memory::copy_and_swap_16_unaligned(memory_->TranslatePhysical(delayed.address),
+                                         delayed.extents, 6);
+    }
+    g_amped3_delayed_extents.clear();
+  }
   uint32_t data_value;
   if ((initiator >> 31) & 0x1) {
     // Write counter (GPU vblank counter?).
@@ -1857,10 +1922,41 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* re
       0,                                         // min z
       1,                                         // max z
   };
+  Amped3FillScreenExtents(extents, address);
   assert_true(endianness == xenos::Endian::k8in16);
   memory::copy_and_swap_16_unaligned(memory_->TranslatePhysical(address), extents,
                                      rex::countof(extents));
   return true;
+}
+
+void CommandProcessor::Amped3FillScreenExtents(uint16_t extents[6], uint32_t address) {
+  switch (REXCVAR_GET(gpu_screen_extents)) {
+    case 1:
+      extents[1] = extents[3] = 0;
+      break;
+    case 2: {
+      float e[4];
+      if (Amped3ScreenExtents(e)) {
+        auto to_tiles = [](float value, bool max) {
+          float clamped = std::min(std::max(max ? std::ceil(value) : std::floor(value), 0.0f),
+                                   float(xenos::kTexture2DCubeMaxWidthHeight - 1));
+          return uint16_t(uint32_t(clamped) >> 3);
+        };
+        uint16_t measured[6] = {to_tiles(e[0], false), to_tiles(e[1], true),
+                                to_tiles(e[2], false), to_tiles(e[3], true),
+                                extents[4],            extents[5]};
+        if (REXCVAR_GET(gpu_screen_extents_delay) != 0) {
+          Amped3DelayedExtents delayed;
+          delayed.frame = g_amped3_extents_frame;
+          delayed.address = address;
+          std::memcpy(delayed.extents, measured, sizeof(measured));
+          g_amped3_delayed_extents.push_back(delayed);
+        } else {
+          std::memcpy(extents, measured, sizeof(measured));
+        }
+      }
+    } break;
+  }
 }
 
 bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader,

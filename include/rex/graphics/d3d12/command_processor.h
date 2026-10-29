@@ -281,6 +281,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;
+  bool Amped3ScreenExtents(float extents_out[4]) override;
 
  private:
   static constexpr uint32_t kQueueFrames = 3;

@@ -87,6 +87,10 @@ extern uint64_t g_amped3_upload_valid_tsc, g_amped3_upload_copy_tsc, g_amped3_up
 }  // namespace rex::graphics::d3d12
 namespace rex::graphics {
 extern uint64_t g_amped3_cp_busy_tsc;
+extern bool g_amped3_count_packets;
+extern uint64_t g_amped3_opcode_counts[128];
+extern uint64_t g_amped3_type0_packets, g_amped3_type0_registers;
+extern uint64_t g_amped3_cp_exec_busy_tsc;
 extern bool amped3_make_valid_timing;
 extern uint64_t amped3_make_valid_lock_tsc, amped3_make_valid_protect_tsc;
 }  // namespace rex::graphics
@@ -2008,6 +2012,7 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   rex::graphics::amped3_make_valid_timing = REXCVAR_GET(d3d12_draw_timing);
+  rex::graphics::g_amped3_count_packets = REXCVAR_GET(d3d12_draw_timing);
   if (REXCVAR_GET(d3d12_draw_timing)) {
     static uint32_t swaps = 0;
     static uint64_t tsc_start = 0;
@@ -2042,6 +2047,30 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                               : 0.0,
           double(g_amped3_copy_tsc) / tsc_per_ms / swaps);
       rex::graphics::g_amped3_cp_busy_tsc = 0;
+      if (rex::graphics::g_amped3_cp_exec_busy_tsc) {
+        REXGPU_INFO("d3d12_draw_timing: gpu_cp_split executor busy {:.2f} ms/frame ({:.0f} ns/draw)",
+                    double(rex::graphics::g_amped3_cp_exec_busy_tsc) / tsc_per_ms / swaps,
+                    g_draw_timing_draws
+                        ? double(rex::graphics::g_amped3_cp_exec_busy_tsc) / tsc_per_ms * 1e6 /
+                              double(g_draw_timing_draws)
+                        : 0.0);
+        rex::graphics::g_amped3_cp_exec_busy_tsc = 0;
+      }
+      {
+        std::string opcodes;
+        for (uint32_t i = 0; i < 128; ++i) {
+          if (rex::graphics::g_amped3_opcode_counts[i]) {
+            opcodes += fmt::format(" {:02X}:{:.1f}", i,
+                                   double(rex::graphics::g_amped3_opcode_counts[i]) / swaps);
+          }
+        }
+        REXGPU_INFO("d3d12_draw_timing: per frame type-0 {:.0f} ({:.0f} registers), type-3:{}",
+                    double(rex::graphics::g_amped3_type0_packets) / swaps,
+                    double(rex::graphics::g_amped3_type0_registers) / swaps, opcodes);
+        std::fill(std::begin(rex::graphics::g_amped3_opcode_counts),
+                  std::end(rex::graphics::g_amped3_opcode_counts), 0);
+        rex::graphics::g_amped3_type0_packets = rex::graphics::g_amped3_type0_registers = 0;
+      }
       g_amped3_copy_tsc = 0;
       REXGPU_INFO("d3d12_draw_timing: make valid: lock + bitmaps {:.2f} ms, protect {:.2f} ms",
                   double(rex::graphics::amped3_make_valid_lock_tsc) / tsc_per_ms / swaps,

@@ -42,6 +42,9 @@ REXCVAR_DEFINE_BOOL(gpu_read_pointer_progress, true, "GPU",
                     "Write the ring buffer read pointer back after every primary ring packet "
                     "(like the hardware), not only when the batch is done");
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+REXCVAR_DEFINE_BOOL(gpu_cp_split, false, "GPU",
+                    "Run the command processor in two threads: one reads the command buffers "
+                    "and register writes, the other executes the draws");
 REXCVAR_DEFINE_BOOL(swap_times, false, "GPU",
                     "Debug: write the time of every guest swap to swaptimes.csv");
 
@@ -111,6 +114,38 @@ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
 
 }  // namespace
 
+// amped3 cp perf (gpu_cp_split): the command processor in two threads. The
+// "GPU Commands" thread (the parser) walks the ring and the indirect buffers,
+// takes the register writes off the packets, handles the packets that don't
+// depend on drawing (bin masks, the per-draw events), and queues the rest with
+// the register writes, in order, for the "GPU Draws" thread (the executor),
+// which runs them exactly as the single-threaded command processor would. Like
+// the hardware's prefetch parser, the parser reports read pointer progress for
+// the packets it has taken: they are copied into the queue.
+struct CommandProcessor::Amped3Split {
+  enum Op : uint32_t {
+    kOpRegisters = 1,  // start index, big-endian values (WriteRegistersFromMem)
+    kOpPacket,         // a whole big-endian packet (ExecutePacket)
+    kOpPrimaryEnd,     // OnPrimaryBufferEnd
+    kOpWrap,           // the rest of the buffer is unused, continue at its start
+    kOpDraw,           // VGT_DRAW_INITIATOR, VGT_DMA_BASE, VGT_DMA_SIZE (Amped3ExecuteDraw)
+    kOpShader,         // shader type, Shader* (low, high) loaded by the parser
+  };
+  static constexpr uint32_t kCapacity = uint32_t(1) << 22;  // dwords
+  std::unique_ptr<uint32_t[]> buffer{new uint32_t[kCapacity]};
+  // Positions in dwords since the start, the buffer offset modulo kCapacity.
+  alignas(64) std::atomic<uint64_t> write_pos{0};
+  std::atomic<bool> executor_sleeping{false};
+  alignas(64) std::atomic<uint64_t> read_pos{0};
+  std::atomic<bool> parser_waiting{false};
+  alignas(64) uint64_t local_write = 0;  // The parser's, published by Publish.
+  uint64_t cached_read = 0;              // The parser's last look at read_pos.
+  std::unique_ptr<rex::thread::Event> data_event{rex::thread::Event::CreateAutoResetEvent(false)};
+  std::unique_ptr<rex::thread::Event> space_event{rex::thread::Event::CreateAutoResetEvent(false)};
+  std::atomic<bool> running{true};
+  system::object_ref<system::XHostThread> thread;
+};
+
 CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
                                    system::KernelState* kernel_state)
     : memory_(graphics_system->memory()),
@@ -153,6 +188,18 @@ bool CommandProcessor::Initialize() {
       }));
   worker_thread_->set_name("GPU Commands");
   worker_thread_->Create();
+
+  if (REXCVAR_GET(gpu_cp_split)) {
+    amped3_split_ = std::make_unique<Amped3Split>();
+    amped3_split_->thread = system::object_ref<system::XHostThread>(
+        new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
+          Amped3SplitExecutorMain();
+          return 0;
+        }));
+    amped3_split_->thread->set_name("GPU Draws");
+    amped3_split_->thread->Create();
+    REXGPU_INFO("gpu_cp_split: command processor in two threads");
+  }
 
   return true;
 }
@@ -216,6 +263,9 @@ void CommandProcessor::WorkerThreadMain() {
   }
 
   while (worker_running_) {
+    if (!pending_fns_.empty() && amped3_split_) {
+      Amped3SplitDrain();
+    }
     while (!pending_fns_.empty()) {
       auto fn = std::move(pending_fns_.front());
       pending_fns_.pop();
@@ -264,6 +314,13 @@ void CommandProcessor::WorkerThreadMain() {
     // but no games seem to actually use it.
   }
 
+  if (amped3_split_) {
+    Amped3SplitDrain();
+    amped3_split_->running = false;
+    amped3_split_->data_event->Set();
+    amped3_split_->thread->Wait(0, 0, 0, nullptr);
+    amped3_split_->thread.reset();
+  }
   ShutdownContext();
 }
 
@@ -695,6 +752,13 @@ void CommandProcessor::ReturnFromWait() {}
 // amped3 debug (--d3d12_draw_timing): the command processor's busy time
 // (primary buffer execution), read by the D3D12 per-frame log.
 uint64_t g_amped3_cp_busy_tsc;
+// amped3 debug (d3d12_draw_timing): type-3 packets per opcode, and type-0
+// packets and their register count, for sizing a command processor split.
+bool g_amped3_count_packets;
+uint64_t g_amped3_opcode_counts[128];
+uint64_t g_amped3_type0_packets, g_amped3_type0_registers;
+// gpu_cp_split: the executor's busy time (g_amped3_cp_busy_tsc is the parser's).
+uint64_t g_amped3_cp_exec_busy_tsc;
 
 uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t write_index) {
   SCOPE_profile_cpu_f("gpu");
@@ -707,6 +771,22 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
   memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
   reader.set_read_offset(read_index * sizeof(uint32_t));
   reader.set_write_offset(write_index * sizeof(uint32_t));
+  if (amped3_split_) {
+    do {
+      if (!Amped3SplitParsePacket(&reader)) {
+        REXGPU_ERROR("**** PRIMARY RINGBUFFER: Failed to execute packet.");
+        assert_always();
+        break;
+      }
+      if (read_ptr_writeback_ptr_ && REXCVAR_GET(gpu_read_pointer_progress)) {
+        memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
+                                         uint32_t(reader.read_offset() / sizeof(uint32_t)));
+      }
+    } while (reader.read_count());
+    Amped3SplitReserve(Amped3Split::kOpPrimaryEnd, 0);
+    Amped3SplitPublish();
+    return write_index;
+  }
   do {
     if (!ExecutePacket(&reader)) {
       // This probably should be fatal - but we're going to continue anyways.
@@ -784,6 +864,398 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
   }
 }
 
+uint32_t* CommandProcessor::Amped3SplitReserve(uint32_t op, uint32_t payload_dwords) {
+  Amped3Split& split = *amped3_split_;
+  const uint32_t total = 1 + payload_dwords;
+  assert_true(total <= Amped3Split::kCapacity / 2);
+  const uint32_t offset = uint32_t(split.local_write % Amped3Split::kCapacity);
+  const bool wrap = offset + total > Amped3Split::kCapacity;
+  const uint64_t start = wrap ? split.local_write + (Amped3Split::kCapacity - offset)
+                              : split.local_write;
+  if (start + total - split.cached_read > Amped3Split::kCapacity) {
+    // Full: let the executor see everything so far, and wait for space.
+    Amped3SplitPublish();
+    for (uint32_t spins = 0;; ++spins) {
+      split.cached_read = split.read_pos.load(std::memory_order_acquire);
+      if (start + total - split.cached_read <= Amped3Split::kCapacity) {
+        break;
+      }
+      if (spins < 1000) {
+        _mm_pause();
+        continue;
+      }
+      split.parser_waiting.store(true);
+      split.cached_read = split.read_pos.load();
+      if (start + total - split.cached_read > Amped3Split::kCapacity) {
+        rex::thread::Wait(split.space_event.get(), false, std::chrono::milliseconds(1));
+      }
+      split.parser_waiting.store(false);
+    }
+  }
+  if (wrap) {
+    split.buffer[offset] = uint32_t(Amped3Split::kOpWrap) << 24;
+  }
+  uint32_t* header = &split.buffer[start % Amped3Split::kCapacity];
+  header[0] = (op << 24) | payload_dwords;
+  split.local_write = start + total;
+  return header + 1;
+}
+
+void CommandProcessor::Amped3SplitPublish() {
+  Amped3Split& split = *amped3_split_;
+  split.write_pos.store(split.local_write);
+  if (split.executor_sleeping.load()) {
+    split.data_event->Set();
+  }
+}
+
+void CommandProcessor::Amped3SplitDrain() {
+  Amped3Split& split = *amped3_split_;
+  Amped3SplitPublish();
+  for (uint32_t spins = 0;; ++spins) {
+    split.cached_read = split.read_pos.load(std::memory_order_acquire);
+    if (split.cached_read == split.local_write) {
+      return;
+    }
+    if (spins < 1000) {
+      _mm_pause();
+      continue;
+    }
+    split.parser_waiting.store(true);
+    if (split.read_pos.load() != split.local_write) {
+      rex::thread::Wait(split.space_event.get(), false, std::chrono::milliseconds(1));
+    }
+    split.parser_waiting.store(false);
+  }
+}
+
+void CommandProcessor::Amped3SplitQueueRegisters(uint32_t start_index, memory::RingBuffer* reader,
+                                                 uint32_t count) {
+  uint32_t* payload = Amped3SplitReserve(Amped3Split::kOpRegisters, 1 + count);
+  payload[0] = start_index;
+  memory::RingBuffer::ReadRange range = reader->BeginRead(size_t(count) * sizeof(uint32_t));
+  std::memcpy(payload + 1, range.first, range.first_length);
+  if (range.second_length) {
+    std::memcpy(reinterpret_cast<uint8_t*>(payload + 1) + range.first_length, range.second,
+                range.second_length);
+  }
+  reader->EndRead(range);
+}
+
+void CommandProcessor::Amped3SplitForward(uint32_t packet, memory::RingBuffer* reader,
+                                          uint32_t count) {
+  uint32_t* payload = Amped3SplitReserve(Amped3Split::kOpPacket, 1 + count);
+  payload[0] = rex::byte_swap(packet);
+  memory::RingBuffer::ReadRange range = reader->BeginRead(size_t(count) * sizeof(uint32_t));
+  std::memcpy(payload + 1, range.first, range.first_length);
+  if (range.second_length) {
+    std::memcpy(reinterpret_cast<uint8_t*>(payload + 1) + range.first_length, range.second,
+                range.second_length);
+  }
+  reader->EndRead(range);
+  Amped3SplitPublish();
+}
+
+void CommandProcessor::Amped3SplitParseIndirectBuffer(uint32_t ptr, uint32_t count) {
+  memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
+  reader.set_write_offset(count * sizeof(uint32_t));
+  do {
+    if (!Amped3SplitParsePacket(&reader)) {
+      REXGPU_ERROR("**** INDIRECT RINGBUFFER: Failed to execute packet.");
+      assert_always();
+      break;
+    }
+  } while (reader.read_count());
+}
+
+// The parser's part of ExecutePacket: what it doesn't handle itself goes to the
+// executor (in order with the register writes), with the same validation as
+// ExecutePacketType0/3 before it's queued.
+bool CommandProcessor::Amped3SplitParsePacket(memory::RingBuffer* reader) {
+  const uint32_t packet = reader->ReadAndSwap<uint32_t>();
+  if (packet == 0) {
+    return true;
+  }
+  if (packet == 0xCDCDCDCD) {
+    REXGPU_WARN("GPU packet is CDCDCDCD - probably read uninitialized memory!");
+  }
+  switch (packet >> 30) {
+    case 0x00: {
+      uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
+      if (reader->read_count() < count * sizeof(uint32_t)) {
+        REXGPU_ERROR("ExecutePacketType0 overflow (read count {:08X}, packet count {:08X})",
+                     reader->read_count(), count * sizeof(uint32_t));
+        return false;
+      }
+      if (!((packet >> 15) & 0x1)) {
+        Amped3SplitQueueRegisters(packet & 0x7FFF, reader, count);
+      } else {
+        Amped3SplitForward(packet, reader, count);
+      }
+      return true;
+    }
+    case 0x01:
+      Amped3SplitForward(packet, reader, 2);
+      return true;
+    case 0x02:
+      return true;
+    case 0x03:
+      break;
+  }
+
+  uint32_t opcode = (packet >> 8) & 0x7F;
+  uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
+  if (reader->read_count() < count * sizeof(uint32_t)) {
+    REXGPU_ERROR("ExecutePacketType3 overflow (read count {:08X}, packet count {:08X})",
+                 reader->read_count(), count * sizeof(uint32_t));
+    return false;
+  }
+  // The predicate (bin) check here, with the bin registers the parser keeps.
+  if (packet & 1) {
+    bool any_pass = (bin_select_ & bin_mask_) != 0;
+    if (!any_pass || opcode == PM4_XE_SWAP) {
+      reader->AdvanceRead(count * sizeof(uint32_t));
+      return true;
+    }
+  }
+  switch (opcode) {
+    case PM4_INDIRECT_BUFFER:
+    case PM4_INDIRECT_BUFFER_PFD: {
+      uint32_t list_ptr = CpuToGpu(reader->ReadAndSwap<uint32_t>());
+      uint32_t list_length = reader->ReadAndSwap<uint32_t>() & 0xFFFFF;
+      reader->AdvanceRead((count - 2) * sizeof(uint32_t));
+      Amped3SplitParseIndirectBuffer(GpuToCpu(list_ptr), list_length);
+      return true;
+    }
+    case PM4_NOP:
+    case PM4_INVALIDATE_STATE:
+      // (INVALIDATE_STATE does nothing in ExecutePacketType3_INVALIDATE_STATE.)
+      reader->AdvanceRead(count * sizeof(uint32_t));
+      return true;
+    case PM4_DRAW_INDX:
+    case PM4_DRAW_INDX_2: {
+      uint32_t count_remaining = count;
+      const char* opcode_name = opcode == PM4_DRAW_INDX ? "PM4_DRAW_INDX" : "PM4_DRAW_INDX_2";
+      if (opcode == PM4_DRAW_INDX) {
+        // The viz query token (unused, as in ExecutePacketType3Draw).
+        reader->ReadAndSwap<uint32_t>();
+        --count_remaining;
+      }
+      uint32_t words[3];
+      if (Amped3ReadDraw(reader, opcode_name, count_remaining, words)) {
+        uint32_t* payload = Amped3SplitReserve(Amped3Split::kOpDraw, 3);
+        std::memcpy(payload, words, sizeof(words));
+        Amped3SplitPublish();
+      }
+      return true;
+    }
+    case PM4_IM_LOAD:
+    case PM4_IM_LOAD_IMMEDIATE: {
+      // The shader lookup (hashing its microcode) here: only this thread
+      // loads shaders while the command processor runs.
+      uint32_t dword0 = reader->ReadAndSwap<uint32_t>();
+      uint32_t start_size = reader->ReadAndSwap<uint32_t>();
+      uint32_t size_dwords = start_size & 0xFFFF;
+      assert_true((start_size >> 16) == 0);
+      Shader* shader;
+      xenos::ShaderType shader_type;
+      if (opcode == PM4_IM_LOAD) {
+        shader_type = static_cast<xenos::ShaderType>(dword0 & 0x3);
+        uint32_t addr = dword0 & ~uint32_t(0x3);
+        shader = LoadShader(shader_type, addr, memory_->TranslatePhysical<uint32_t*>(addr),
+                            size_dwords);
+        reader->AdvanceRead((count - 2) * sizeof(uint32_t));
+      } else {
+        shader_type = static_cast<xenos::ShaderType>(dword0);
+        assert_true(count - 2 >= size_dwords);
+        shader = LoadShader(shader_type, uint32_t(reader->read_ptr()),
+                            reinterpret_cast<uint32_t*>(reader->read_ptr()), size_dwords);
+        reader->AdvanceRead((count - 2) * sizeof(uint32_t));
+      }
+      uint32_t* payload = Amped3SplitReserve(Amped3Split::kOpShader, 3);
+      payload[0] = uint32_t(shader_type);
+      payload[1] = uint32_t(reinterpret_cast<uintptr_t>(shader));
+      payload[2] = uint32_t(uint64_t(reinterpret_cast<uintptr_t>(shader)) >> 32);
+      return true;
+    }
+    case PM4_SET_CONSTANT: {
+      uint32_t offset_type = reader->ReadAndSwap<uint32_t>();
+      uint32_t index = offset_type & 0x7FF;
+      static const uint32_t kConstantBases[] = {0x4000, 0x4800, 0x4900, 0x4908, 0x2000};
+      uint32_t type = (offset_type >> 16) & 0xFF;
+      if (type >= rex::countof(kConstantBases)) {
+        reader->AdvanceRead((count - 1) * sizeof(uint32_t));
+        return true;
+      }
+      Amped3SplitQueueRegisters(index + kConstantBases[type], reader, count - 1);
+      return true;
+    }
+    case PM4_SET_CONSTANT2:
+    case PM4_SET_SHADER_CONSTANTS: {
+      uint32_t offset_type = reader->ReadAndSwap<uint32_t>();
+      Amped3SplitQueueRegisters(offset_type & 0xFFFF, reader, count - 1);
+      return true;
+    }
+    case PM4_EVENT_WRITE:
+      if (count == 1) {
+        uint32_t* payload = Amped3SplitReserve(Amped3Split::kOpRegisters, 2);
+        payload[0] = XE_GPU_REG_VGT_EVENT_INITIATOR;
+        payload[1] = rex::byte_swap(reader->ReadAndSwap<uint32_t>() & 0x3F);
+        return true;
+      }
+      break;
+    case PM4_EVENT_WRITE_EXT:
+      if (count == 2) {
+        // Fake screen extents (as ExecutePacketType3_EVENT_WRITE_EXT): not
+        // dependent on drawing.
+        uint32_t initiator = reader->ReadAndSwap<uint32_t>();
+        uint32_t address = reader->ReadAndSwap<uint32_t>() & ~uint32_t(0x3);
+        uint32_t* payload = Amped3SplitReserve(Amped3Split::kOpRegisters, 2);
+        payload[0] = XE_GPU_REG_VGT_EVENT_INITIATOR;
+        payload[1] = rex::byte_swap(initiator & 0x3F);
+        uint16_t extents[] = {
+            0 >> 3, xenos::kTexture2DCubeMaxWidthHeight >> 3,
+            0 >> 3, xenos::kTexture2DCubeMaxWidthHeight >> 3,
+            0,      1,
+        };
+        memory::copy_and_swap_16_unaligned(memory_->TranslatePhysical(address), extents,
+                                           rex::countof(extents));
+        return true;
+      }
+      break;
+    case PM4_SET_BIN_MASK_LO:
+    case PM4_SET_BIN_MASK_HI:
+    case PM4_SET_BIN_SELECT_LO:
+    case PM4_SET_BIN_SELECT_HI:
+    case PM4_SET_BIN_MASK:
+    case PM4_SET_BIN_SELECT: {
+      // The parser's own state (the predicate check above); reuse the
+      // single-threaded handling on a copy of the packet.
+      uint32_t words[3] = {};
+      for (uint32_t i = 0; i < count && i < 2; ++i) {
+        words[i] = reader->ReadAndSwap<uint32_t>();
+      }
+      if (count > 2) {
+        reader->AdvanceRead((count - 2) * sizeof(uint32_t));
+      }
+      switch (opcode) {
+        case PM4_SET_BIN_MASK_LO:
+          bin_mask_ = (bin_mask_ & 0xFFFFFFFF00000000ull) | words[0];
+          break;
+        case PM4_SET_BIN_MASK_HI:
+          bin_mask_ = (bin_mask_ & 0xFFFFFFFFull) | (uint64_t(words[0]) << 32);
+          break;
+        case PM4_SET_BIN_SELECT_LO:
+          bin_select_ = (bin_select_ & 0xFFFFFFFF00000000ull) | words[0];
+          break;
+        case PM4_SET_BIN_SELECT_HI:
+          bin_select_ = (bin_select_ & 0xFFFFFFFFull) | (uint64_t(words[0]) << 32);
+          break;
+        case PM4_SET_BIN_MASK:
+          bin_mask_ = (uint64_t(words[0]) << 32) | words[1];
+          break;
+        case PM4_SET_BIN_SELECT:
+          bin_select_ = (uint64_t(words[0]) << 32) | words[1];
+          break;
+      }
+      return true;
+    }
+    default:
+      break;
+  }
+  // Everything else runs on the executor, in order. Without the predicate bit:
+  // it has been checked here.
+  Amped3SplitForward(packet & ~uint32_t(1), reader, count);
+  return true;
+}
+
+void CommandProcessor::Amped3SplitExecutorMain() {
+  Amped3Split& split = *amped3_split_;
+  uint64_t read = 0, write = 0, signaled_read = 0;
+  uint64_t busy_start = __rdtsc();
+  while (true) {
+    if (read == write) {
+      write = split.write_pos.load(std::memory_order_acquire);
+      if (read == write) {
+        split.read_pos.store(read, std::memory_order_release);
+        if (split.parser_waiting.load()) {
+          split.space_event->Set();
+        }
+        g_amped3_cp_exec_busy_tsc += __rdtsc() - busy_start;
+        for (uint32_t spins = 0; read == write; ++spins) {
+          if (!split.running.load(std::memory_order_relaxed)) {
+            return;
+          }
+          if (spins < 2000) {
+            _mm_pause();
+          } else {
+            split.executor_sleeping.store(true);
+            if (split.write_pos.load() == read) {
+              rex::thread::Wait(split.data_event.get(), false, std::chrono::milliseconds(5));
+            }
+            split.executor_sleeping.store(false);
+          }
+          write = split.write_pos.load(std::memory_order_acquire);
+        }
+        busy_start = __rdtsc();
+      }
+    }
+    uint32_t* header = &split.buffer[read % Amped3Split::kCapacity];
+    uint32_t op = header[0] >> 24;
+    uint32_t payload_dwords = header[0] & 0xFFFFFF;
+    switch (op) {
+      case Amped3Split::kOpRegisters:
+        WriteRegistersFromMem(header[1], header + 2, payload_dwords - 1);
+        break;
+      case Amped3Split::kOpPacket: {
+        memory::RingBuffer reader(reinterpret_cast<uint8_t*>(header + 1),
+                                  payload_dwords * sizeof(uint32_t));
+        reader.set_write_offset(payload_dwords * sizeof(uint32_t));
+        if (!ExecutePacket(&reader)) {
+          REXGPU_ERROR("gpu_cp_split: failed to execute a packet");
+        }
+      } break;
+      case Amped3Split::kOpPrimaryEnd:
+        OnPrimaryBufferEnd();
+        break;
+      case Amped3Split::kOpDraw:
+        Amped3ExecuteDraw(header + 1, "PM4_DRAW_INDX");
+        break;
+      case Amped3Split::kOpShader: {
+        auto shader =
+            reinterpret_cast<Shader*>(uintptr_t(header[2]) | (uintptr_t(header[3]) << 32));
+        switch (static_cast<xenos::ShaderType>(header[1])) {
+          case xenos::ShaderType::kVertex:
+            active_vertex_shader_ = shader;
+            break;
+          case xenos::ShaderType::kPixel:
+            active_pixel_shader_ = shader;
+            break;
+          default:
+            assert_always();
+            break;
+        }
+      } break;
+      case Amped3Split::kOpWrap:
+        read += Amped3Split::kCapacity - read % Amped3Split::kCapacity;
+        continue;
+      default:
+        assert_always();
+        break;
+    }
+    read += 1 + payload_dwords;
+    split.read_pos.store(read, std::memory_order_release);
+    // A parser waiting for space is woken after an eighth of the buffer (one
+    // waiting for everything to be done, by the empty queue above): setting
+    // the event is a system call.
+    if (read - signaled_read >= Amped3Split::kCapacity / 8 &&
+        split.parser_waiting.load(std::memory_order_relaxed)) {
+      signaled_read = read;
+      split.space_event->Set();
+    }
+  }
+}
+
 bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t packet) {
   // Type-0 packet.
   // Write count registers in sequence to the registers starting at
@@ -798,6 +1270,10 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
 
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
+  if (g_amped3_count_packets) {
+    ++g_amped3_type0_packets;
+    g_amped3_type0_registers += count;
+  }
   if (!write_one_reg) {
     // amped3 cp perf: consecutive registers through the range path, which
     // copies whole constant ranges at once (as in Xenia Canary).
@@ -834,6 +1310,9 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
   uint32_t opcode = (packet >> 8) & 0x7F;
   uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
   auto data_start_offset = reader->read_offset();
+  if (g_amped3_count_packets) {
+    ++g_amped3_opcode_counts[opcode];
+  }
 
   if (reader->read_count() < count * sizeof(uint32_t)) {
     REXGPU_ERROR("ExecutePacketType3 overflow (read count {:08X}, packet count {:08X})",
@@ -1412,7 +1891,18 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
   // uint32_t viz_id = viz_query_condition & 0x3F;
   // when true, render conditionally based on query result
   // uint32_t viz_use = viz_query_condition & 0x100;
+  uint32_t words[3];
+  if (!Amped3ReadDraw(reader, opcode_name, count_remaining, words)) {
+    return false;
+  }
+  return Amped3ExecuteDraw(words, opcode_name);
+}
 
+// amped3: the reading part of ExecutePacketType3Draw (also gpu_cp_split's
+// parser): VGT_DRAW_INITIATOR and, for indexed draws, VGT_DMA_BASE and
+// VGT_DMA_SIZE, then skips the rest of the packet.
+bool CommandProcessor::Amped3ReadDraw(memory::RingBuffer* reader, const char* opcode_name,
+                                      uint32_t count_remaining, uint32_t words[3]) {
   assert_not_zero(count_remaining);
   if (!count_remaining) {
     REXGPU_ERROR("{}: Packet too small, can't read VGT_DRAW_INITIATOR", opcode_name);
@@ -1421,6 +1911,36 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
   reg::VGT_DRAW_INITIATOR vgt_draw_initiator;
   vgt_draw_initiator.value = reader->ReadAndSwap<uint32_t>();
   --count_remaining;
+  words[0] = vgt_draw_initiator.value;
+  words[1] = words[2] = 0;
+  if (vgt_draw_initiator.source_select == xenos::SourceSelect::kDMA) {
+    // Two separate bounds checks so if there's only one missing register
+    // value out of two, one uint32_t will be skipped in the command buffer,
+    // not two.
+    assert_not_zero(count_remaining);
+    if (!count_remaining) {
+      REXGPU_ERROR("{}: Packet too small, can't read VGT_DMA_BASE", opcode_name);
+      return false;
+    }
+    words[1] = reader->ReadAndSwap<uint32_t>();
+    --count_remaining;
+    assert_not_zero(count_remaining);
+    if (!count_remaining) {
+      REXGPU_ERROR("{}: Packet too small, can't read VGT_DMA_SIZE", opcode_name);
+      return false;
+    }
+    words[2] = reader->ReadAndSwap<uint32_t>();
+    --count_remaining;
+  }
+  // Skip to the next command, for example, if there are immediate indexes that
+  // we don't support yet.
+  reader->AdvanceRead(count_remaining * sizeof(uint32_t));
+  return true;
+}
+
+bool CommandProcessor::Amped3ExecuteDraw(const uint32_t words[3], const char* opcode_name) {
+  reg::VGT_DRAW_INITIATOR vgt_draw_initiator;
+  vgt_draw_initiator.value = words[0];
   WriteRegister(XE_GPU_REG_VGT_DRAW_INITIATOR, vgt_draw_initiator.value);
 
   bool draw_succeeded = true;
@@ -1432,26 +1952,10 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
     case xenos::SourceSelect::kDMA: {
       // Indexed draw.
       is_indexed = true;
-
-      // Two separate bounds checks so if there's only one missing register
-      // value out of two, one uint32_t will be skipped in the command buffer,
-      // not two.
-      assert_not_zero(count_remaining);
-      if (!count_remaining) {
-        REXGPU_ERROR("{}: Packet too small, can't read VGT_DMA_BASE", opcode_name);
-        return false;
-      }
-      uint32_t vgt_dma_base = reader->ReadAndSwap<uint32_t>();
-      --count_remaining;
+      uint32_t vgt_dma_base = words[1];
       WriteRegister(XE_GPU_REG_VGT_DMA_BASE, vgt_dma_base);
       reg::VGT_DMA_SIZE vgt_dma_size;
-      assert_not_zero(count_remaining);
-      if (!count_remaining) {
-        REXGPU_ERROR("{}: Packet too small, can't read VGT_DMA_SIZE", opcode_name);
-        return false;
-      }
-      vgt_dma_size.value = reader->ReadAndSwap<uint32_t>();
-      --count_remaining;
+      vgt_dma_size.value = words[2];
       WriteRegister(XE_GPU_REG_VGT_DMA_SIZE, vgt_dma_size.value);
 
       uint32_t index_size_bytes = vgt_draw_initiator.index_size == xenos::IndexFormat::kInt16
@@ -1485,10 +1989,6 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
       assert_unhandled_case(vgt_draw_initiator.source_select);
     } break;
   }
-
-  // Skip to the next command, for example, if there are immediate indexes that
-  // we don't support yet.
-  reader->AdvanceRead(count_remaining * sizeof(uint32_t));
 
   if (draw_succeeded) {
     auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();

@@ -277,6 +277,23 @@ class CommandProcessor {
   // name (for explicit-override compatibility).
   const char* legacy_readback_memexport_cvar_name_ = nullptr;
 
+  // amped3 cp perf (gpu_cp_split): the command processor in two threads, see
+  // command_processor.cpp.
+  struct Amped3Split;
+  std::unique_ptr<Amped3Split> amped3_split_;
+  bool Amped3SplitParsePacket(memory::RingBuffer* reader);
+  void Amped3SplitParseIndirectBuffer(uint32_t ptr, uint32_t count);
+  uint32_t* Amped3SplitReserve(uint32_t op, uint32_t payload_dwords);
+  void Amped3SplitQueueRegisters(uint32_t start_index, memory::RingBuffer* reader,
+                                 uint32_t count);
+  void Amped3SplitForward(uint32_t packet, memory::RingBuffer* reader, uint32_t count);
+  void Amped3SplitPublish();
+  void Amped3SplitDrain();
+  void Amped3SplitExecutorMain();
+  bool Amped3ReadDraw(memory::RingBuffer* reader, const char* opcode_name,
+                      uint32_t count_remaining, uint32_t words[3]);
+  bool Amped3ExecuteDraw(const uint32_t words[3], const char* opcode_name);
+
  private:
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};
   reg::DC_LUT_PWL_DATA gamma_ramp_pwl_rgb_[128][3] = {};

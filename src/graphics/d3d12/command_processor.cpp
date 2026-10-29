@@ -50,6 +50,10 @@ REXCVAR_DEFINE_BOOL(d3d12_readback_memexport, false, "GPU/D3D12",
 
 REXCVAR_DEFINE_BOOL(d3d12_draw_timing, false, "GPU/D3D12",
                     "Debug: log the command processor's time per IssueDraw section (ms per frame)");
+REXCVAR_DEFINE_BOOL(d3d12_draw_timing_sections, true, "GPU/D3D12",
+                    "Debug: with d3d12_draw_timing, also time each IssueDraw section (the "
+                    "timer reads cost about 1 ms per frame); false logs only the command "
+                    "processor's busy time per frame and per draw");
 REXCVAR_DEFINE_BOOL(d3d12_readback_resolve, false, "GPU/D3D12",
                     "Read render-to-texture results on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -2029,9 +2033,14 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           double(g_amped3_upload_calls) / swaps, double(g_amped3_upload_pages) / swaps,
           double(g_amped3_upload_valid_tsc) / tsc_per_ms / swaps,
           double(g_amped3_upload_copy_tsc) / tsc_per_ms / swaps);
-      REXGPU_INFO("d3d12_draw_timing: command processor busy {:.2f} ms/frame, IssueCopy {:.2f} ms",
-                  double(rex::graphics::g_amped3_cp_busy_tsc) / tsc_per_ms / swaps,
-                  double(g_amped3_copy_tsc) / tsc_per_ms / swaps);
+      REXGPU_INFO(
+          "d3d12_draw_timing: command processor busy {:.2f} ms/frame ({:.0f} ns/draw), "
+          "IssueCopy {:.2f} ms",
+          double(rex::graphics::g_amped3_cp_busy_tsc) / tsc_per_ms / swaps,
+          g_draw_timing_draws ? double(rex::graphics::g_amped3_cp_busy_tsc) / tsc_per_ms * 1e6 /
+                                    double(g_draw_timing_draws)
+                              : 0.0,
+          double(g_amped3_copy_tsc) / tsc_per_ms / swaps);
       rex::graphics::g_amped3_cp_busy_tsc = 0;
       g_amped3_copy_tsc = 0;
       REXGPU_INFO("d3d12_draw_timing: make valid: lock + bitmaps {:.2f} ms, protect {:.2f} ms",
@@ -2580,11 +2589,11 @@ uint32_t D3D12CommandProcessor::ComputeLodFreeFetchMask(const D3D12Shader& pixel
 bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
                                       IndexBufferInfo* index_buffer_info,
                                       bool major_mode_explicit) {
-  g_draw_timing_on = REXCVAR_GET(d3d12_draw_timing);
+  g_draw_timing_on = REXCVAR_GET(d3d12_draw_timing) && REXCVAR_GET(d3d12_draw_timing_sections);
   if (g_draw_timing_on) {
     g_draw_timing_last = __rdtsc();
-    ++g_draw_timing_draws;
   }
+  g_draw_timing_draws += REXCVAR_GET(d3d12_draw_timing);
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -2780,7 +2789,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       std::pair<uint32_t, uint32_t> everything(0, SharedMemory::kBufferSize);
       texture_cache_->WriteOutDirectResolves(&everything, 1);
     } else {
-      std::pair<uint32_t, uint32_t> vertex_ranges[96];
+      // Not value-initialized (std::pair would zero all 96 on every draw):
+      // only the first vertex_range_count are written and read.
+      union VertexRangeStorage {
+        VertexRangeStorage() {}
+        std::pair<uint32_t, uint32_t> ranges[96];
+      } vertex_range_storage;
+      auto& vertex_ranges = vertex_range_storage.ranges;
       size_t vertex_range_count = 0;
       const Shader::ConstantRegisterMap& vertex_constant_map =
           vertex_shader->constant_register_map();
@@ -3983,8 +3998,13 @@ bool D3D12CommandProcessor::UploadFloatConstants(uint32_t stage, const uint64_t*
   const size_t size = sizeof(float) * 4 * std::max(float_count, uint32_t(1));
   // Gathered into cached memory first: compared with the last upload, and
   // copied to the (write-combined) upload buffer in one go.
+  // Both buffers stay at the maximum size (no zero-filling as the size
+  // changes), and the staging one becomes the last upload by a swap.
+  constexpr size_t kFloatConstantsMaxSize = sizeof(float) * 4 * 256;
   std::vector<uint8_t>& staging = float_constants_staging_;
-  staging.resize(size);
+  if (staging.size() != kFloatConstantsMaxSize) {
+    staging.resize(kFloatConstantsMaxSize);
+  }
   uint8_t* gathered = staging.data();
   if (!float_count) {
     std::memset(gathered, 0, size);
@@ -4003,7 +4023,7 @@ bool D3D12CommandProcessor::UploadFloatConstants(uint32_t stage, const uint64_t*
   }
   FloatConstantUpload& last = float_constants_last_[stage];
   if (REXCVAR_GET(d3d12_reuse_float_constants) && last.frame == frame_current_ &&
-      last.data.size() == size && !std::memcmp(last.data.data(), staging.data(), size)) {
+      last.size == size && !std::memcmp(last.data.data(), staging.data(), size)) {
     address_out = last.address;
     ++float_constant_reuses_;
     return true;
@@ -4017,7 +4037,8 @@ bool D3D12CommandProcessor::UploadFloatConstants(uint32_t stage, const uint64_t*
   std::memcpy(float_constants, staging.data(), size);
   ++float_constant_uploads_;
   float_constant_upload_bytes_ += size;
-  last.data.assign(staging.begin(), staging.end());
+  last.data.swap(staging);
+  last.size = size;
   last.frame = frame_current_;
   last.address = address_out;
   return true;

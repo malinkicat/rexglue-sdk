@@ -212,7 +212,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   // when the same bytes are needed again in the same frame
   // (d3d12_reuse_float_constants).
   struct FloatConstantUpload {
+    // Always kFloatConstantsMaxSize bytes (swapped with the staging buffer),
+    // size of them used.
     std::vector<uint8_t> data;
+    size_t size = 0;
     uint64_t frame = UINT64_MAX;
     D3D12_GPU_VIRTUAL_ADDRESS address = 0;
   };

@@ -905,6 +905,21 @@ DxbcShaderTranslator::Modification PipelineCache::GetCurrentPixelShaderModificat
 // amped3 cp perf: the registers GetCurrentStateDescription reads, directly or
 // through draw_util (IsPrimitivePolygonal, IsRasterizationPotentiallyDone,
 // GetPreferredFacePolygonOffset). Keep in sync with that function.
+// Equality of two short keys compared on every draw, inline (vectorized)
+// rather than a memcmp library call.
+template <typename T>
+inline bool Amped3KeysEqual(const T& a, const T& b) {
+  static_assert(sizeof(T) % sizeof(uint32_t) == 0 && std::is_trivially_copyable_v<T>);
+  uint32_t x[sizeof(T) / sizeof(uint32_t)], y[sizeof(T) / sizeof(uint32_t)];
+  std::memcpy(x, &a, sizeof(T));
+  std::memcpy(y, &b, sizeof(T));
+  uint32_t difference = 0;
+  for (size_t i = 0; i < sizeof(T) / sizeof(uint32_t); ++i) {
+    difference |= x[i] ^ y[i];
+  }
+  return !difference;
+}
+
 static const uint32_t kConfigureMemoRegisters[] = {
     uint32_t(XE_GPU_REG_PA_SU_SC_MODE_CNTL),
     uint32_t(XE_GPU_REG_VGT_OUTPUT_PATH_CNTL),
@@ -970,7 +985,7 @@ bool PipelineCache::ConfigurePipeline(
                   current_pipeline_ == configure_memo_pipeline_ &&
                   !(vertex_shader->is_translated() && !vertex_shader->is_valid()) &&
                   !(pixel_shader && pixel_shader->is_translated() && !pixel_shader->is_valid()) &&
-                  !std::memcmp(&key, &configure_memo_key_, sizeof(key));
+                  Amped3KeysEqual(key, configure_memo_key_);
   const bool verify = REXCVAR_GET(d3d12_pipeline_memo_verify);
   if (memo_hit && !verify) {
     *pipeline_handle_out = configure_memo_pipeline_;

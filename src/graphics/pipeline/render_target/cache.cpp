@@ -408,6 +408,21 @@ void RenderTargetCache::BeginFrame() {
   ResetAccumulatedRenderTargets();
 }
 
+// Equality of two short keys compared on every draw, inline (vectorized)
+// rather than a memcmp library call.
+template <typename T>
+inline bool Amped3KeysEqualRt(const T& a, const T& b) {
+  static_assert(sizeof(T) % sizeof(uint32_t) == 0 && std::is_trivially_copyable_v<T>);
+  uint32_t x[sizeof(T) / sizeof(uint32_t)], y[sizeof(T) / sizeof(uint32_t)];
+  std::memcpy(x, &a, sizeof(T));
+  std::memcpy(y, &b, sizeof(T));
+  uint32_t difference = 0;
+  for (size_t i = 0; i < sizeof(T) / sizeof(uint32_t); ++i) {
+    difference |= x[i] ^ y[i];
+  }
+  return !difference;
+}
+
 bool RenderTargetCache::Update(bool is_rasterization_done,
                                reg::RB_DEPTHCONTROL normalized_depth_control,
                                uint32_t normalized_color_mask, const Shader& vertex_shader) {
@@ -496,7 +511,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
     early_key[18] = uint32_t(GetPath());
     if (update_early_key_valid_ && update_memo_valid_ &&
         update_memo_generation_ == ownership_generation_ &&
-        !std::memcmp(early_key, update_early_key_, sizeof(early_key))) {
+        Amped3KeysEqualRt(early_key, update_early_key_)) {
       for (size_t i = 0; i < rex::countof(last_update_transfers_); ++i) {
         last_update_transfers_[i].clear();
       }

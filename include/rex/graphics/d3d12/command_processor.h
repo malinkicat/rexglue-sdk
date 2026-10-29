@@ -228,8 +228,13 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint32_t lod_free_cache_mask_ = 0;
   // gpu_profile: the part of the frame the next recorded commands belong to.
   void SetGpuProfilePass(rex::perf::GpuPass pass) {
-    deferred_command_list_.SetProfilePass(uint8_t(pass));
+    if (gpu_profile_per_pass_) {
+      deferred_command_list_.SetProfilePass(uint8_t(pass));
+    }
   }
+  // gpu_pass_profile_passes: a timestamp at every pass switch (several per
+  // draw - distorts the GPU time with many draws), or only per submission.
+  bool gpu_profile_per_pass_ = true;
   rex::perf::GpuPass GetGpuProfilePass() const {
     return rex::perf::GpuPass(deferred_command_list_.GetProfilePass());
   }

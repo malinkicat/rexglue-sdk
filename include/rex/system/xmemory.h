@@ -340,6 +340,11 @@ class PhysicalHeap : public BaseHeap {
     // Whether writing to each page should result trigger invalidation
     // callbacks.
     uint64_t notify_on_invalidation;
+    // Pages found read-only or inaccessible by EnableAccessCallbacks (nothing
+    // to watch there), valid while no page protection has changed since
+    // (unwatchable_generation).
+    uint64_t unwatchable;
+    uint64_t unwatchable_generation;
   };
   // Protected by global_critical_region. Flags for each 64 system pages,
   // interleaved as blocks, so bit scan can be used to quickly extract ranges.

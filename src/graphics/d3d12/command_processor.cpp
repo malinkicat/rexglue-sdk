@@ -56,6 +56,11 @@ REXCVAR_DEFINE_INT32(gpu_debug_log_draws, 0, "GPU/Debug",
 REXCVAR_DEFINE_BOOL(gpu_pass_profile, false, "GPU/Debug",
                     "Log the GPU time per frame of each kind of pass every 300 frames");
 
+REXCVAR_DEFINE_BOOL(gpu_pass_profile_passes, true, "GPU/Debug",
+                    "With gpu_pass_profile, time each kind of pass (a GPU timestamp at every "
+                    "pass switch, several per draw); otherwise only whole submissions (GPU busy "
+                    "time and gaps, without distorting it)");
+
 REXCVAR_DEFINE_BOOL(gpu_clear_draws_in_place, true, "GPU/D3D12",
                     "Do clears the game draws as constant rectangles (like the Xbox 360 Direct3D 9 "
                     "Clear through a 4x MSAA view) as render target clears where the data "
@@ -1970,14 +1975,22 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     static ULONG64 cycles_start = 0;
     ULONG64 cycles_now = 0;
     QueryThreadCycleTime(GetCurrentThread(), &cycles_now);
+    gpu_profile_per_pass_ = REXCVAR_GET(gpu_pass_profile_passes);
     if (!stats.enabled.exchange(true)) {
       frames = 0;
       cycles_start = cycles_now;
     } else if (++frames == 300) {
       const uint64_t draws = std::exchange(issued_draw_count_, 0);
-      REXGPU_INFO("gpu_pass_profile: command processor {:.2f} Mcycles/frame, {:.0f} cycles/draw",
+      const uint64_t submissions_timed = stats.submissions.exchange(0);
+      REXGPU_INFO("gpu_pass_profile: command processor {:.2f} Mcycles/frame, {:.0f} cycles/draw; "
+                  "GPU busy {:.2f} ms/frame ({} submissions timed), idle between submissions "
+                  "{:.2f} ms/frame, CPU waits for the GPU {:.2f} ms/frame ({})",
                   double(cycles_now - cycles_start) / 1e6 / frames,
-                  draws ? double(cycles_now - cycles_start) / double(draws) : 0.0);
+                  draws ? double(cycles_now - cycles_start) / double(draws) : 0.0,
+                  double(stats.submission_ns.exchange(0)) / 1e6 / frames, submissions_timed,
+                  double(stats.gap_ns.exchange(0)) / 1e6 / frames,
+                  double(stats.fence_wait_ns.exchange(0)) / 1e6 / frames,
+                  stats.fence_waits.exchange(0));
       cycles_start = cycles_now;
       std::string line;
       double total = 0.0;

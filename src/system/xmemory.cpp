@@ -10,6 +10,8 @@
  */
 
 #include <algorithm>
+#include <atomic>
+#include <bit>
 #include <cstring>
 #include <utility>
 
@@ -1284,6 +1286,10 @@ bool BaseHeap::AllocSystemHeap(uint32_t size, uint32_t alignment, uint32_t alloc
                     out_address);
 }
 
+// Bumped whenever page protection may change in any heap (invalidates
+// PhysicalHeap's cache of pages without anything to watch).
+static std::atomic<uint64_t> page_protect_generation_{1};
+
 bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignment,
                           uint32_t allocation_type, uint32_t protect) {
   alignment = rex::round_up(alignment, page_size_);
@@ -1371,6 +1377,7 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignme
     page_entry.current_protect = protect;
     page_entry.state = memory::kMemoryAllocationReserve | allocation_type;
   }
+  page_protect_generation_.fetch_add(1, std::memory_order_release);
 
   if (!SyncHostPageAccess(start_page_number, end_page_number)) {
     return false;
@@ -1531,6 +1538,7 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t 
     page_entry.current_protect = protect;
     page_entry.state = memory::kMemoryAllocationReserve | allocation_type;
   }
+  page_protect_generation_.fetch_add(1, std::memory_order_release);
 
   if (!SyncHostPageAccess(start_page_number, end_page_number)) {
     return false;
@@ -1636,6 +1644,7 @@ bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
     page_entry.qword = 0;
     unreserved_page_count_++;
   }
+  page_protect_generation_.fetch_add(1, std::memory_order_release);
 
   if (!SyncHostPageAccess(base_page_number, end_page_number)) {
     return false;
@@ -1724,6 +1733,7 @@ bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect, uint32
     auto& page_entry = page_table_[page_number];
     page_entry.current_protect = protect;
   }
+  page_protect_generation_.fetch_add(1, std::memory_order_release);
 
   if (!SyncHostPageAccess(start_page_number, end_page_number)) {
     return false;
@@ -2099,91 +2109,100 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
                                                ? rex::memory::PageAccess::kNoAccess
                                                : rex::memory::PageAccess::kReadOnly;
   uint8_t* protect_base = membase_ + heap_base_;
-  uint32_t protect_system_page_first = UINT32_MAX;
   auto global_lock = global_critical_region_.Acquire();
-  for (uint32_t i = system_page_first; i <= system_page_last; ++i) {
-    // Check if need to enable callbacks for the page and raise its protection.
-    //
-    // If enabling invalidation notifications:
-    // - Page writable and not watched for changes yet - protect and enable
-    //   invalidation notifications.
-    // - Page seen as writable by the guest, but only needs data providers -
-    //   just set the bits to enable invalidation notifications (already has
-    //   even stricter protection than needed).
-    // - Page not writable as requested by the game - don't do anything (need
-    //   real access violations here).
-    // If enabling data providers:
-    // - Page accessible (either read/write or read-only) and didn't need data
-    //   providers initially - protect and enable data providers.
-    // - Otherwise - do nothing.
-    //
-    // It's safe not to await data provider completion here before protecting as
-    // this never makes protection lighter, so it can't interfere with page
-    // faults that await data providers.
-    //
-    // Enabling data providers doesn't need to be deferred - providers will be
-    // polled for the last time without releasing the lock.
-    SystemPageFlagsBlock& page_flags_block = system_page_flags_[i >> 6];
-    uint64_t page_flags_bit = uint64_t(1) << (i & 63);
-    // Already watched (the common case - ranges are re-watched after every
-    // upload): nothing to do, for a whole block of 64 pages at once if possible.
-    if (enable_invalidation_notifications && !enable_data_providers &&
-        (page_flags_block.notify_on_invalidation & page_flags_bit)) {
-      if (protect_system_page_first != UINT32_MAX) {
-        rex::memory::Protect(protect_base + protect_system_page_first * system_page_size_,
-                             (i - protect_system_page_first) * system_page_size_, protect_access);
-        protect_system_page_first = UINT32_MAX;
-      }
-      if (!(i & 63) && page_flags_block.notify_on_invalidation == ~uint64_t(0)) {
-        i = std::min(i + 63, system_page_last);
-      }
-      continue;
+  const uint64_t protect_generation = page_protect_generation_.load(std::memory_order_acquire);
+  // Pages in [protect_run_first, protect_run_end) to protect with one call.
+  uint32_t protect_run_first = UINT32_MAX, protect_run_end = 0;
+  auto flush_protect_run = [&]() {
+    if (protect_run_first != UINT32_MAX) {
+      rex::memory::Protect(protect_base + protect_run_first * system_page_size_,
+                           (protect_run_end - protect_run_first) * system_page_size_,
+                           protect_access);
+      protect_run_first = UINT32_MAX;
     }
-    uint32_t guest_page_number =
-        rex::sat_sub(i * system_page_size_, host_address_offset()) >> page_size_shift_;
-    if (guest_page_number >= page_table_.size()) {
-      REXSYS_ERROR("Access callback page OOB: system_page={} guest_page={} offset=0x{:X}", i,
-                   guest_page_number, host_address_offset());
-      assert_always();
-      continue;
+  };
+  // Whole blocks of 64 pages at once: only the pages not watched yet and not
+  // known to have nothing to watch (read-only or inaccessible, cached while no
+  // page protection changes) are looked at (most of a range is usually
+  // watched already - ranges are re-watched after every upload and resolve).
+  for (uint32_t block_index = system_page_first >> 6; block_index <= system_page_last >> 6;
+       ++block_index) {
+    SystemPageFlagsBlock& page_flags_block = system_page_flags_[block_index];
+    if (page_flags_block.unwatchable_generation != protect_generation) {
+      page_flags_block.unwatchable = 0;
+      page_flags_block.unwatchable_generation = protect_generation;
     }
-    rex::memory::PageAccess current_page_access =
-        ToPageAccess(page_table_[guest_page_number].current_protect);
-    bool protect_system_page = false;
-    // Don't do anything with inaccessible pages - don't protect, don't enable
-    // callbacks - because real access violations are needed there. And don't
-    // enable invalidation notifications for read-only pages for the same
-    // reason.
-    if (current_page_access != rex::memory::PageAccess::kNoAccess) {
-      // TODO(Triang3l): Enable data providers.
-      if (enable_invalidation_notifications) {
-        if (current_page_access != rex::memory::PageAccess::kReadOnly &&
-            (page_flags_block.notify_on_invalidation & page_flags_bit) == 0) {
-          // TODO(Triang3l): Check if data providers are already enabled.
-          // If data providers are already enabled for the page, it has even
-          // stricter protection.
-          protect_system_page = true;
-          page_flags_block.notify_on_invalidation |= page_flags_bit;
+    uint64_t pages_remaining = ~uint64_t(0);
+    if (block_index == system_page_first >> 6) {
+      pages_remaining &= ~uint64_t(0) << (system_page_first & 63);
+    }
+    if (block_index == system_page_last >> 6) {
+      pages_remaining &= ~uint64_t(0) >> (63 - (system_page_last & 63));
+    }
+    if (enable_invalidation_notifications && !enable_data_providers) {
+      pages_remaining &= ~(page_flags_block.notify_on_invalidation | page_flags_block.unwatchable);
+    }
+    while (pages_remaining) {
+      const uint32_t page_in_block = uint32_t(std::countr_zero(pages_remaining));
+      pages_remaining &= pages_remaining - 1;
+      const uint32_t i = (block_index << 6) | page_in_block;
+      const uint64_t page_flags_bit = uint64_t(1) << page_in_block;
+      // Check if need to enable callbacks for the page and raise its
+      // protection.
+      //
+      // If enabling invalidation notifications:
+      // - Page writable and not watched for changes yet - protect and enable
+      //   invalidation notifications.
+      // - Page not writable as requested by the game - don't do anything (need
+      //   real access violations here).
+      //
+      // It's safe not to await data provider completion here before protecting
+      // as this never makes protection lighter, so it can't interfere with
+      // page faults that await data providers.
+      uint32_t guest_page_number =
+          rex::sat_sub(i * system_page_size_, host_address_offset()) >> page_size_shift_;
+      if (guest_page_number >= page_table_.size()) {
+        REXSYS_ERROR("Access callback page OOB: system_page={} guest_page={} offset=0x{:X}", i,
+                     guest_page_number, host_address_offset());
+        assert_always();
+        flush_protect_run();
+        continue;
+      }
+      rex::memory::PageAccess current_page_access =
+          ToPageAccess(page_table_[guest_page_number].current_protect);
+      bool protect_system_page = false;
+      if (current_page_access == rex::memory::PageAccess::kNoAccess ||
+          current_page_access == rex::memory::PageAccess::kReadOnly) {
+        page_flags_block.unwatchable |= page_flags_bit;
+      }
+      // Don't do anything with inaccessible pages - don't protect, don't
+      // enable callbacks - because real access violations are needed there.
+      // And don't enable invalidation notifications for read-only pages for
+      // the same reason.
+      if (current_page_access != rex::memory::PageAccess::kNoAccess) {
+        // TODO(Triang3l): Enable data providers.
+        if (enable_invalidation_notifications) {
+          if (current_page_access != rex::memory::PageAccess::kReadOnly &&
+              (page_flags_block.notify_on_invalidation & page_flags_bit) == 0) {
+            protect_system_page = true;
+            page_flags_block.notify_on_invalidation |= page_flags_bit;
+          }
         }
       }
-    }
-    if (protect_system_page) {
-      if (protect_system_page_first == UINT32_MAX) {
-        protect_system_page_first = i;
-      }
-    } else {
-      if (protect_system_page_first != UINT32_MAX) {
-        rex::memory::Protect(protect_base + protect_system_page_first * system_page_size_,
-                             (i - protect_system_page_first) * system_page_size_, protect_access);
-        protect_system_page_first = UINT32_MAX;
+      if (protect_system_page) {
+        if (protect_run_first != UINT32_MAX && protect_run_end != i) {
+          flush_protect_run();
+        }
+        if (protect_run_first == UINT32_MAX) {
+          protect_run_first = i;
+        }
+        protect_run_end = i + 1;
+      } else {
+        flush_protect_run();
       }
     }
   }
-  if (protect_system_page_first != UINT32_MAX) {
-    rex::memory::Protect(protect_base + protect_system_page_first * system_page_size_,
-                         (system_page_last + 1 - protect_system_page_first) * system_page_size_,
-                         protect_access);
-  }
+  flush_protect_run();
 }
 
 bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> global_lock_locked_once,

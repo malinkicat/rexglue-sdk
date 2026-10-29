@@ -362,6 +362,31 @@ const std::array<uint64_t, (RegisterFile::kRegisterCount + 63) / 64> kKnownRegis
   }
   return known;
 }();
+
+// amped3 cp perf (after Project8Recomp's gpu_cp_fastpath, BSD-3): registers
+// whose write has no effect beyond storing the value - known, and handled by
+// no branch of CommandProcessor::WriteRegister (scratch writeback, coherency,
+// gamma ramp) or D3D12CommandProcessor::WriteRegister (shader constants and
+// fetch constants). Runs of these are stored in bulk by WriteRegistersFromMem.
+// Over-excluding is always safe (the register takes the WriteRegister path).
+const std::array<uint64_t, (RegisterFile::kRegisterCount + 63) / 64> kPlainRegisters = [] {
+  auto plain = kKnownRegisters;
+  auto exclude = [&plain](uint32_t first, uint32_t last) {
+    for (uint32_t i = first; i <= last && i < RegisterFile::kRegisterCount; ++i) {
+      plain[i >> 6] &= ~(uint64_t(1) << (i & 63));
+    }
+  };
+  exclude(XE_GPU_REG_SCRATCH_REG0, XE_GPU_REG_SCRATCH_REG7);
+  exclude(XE_GPU_REG_COHER_STATUS_HOST, XE_GPU_REG_COHER_STATUS_HOST);
+  exclude(XE_GPU_REG_DC_LUT_RW_INDEX, XE_GPU_REG_DC_LUT_RW_INDEX);
+  exclude(XE_GPU_REG_DC_LUT_SEQ_COLOR, XE_GPU_REG_DC_LUT_SEQ_COLOR);
+  exclude(XE_GPU_REG_DC_LUT_PWL_DATA, XE_GPU_REG_DC_LUT_PWL_DATA);
+  exclude(XE_GPU_REG_DC_LUT_30_COLOR, XE_GPU_REG_DC_LUT_30_COLOR);
+  exclude(XE_GPU_REG_SHADER_CONSTANT_000_X, XE_GPU_REG_SHADER_CONSTANT_511_W);
+  exclude(XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031, XE_GPU_REG_SHADER_CONSTANT_LOOP_31);
+  exclude(XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0, XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5);
+  return plain;
+}();
 }  // namespace
 
 void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
@@ -519,9 +544,37 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
 
 void CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t* base,
                                              uint32_t num_registers) {
-  for (uint32_t i = 0; i < num_registers; ++i) {
-    uint32_t data = memory::load_and_swap<uint32_t>(base + i);
-    WriteRegister(start_index + i, data);
+  if (uint64_t(start_index) + num_registers > RegisterFile::kRegisterCount) {
+    for (uint32_t i = 0; i < num_registers; ++i) {
+      WriteRegister(start_index + i, memory::load_and_swap<uint32_t>(base + i));
+    }
+    return;
+  }
+  // amped3 cp perf: store runs of plain registers directly and only call the
+  // (virtual) WriteRegister for registers with side effects, in order, so each
+  // sees the registers before it already stored and the ones after it not yet.
+  uint32_t* values = register_file_->values;
+  uint32_t i = 0;
+  while (i < num_registers) {
+    uint32_t run = 0;
+    for (uint32_t index = start_index + i;
+         i + run < num_registers && (kPlainRegisters[index >> 6] >> (index & 63)) & 1;
+         ++index) {
+      ++run;
+    }
+    if (!run) {
+      WriteRegister(start_index + i, memory::load_and_swap<uint32_t>(base + i));
+      ++i;
+      continue;
+    }
+    if (run >= 4) {
+      memory::copy_and_swap(values + start_index + i, base + i, run);
+    } else {
+      for (uint32_t j = 0; j < run; ++j) {
+        values[start_index + i + j] = memory::load_and_swap<uint32_t>(base + i + j);
+      }
+    }
+    i += run;
   }
 }
 

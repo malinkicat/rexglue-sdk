@@ -1,3 +1,4 @@
+#include <intrin.h>
 /**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
@@ -691,8 +692,16 @@ void CommandProcessor::PrepareForWait() {}
 
 void CommandProcessor::ReturnFromWait() {}
 
+// amped3 debug (--d3d12_draw_timing): the command processor's busy time
+// (primary buffer execution), read by the D3D12 per-frame log.
+uint64_t g_amped3_cp_busy_tsc;
+
 uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t write_index) {
   SCOPE_profile_cpu_f("gpu");
+  struct BusyTimer {
+    uint64_t start = __rdtsc();
+    ~BusyTimer() { g_amped3_cp_busy_tsc += __rdtsc() - start; }
+  } busy_timer;
 
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);

@@ -75,12 +75,14 @@ const char* const kDrawTimingNames[kDrawTimingCount] = {
     "setup", "process", "rt", "pipeline", "textures", "viewport", "sysconst", "bindings",
     "vertexbuffers", "tail"};
 uint64_t g_draw_timing[kDrawTimingCount];
+uint64_t g_amped3_copy_tsc;
 }  // namespace
 namespace rex::graphics::d3d12 {
 extern uint64_t g_amped3_upload_valid_tsc, g_amped3_upload_copy_tsc, g_amped3_upload_pages,
     g_amped3_upload_calls;
 }  // namespace rex::graphics::d3d12
 namespace rex::graphics {
+extern uint64_t g_amped3_cp_busy_tsc;
 extern bool amped3_make_valid_timing;
 extern uint64_t amped3_make_valid_lock_tsc, amped3_make_valid_protect_tsc;
 }  // namespace rex::graphics
@@ -2027,6 +2029,11 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           double(g_amped3_upload_calls) / swaps, double(g_amped3_upload_pages) / swaps,
           double(g_amped3_upload_valid_tsc) / tsc_per_ms / swaps,
           double(g_amped3_upload_copy_tsc) / tsc_per_ms / swaps);
+      REXGPU_INFO("d3d12_draw_timing: command processor busy {:.2f} ms/frame, IssueCopy {:.2f} ms",
+                  double(rex::graphics::g_amped3_cp_busy_tsc) / tsc_per_ms / swaps,
+                  double(g_amped3_copy_tsc) / tsc_per_ms / swaps);
+      rex::graphics::g_amped3_cp_busy_tsc = 0;
+      g_amped3_copy_tsc = 0;
       REXGPU_INFO("d3d12_draw_timing: make valid: lock + bitmaps {:.2f} ms, protect {:.2f} ms",
                   double(rex::graphics::amped3_make_valid_lock_tsc) / tsc_per_ms / swaps,
                   double(rex::graphics::amped3_make_valid_protect_tsc) / tsc_per_ms / swaps);
@@ -2589,7 +2596,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
     // Special copy handling.
-    return IssueCopy();
+    uint64_t copy_start = __rdtsc();
+    bool copy_result = IssueCopy();
+    g_amped3_copy_tsc += __rdtsc() - copy_start;
+    return copy_result;
   }
 
   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;

@@ -11,6 +11,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <filesystem>
 #include <set>
@@ -1030,6 +1031,9 @@ class Shader {
 
   // Modification bits -> translation.
   std::unordered_map<uint64_t, Translation*> translations_;
+  // The last translation GetOrCreateTranslation returned (consecutive draws
+  // mostly use the same modification).
+  std::atomic<Translation*> last_translation_{nullptr};
 
   uint32_t ucode_storage_index_ = UINT32_MAX;
 

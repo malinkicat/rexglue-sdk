@@ -95,15 +95,24 @@ std::pair<std::filesystem::path, std::filesystem::path> Shader::Translation::Dum
 }
 
 Shader::Translation* Shader::GetOrCreateTranslation(uint64_t modification, bool* is_new) {
+  Translation* last = last_translation_.load(std::memory_order_relaxed);
+  if (last && last->modification() == modification) {
+    if (is_new) {
+      *is_new = false;
+    }
+    return last;
+  }
   auto it = translations_.find(modification);
   if (it != translations_.end()) {
     if (is_new) {
       *is_new = false;
     }
+    last_translation_.store(it->second, std::memory_order_relaxed);
     return it->second;
   }
   Translation* translation = CreateTranslationInstance(modification);
   translations_.emplace(modification, translation);
+  last_translation_.store(translation, std::memory_order_relaxed);
   if (is_new) {
     *is_new = true;
   }
@@ -114,6 +123,9 @@ void Shader::DestroyTranslation(uint64_t modification) {
   auto it = translations_.find(modification);
   if (it == translations_.end()) {
     return;
+  }
+  if (last_translation_.load(std::memory_order_relaxed) == it->second) {
+    last_translation_.store(nullptr, std::memory_order_relaxed);
   }
   delete it->second;
   translations_.erase(it);

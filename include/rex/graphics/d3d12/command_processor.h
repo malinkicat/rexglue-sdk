@@ -528,7 +528,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   ID3D12GraphicsCommandList1* command_list_1_ = nullptr;
   DeferredCommandList deferred_command_list_;
   struct SubmissionJob {
-    std::vector<uintmax_t> command_stream;
+    DeferredCommandStream command_stream;
     ID3D12CommandAllocator* command_allocator;
     uint64_t fence_value;
     // If set, run instead of submitting (in order with the submissions).
@@ -544,7 +544,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   std::condition_variable submission_jobs_done_;
   std::deque<SubmissionJob> submission_jobs_;
   // Emptied command streams for reuse (capacity kept).
-  std::vector<std::vector<uintmax_t>> submission_free_streams_;
+  std::vector<DeferredCommandStream> submission_free_streams_;
   bool submission_thread_busy_ = false;
   bool submission_thread_exit_ = false;
   int submission_thread_state_ = 0;  // 0 not decided, 1 used, -1 not used.

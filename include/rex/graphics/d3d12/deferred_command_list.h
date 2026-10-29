@@ -14,6 +14,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <memory>
+#include <utility>
 #include <vector>
 
 #include <rex/assert.h>
@@ -27,6 +29,30 @@ using namespace ::rex::literals;
 
 class D3D12CommandProcessor;
 
+// amped3 cp perf: growing the command stream must not zero the new space
+// (std::vector::resize value-initializes: a memset per recorded command, ~2.4%
+// of the command processor on a Steam Deck); every element is written right
+// after. Same layout as std::vector<uintmax_t> (the allocator is stateless).
+template <typename T>
+struct DefaultInitAllocator : std::allocator<T> {
+  template <typename U>
+  struct rebind {
+    using other = DefaultInitAllocator<U>;
+  };
+  DefaultInitAllocator() noexcept = default;
+  template <typename U>
+  DefaultInitAllocator(const DefaultInitAllocator<U>&) noexcept {}
+  template <typename U>
+  void construct(U* p) noexcept {
+    ::new (static_cast<void*>(p)) U;
+  }
+  template <typename U, typename... Args>
+  void construct(U* p, Args&&... args) {
+    ::new (static_cast<void*>(p)) U(std::forward<Args>(args)...);
+  }
+};
+using DeferredCommandStream = std::vector<uintmax_t, DefaultInitAllocator<uintmax_t>>;
+
 class DeferredCommandList {
  public:
   DeferredCommandList(const D3D12CommandProcessor& command_processor,
@@ -36,7 +62,7 @@ class DeferredCommandList {
   void Execute(ID3D12GraphicsCommandList* command_list, ID3D12GraphicsCommandList1* command_list_1);
   // Exchanges the recorded commands with `stream` (handing them to another
   // list, e.g. for executing on another thread).
-  void SwapCommandStream(std::vector<uintmax_t>& stream) { command_stream_.swap(stream); }
+  void SwapCommandStream(DeferredCommandStream& stream) { command_stream_.swap(stream); }
 
   D3D12_RECT* ClearDepthStencilViewAllocatedRects(D3D12_CPU_DESCRIPTOR_HANDLE depth_stencil_view,
                                                   D3D12_CLEAR_FLAGS clear_flags, FLOAT depth,
@@ -666,7 +692,7 @@ class DeferredCommandList {
   std::vector<uint8_t> profile_passes_;
 
   // uintmax_t to ensure uint64_t and pointer alignment of all structures.
-  std::vector<uintmax_t> command_stream_;
+  DeferredCommandStream command_stream_;
 };
 
 }  // namespace rex::graphics::d3d12

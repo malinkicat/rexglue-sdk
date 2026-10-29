@@ -10,22 +10,98 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <forward_list>
 
+#include <disruptorplus/blocking_wait_strategy.hpp>
 #include <disruptorplus/multi_threaded_claim_strategy.hpp>
 #include <disruptorplus/ring_buffer.hpp>
 #include <disruptorplus/sequence_barrier.hpp>
 #include <disruptorplus/spin_wait_strategy.hpp>
 
 #include <rex/assert.h>
+#include <rex/platform.h>
+#include <rex/cvar.h>
 #include <rex/thread.h>
 #include <rex/thread/timer_queue.h>
+
+#if REX_PLATFORM_WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
+// amped3: the timer thread spins (spin_wait_strategy) until the next timer is
+// due - ~16% of a core on a Steam Deck under Proton, power its GPU needs.
+// -1 auto: block under Wine (and on non-Windows hosts), spin on Windows, where
+// condition-variable timeouts are coarser. After Project8Recomp (BSD-3).
+REXCVAR_DEFINE_INT32(timer_queue_blocking_wait, -1, "Threading",
+                     "Timer thread waits by blocking instead of spinning: -1 auto (Proton/Wine "
+                     "and Linux block, Windows spins), 0 spin, 1 block");
 
 namespace dp = disruptorplus;
 
 namespace rex::thread {
 
 using WaitItem = TimerQueueWaitItem;
+
+namespace {
+
+bool TimerQueueBlocks() {
+  static const bool blocks = [] {
+    int32_t mode = REXCVAR_GET(timer_queue_blocking_wait);
+    if (mode >= 0) {
+      return mode != 0;
+    }
+#if REX_PLATFORM_WIN32
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    return ntdll && GetProcAddress(ntdll, "wine_get_version");
+#else
+    return true;
+#endif
+  }();
+  return blocks;
+}
+
+}  // namespace
+
+// Either strategy, chosen once. Publishers always signal the blocking one so a
+// blocked waiter wakes as soon as a timer is queued.
+class TimerQueueWaitStrategy {
+ public:
+  dp::sequence_t wait_until_published(dp::sequence_t sequence, size_t count,
+                                      const std::atomic<dp::sequence_t>* const sequences[]) {
+    if (blocks_) {
+      return blocking_.wait_until_published(sequence, count, sequences);
+    }
+    return spin_.wait_until_published(sequence, count, sequences);
+  }
+  template <typename Clock, typename Duration>
+  dp::sequence_t wait_until_published(dp::sequence_t sequence, size_t count,
+                                      const std::atomic<dp::sequence_t>* const sequences[],
+                                      const std::chrono::time_point<Clock, Duration>& due) {
+    if (blocks_) {
+      // At most a second per wait: an idle queue waits until time_point::max(),
+      // which some condition_variable implementations overflow on. The
+      // caller's loop just waits again.
+      const auto limit = Clock::now() + std::chrono::seconds(1);
+      return blocking_.wait_until_published(sequence, count, sequences,
+                                            due < limit ? due : limit);
+    }
+    return spin_.wait_until_published(sequence, count, sequences, due);
+  }
+  void signal_all_when_blocking() {
+    if (blocks_) {
+      blocking_.signal_all_when_blocking();
+    }
+  }
+
+ private:
+  const bool blocks_ = TimerQueueBlocks();
+  dp::spin_wait_strategy spin_;
+  dp::blocking_wait_strategy blocking_;
+};
 
 class TimerQueue {
  public:
@@ -142,9 +218,9 @@ class TimerQueue {
   // This ring buffer will be used to introduce timers queued by the public API
   static constexpr size_t kWaitCount = 512;
   dp::ring_buffer<std::shared_ptr<WaitItem>> buffer_;
-  dp::spin_wait_strategy wait_strategy_;
-  dp::multi_threaded_claim_strategy<dp::spin_wait_strategy> claim_strategy_;
-  dp::sequence_barrier<dp::spin_wait_strategy> consumed_;
+  TimerQueueWaitStrategy wait_strategy_;
+  dp::multi_threaded_claim_strategy<TimerQueueWaitStrategy> claim_strategy_;
+  dp::sequence_barrier<TimerQueueWaitStrategy> consumed_;
 
   // This is a _sorted_ (ascending due_) list of active timers managed by a
   // dedicated thread

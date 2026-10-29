@@ -1,3 +1,4 @@
+#include <intrin.h>
 /**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
@@ -28,6 +29,8 @@ REXCVAR_DEFINE_BOOL(d3d12_tiled_shared_memory, true, "GPU/D3D12",
 
 // command_processor.cpp: also logs the uploads.
 REXCVAR_DECLARE(int32_t, gpu_debug_log_draws);
+
+REXCVAR_DECLARE(bool, d3d12_draw_timing);
 
 namespace rex::graphics::d3d12 {
 
@@ -305,6 +308,11 @@ bool D3D12SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocat
   return true;
 }
 
+// amped3 debug (--d3d12_draw_timing): time and size of uploads, read by the
+// command processor's per-frame log.
+uint64_t g_amped3_upload_valid_tsc, g_amped3_upload_copy_tsc, g_amped3_upload_pages,
+    g_amped3_upload_calls;
+
 bool D3D12SharedMemory::UploadRanges(
     const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) {
   if (upload_page_ranges.empty()) {
@@ -344,10 +352,19 @@ bool D3D12SharedMemory::UploadRanges(
         REXGPU_ERROR("Shared memory: Failed to get an upload buffer");
         return false;
       }
+      const bool timing = REXCVAR_GET(d3d12_draw_timing);
+      uint64_t t0 = timing ? __rdtsc() : 0;
       MakeRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size), false);
+      uint64_t t1 = timing ? __rdtsc() : 0;
       std::memcpy(upload_buffer_mapping,
                   memory().TranslatePhysical(upload_range_start << page_size_log2()),
                   upload_buffer_size);
+      if (timing) {
+        g_amped3_upload_valid_tsc += t1 - t0;
+        g_amped3_upload_copy_tsc += __rdtsc() - t1;
+        g_amped3_upload_pages += upload_buffer_size >> page_size_log2();
+        ++g_amped3_upload_calls;
+      }
       command_list.D3DCopyBufferRegion(buffer_, upload_range_start << page_size_log2(),
                                        upload_buffer, UINT64(upload_buffer_offset),
                                        UINT64(upload_buffer_size));

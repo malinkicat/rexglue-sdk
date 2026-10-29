@@ -245,6 +245,16 @@ class SharedMemory {
   // Unlinks and frees the range and its nodes. Call this in the global critical
   // region.
   void UnlinkWatchRange(WatchRange* range);
+
+  // amped3 (--gpu_hot_pages): pages the CPU keeps rewriting (dynamic vertex
+  // data) stop being write-protected after a few write faults; they stay
+  // invalid and are copied again on every request instead. Re-protecting them
+  // after every upload, and the game's next write faulting, is far slower than
+  // the copy under Wine (~25 us per protect on a Steam Deck). Pages with watches
+  // (textures) or GPU-written data never go hot.
+  bool PageHasWatch(uint32_t page) const;
+  std::vector<uint8_t> amped3_page_write_faults_;
+  std::vector<uint64_t> amped3_hot_pages_;
 };
 
 }  // namespace rex::graphics

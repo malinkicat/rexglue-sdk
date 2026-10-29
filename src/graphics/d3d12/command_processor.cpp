@@ -10,6 +10,8 @@
  */
 
 #include <algorithm>
+#include <chrono>
+#include <intrin.h>
 #include <cmath>
 #include <atomic>
 #include <bit>
@@ -46,9 +48,54 @@ REXCVAR_DEFINE_BOOL(d3d12_readback_memexport, false, "GPU/D3D12",
                     "Read data written by memory export in shaders on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(d3d12_draw_timing, false, "GPU/D3D12",
+                    "Debug: log the command processor's time per IssueDraw section (ms per frame)");
 REXCVAR_DEFINE_BOOL(d3d12_readback_resolve, false, "GPU/D3D12",
                     "Read render-to-texture results on the CPU")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+// amped3 debug (--d3d12_draw_timing): rdtsc time per IssueDraw section, logged
+// as ms per frame every 120 swaps - how much of the command processor's draw
+// work could move to another thread.
+namespace {
+enum DrawTimingSection {
+  kDrawTimingSetup,       // entry to primitive processing (shaders, clears in place)
+  kDrawTimingProcess,     // primitive processing
+  kDrawTimingProcessRt,   // render target cache update (and what's between)
+  kDrawTimingPipeline,    // translations + ConfigurePipeline
+  kDrawTimingTextures,    // RequestTextures
+  kDrawTimingViewport,    // viewport, scissor, fixed function state
+  kDrawTimingSysConst,    // UpdateSystemConstantValues
+  kDrawTimingBindings,    // UpdateBindings
+  kDrawTimingVertexBuffers,  // vertex fetch constants -> shared memory ranges
+  kDrawTimingTail,        // memexport, index buffer, barriers, the draw
+  kDrawTimingCount
+};
+const char* const kDrawTimingNames[kDrawTimingCount] = {
+    "setup", "process", "rt", "pipeline", "textures", "viewport", "sysconst", "bindings",
+    "vertexbuffers", "tail"};
+uint64_t g_draw_timing[kDrawTimingCount];
+}  // namespace
+namespace rex::graphics::d3d12 {
+extern uint64_t g_amped3_upload_valid_tsc, g_amped3_upload_copy_tsc, g_amped3_upload_pages,
+    g_amped3_upload_calls;
+}  // namespace rex::graphics::d3d12
+namespace rex::graphics {
+extern bool amped3_make_valid_timing;
+extern uint64_t amped3_make_valid_lock_tsc, amped3_make_valid_protect_tsc;
+}  // namespace rex::graphics
+namespace {
+uint64_t g_draw_timing_last;
+uint64_t g_draw_timing_draws;
+bool g_draw_timing_on;
+inline void DrawTimingMark(DrawTimingSection section) {
+  if (g_draw_timing_on) {
+    uint64_t now = __rdtsc();
+    g_draw_timing[section] += now - g_draw_timing_last;
+    g_draw_timing_last = now;
+  }
+}
+}  // namespace
 
 REXCVAR_DEFINE_INT32(gpu_debug_log_draws, 0, "GPU/Debug",
                      "Log the state of every draw for this many frames (counts down)");
@@ -1954,6 +2001,45 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
 
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
+  rex::graphics::amped3_make_valid_timing = REXCVAR_GET(d3d12_draw_timing);
+  if (REXCVAR_GET(d3d12_draw_timing)) {
+    static uint32_t swaps = 0;
+    static uint64_t tsc_start = 0;
+    static auto clock_start = std::chrono::steady_clock::now();
+    if (!tsc_start) {
+      tsc_start = __rdtsc();
+    } else if (++swaps == 120) {
+      double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - clock_start)
+                           .count();
+      double tsc_per_ms = double(__rdtsc() - tsc_start) / (seconds * 1000.0);
+      uint64_t total = 0;
+      std::string parts;
+      for (uint32_t i = 0; i < kDrawTimingCount; ++i) {
+        total += g_draw_timing[i];
+        parts += fmt::format(" {} {:.2f}", kDrawTimingNames[i],
+                             double(g_draw_timing[i]) / tsc_per_ms / swaps);
+      }
+      REXGPU_INFO("d3d12_draw_timing: {:.0f} draws/frame, IssueDraw {:.2f} ms/frame:{}",
+                  double(g_draw_timing_draws) / swaps, double(total) / tsc_per_ms / swaps, parts);
+      REXGPU_INFO(
+          "d3d12_draw_timing: uploads {:.1f}/frame, {:.0f} pages/frame, make valid {:.2f} ms, "
+          "copy {:.2f} ms per frame",
+          double(g_amped3_upload_calls) / swaps, double(g_amped3_upload_pages) / swaps,
+          double(g_amped3_upload_valid_tsc) / tsc_per_ms / swaps,
+          double(g_amped3_upload_copy_tsc) / tsc_per_ms / swaps);
+      REXGPU_INFO("d3d12_draw_timing: make valid: lock + bitmaps {:.2f} ms, protect {:.2f} ms",
+                  double(rex::graphics::amped3_make_valid_lock_tsc) / tsc_per_ms / swaps,
+                  double(rex::graphics::amped3_make_valid_protect_tsc) / tsc_per_ms / swaps);
+      rex::graphics::amped3_make_valid_lock_tsc = rex::graphics::amped3_make_valid_protect_tsc = 0;
+      g_amped3_upload_calls = g_amped3_upload_pages = g_amped3_upload_valid_tsc =
+          g_amped3_upload_copy_tsc = 0;
+      std::fill(std::begin(g_draw_timing), std::end(g_draw_timing), 0);
+      g_draw_timing_draws = 0;
+      swaps = 0;
+      tsc_start = __rdtsc();
+      clock_start = std::chrono::steady_clock::now();
+    }
+  }
   SCOPE_profile_cpu_f("gpu");
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
@@ -2483,9 +2569,15 @@ uint32_t D3D12CommandProcessor::ComputeLodFreeFetchMask(const D3D12Shader& pixel
   return lod_free_mask;
 }
 
+
 bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
                                       IndexBufferInfo* index_buffer_info,
                                       bool major_mode_explicit) {
+  g_draw_timing_on = REXCVAR_GET(d3d12_draw_timing);
+  if (g_draw_timing_on) {
+    g_draw_timing_last = __rdtsc();
+    ++g_draw_timing_draws;
+  }
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -2555,11 +2647,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     return true;
   }
 
+  DrawTimingMark(kDrawTimingSetup);
   // Process primitives.
   PrimitiveProcessor::ProcessingResult primitive_processing_result;
   if (!primitive_processor_->Process(primitive_processing_result)) {
     return false;
   }
+  DrawTimingMark(kDrawTimingProcess);
   if (!primitive_processing_result.host_draw_vertex_count) {
     // Nothing to draw.
     return true;
@@ -2630,6 +2724,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                                     normalized_color_mask, *vertex_shader)) {
     return false;
   }
+  DrawTimingMark(kDrawTimingProcessRt);
 
   // Create the pipeline (for this, need the actually used render target formats
   // from the render target cache), translating the shaders - doing this now to
@@ -2660,6 +2755,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           bound_depth_and_color_render_target_formats, &pipeline_handle, &root_signature)) {
     return false;
   }
+  DrawTimingMark(kDrawTimingPipeline);
   if (REXCVAR_GET(async_shader_compilation) &&
       pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
     return true;
@@ -2701,6 +2797,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   SetGpuProfilePass(rex::perf::GpuPass::kTextureLoad);
   texture_cache_->RequestTextures(used_texture_mask);
   SetGpuProfilePass(rex::perf::GpuPass::kOther);
+  DrawTimingMark(kDrawTimingTextures);
 
   // Bind the pipeline after configuring it and doing everything that may bind
   // other pipelines.
@@ -2754,6 +2851,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
 
   // Update viewport, scissor, blend factor and stencil reference.
   UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal, normalized_depth_control);
+  DrawTimingMark(kDrawTimingViewport);
 
   // Update system constants before uploading them.
   // TODO(Triang3l): With ROV, pass the disabled render target mask for safety.
@@ -2761,11 +2859,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                              primitive_processing_result.line_loop_closing_index,
                              primitive_processing_result.host_shader_index_endian, viewport_info,
                              used_texture_mask, normalized_depth_control, normalized_color_mask);
+  DrawTimingMark(kDrawTimingSysConst);
 
   // Update constant buffers, descriptors and root parameters.
   if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used)) {
     return false;
   }
+  DrawTimingMark(kDrawTimingBindings);
   // Must not call anything that can change the descriptor heap from now on!
   struct DirectResolveWriteOutBlock {
     D3D12TextureCache& texture_cache;
@@ -2825,6 +2925,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
   }
 
+  DrawTimingMark(kDrawTimingVertexBuffers);
   // Gather memexport ranges and ensure the heaps for them are resident, and
   // also load the data surrounding the export and to fill the regions that
   // won't be modified by the shaders.
@@ -3035,6 +3136,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
   }
 
+  DrawTimingMark(kDrawTimingTail);
   return true;
 }
 

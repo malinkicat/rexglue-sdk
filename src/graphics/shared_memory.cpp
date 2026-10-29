@@ -1,3 +1,4 @@
+#include <intrin.h>
 /**
  ******************************************************************************
  * Xenia : Xbox 360 Emulator Research Project                                 *
@@ -14,12 +15,42 @@
 #include <cstring>
 #include <utility>
 
+#include <rex/platform.h>
+#if REX_PLATFORM_WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 #include <rex/assert.h>
 #include <rex/bit.h>
+#include <rex/cvar.h>
+#include <rex/platform.h>
 #include <rex/dbg.h>
 #include <rex/graphics/shared_memory.h>
 #include <rex/math.h>
 #include <rex/memory.h>
+
+REXCVAR_DEFINE_INT32(gpu_hot_pages, -1, "GPU",
+                     "Stop write-protecting guest pages the CPU keeps rewriting and copy them on "
+                     "every request instead (much cheaper than page protection under Wine): "
+                     "-1 auto (on under Proton/Wine and on Linux, off on Windows), 0 off, 1 on");
+
+namespace {
+bool HotPagesEnabled() {
+  int32_t mode = REXCVAR_GET(gpu_hot_pages);
+  if (mode >= 0) {
+    return mode != 0;
+  }
+#if REX_PLATFORM_WIN32
+  HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+  return ntdll && GetProcAddress(ntdll, "wine_get_version");
+#else
+  return true;
+#endif
+}
+}  // namespace
 
 namespace rex::graphics {
 
@@ -35,6 +66,10 @@ void SharedMemory::InitializeCommon() {
   num_system_page_flags_ = ((kBufferSize >> page_size_log2_) + 63) / 64;
   system_page_flags_valid_.assign(num_system_page_flags_, 0);
   system_page_flags_valid_and_gpu_written_.assign(num_system_page_flags_, 0);
+  if (HotPagesEnabled()) {
+    amped3_page_write_faults_.assign(kBufferSize >> page_size_log2_, 0);
+    amped3_hot_pages_.assign(num_system_page_flags_, 0);
+  }
 
   memory_invalidation_callback_handle_ =
       memory_.RegisterPhysicalMemoryInvalidationCallback(MemoryInvalidationCallbackThunk, this);
@@ -169,6 +204,14 @@ SharedMemory::WatchHandle SharedMemory::WatchMemoryRange(uint32_t start, uint32_
 
   auto global_lock = global_critical_region_.Acquire();
 
+  // amped3: watched pages (textures) must fault on CPU writes again.
+  if (!amped3_hot_pages_.empty()) {
+    for (uint32_t page = watch_page_first; page <= watch_page_last; ++page) {
+      amped3_hot_pages_[page >> 6] &= ~(uint64_t(1) << (page & 63));
+      amped3_page_write_faults_[page] = 0;
+    }
+  }
+
   // Allocate the range.
   WatchRange* range = watch_range_first_free_;
   if (range != nullptr) {
@@ -281,6 +324,11 @@ bool SharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
   return false;
 }
 
+// amped3 debug: MakeRangeValid split into the locked bitmap update and the page
+// protection (set by the D3D12 command processor's --d3d12_draw_timing).
+bool amped3_make_valid_timing;
+uint64_t amped3_make_valid_lock_tsc, amped3_make_valid_protect_tsc;
+
 void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_by_gpu) {
   if (length == 0 || start >= kBufferSize) {
     return;
@@ -292,6 +340,7 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
   uint32_t valid_block_first = valid_page_first >> 6;
   uint32_t valid_block_last = valid_page_last >> 6;
 
+  uint64_t timing_t0 = amped3_make_valid_timing ? __rdtsc() : 0;
   {
     auto global_lock = global_critical_region_.Acquire();
 
@@ -303,17 +352,58 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
       if (i == valid_block_last && (valid_page_last & 63) != 63) {
         valid_bits &= (uint64_t(1) << ((valid_page_last & 63) + 1)) - 1;
       }
+      if (!amped3_hot_pages_.empty()) {
+        if (written_by_gpu) {
+          amped3_hot_pages_[i] &= ~valid_bits;
+        } else {
+          valid_bits &= ~amped3_hot_pages_[i];
+        }
+      }
       system_page_flags_valid_[i] |= valid_bits;
       uint64_t& gpu_written = system_page_flags_valid_and_gpu_written_[i];
       gpu_written = written_by_gpu ? (gpu_written | valid_bits) : (gpu_written & ~valid_bits);
     }
   }
 
+  uint64_t timing_t1 = amped3_make_valid_timing ? __rdtsc() : 0;
   if (memory_invalidation_callback_handle_) {
-    memory().EnablePhysicalMemoryAccessCallbacks(
-        valid_page_first << page_size_log2_,
-        (valid_page_last - valid_page_first + 1) << page_size_log2_, true, false);
+    if (amped3_hot_pages_.empty() || written_by_gpu) {
+      memory().EnablePhysicalMemoryAccessCallbacks(
+          valid_page_first << page_size_log2_,
+          (valid_page_last - valid_page_first + 1) << page_size_log2_, true, false);
+    } else {
+      // Protect only the runs of pages that aren't hot. (Hotness only changes
+      // under the global lock; a page going hot between here and the protect
+      // just stays protected until its next fault.)
+      uint32_t run_first = UINT32_MAX;
+      for (uint32_t page = valid_page_first; page <= valid_page_last + 1; ++page) {
+        bool hot = page <= valid_page_last &&
+                   ((amped3_hot_pages_[page >> 6] >> (page & 63)) & 1);
+        bool end = page > valid_page_last || hot;
+        if (!end && run_first == UINT32_MAX) {
+          run_first = page;
+        } else if (end && run_first != UINT32_MAX) {
+          memory().EnablePhysicalMemoryAccessCallbacks(
+              run_first << page_size_log2_, (page - run_first) << page_size_log2_, true, false);
+          run_first = UINT32_MAX;
+        }
+      }
+    }
   }
+  if (amped3_make_valid_timing) {
+    amped3_make_valid_lock_tsc += timing_t1 - timing_t0;
+    amped3_make_valid_protect_tsc += __rdtsc() - timing_t1;
+  }
+}
+
+bool SharedMemory::PageHasWatch(uint32_t page) const {
+  for (const WatchNode* node = watch_buckets_[page << page_size_log2_ >> kWatchBucketSizeLog2];
+       node != nullptr; node = node->bucket_node_next) {
+    if (node->range->page_first <= page && page <= node->range->page_last) {
+      return true;
+    }
+  }
+  return false;
 }
 
 void SharedMemory::UnlinkWatchRange(WatchRange* range) {
@@ -530,6 +620,16 @@ std::pair<uint32_t, uint32_t> SharedMemory::MemoryInvalidationCallback(
   uint32_t block_last = page_last >> 6;
 
   auto global_lock = global_critical_region_.Acquire();
+
+  if (!exact_range && !amped3_hot_pages_.empty()) {
+    // A CPU write fault: after the third on a page, stop protecting it.
+    for (uint32_t page = page_first; page <= page_last; ++page) {
+      uint8_t& faults = amped3_page_write_faults_[page];
+      if (faults < 255 && ++faults == 3 && !PageHasWatch(page)) {
+        amped3_hot_pages_[page >> 6] |= uint64_t(1) << (page & 63);
+      }
+    }
+  }
 
   if (!exact_range) {
     // Check if a somewhat wider range (up to 256 KB with 4 KB pages) can be

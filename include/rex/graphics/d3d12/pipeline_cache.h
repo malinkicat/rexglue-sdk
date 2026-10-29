@@ -419,6 +419,38 @@ class PipelineCache {
   // creation_request_cond_ when set.
   size_t creation_threads_shutdown_from_ = SIZE_MAX;
   std::vector<std::unique_ptr<rex::thread::Thread>> creation_threads_;
+
+  // amped3 cp perf: ConfigurePipeline memo - when every input of
+  // GetCurrentStateDescription matches the previous successful call, the
+  // current pipeline is the answer again (pipeline_cache.cpp).
+  bool ConfigurePipelineUncached(D3D12Shader::D3D12Translation* vertex_shader,
+                                 D3D12Shader::D3D12Translation* pixel_shader,
+                                 const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+                                 reg::RB_DEPTHCONTROL normalized_depth_control,
+                                 uint32_t normalized_color_mask,
+                                 uint32_t bound_depth_and_color_render_target_bits,
+                                 const uint32_t* bound_depth_and_color_render_targets_formats,
+                                 void** pipeline_handle_out, ID3D12RootSignature** root_signature_out);
+  struct ConfigureMemoKey {
+    const void* vertex_shader;
+    const void* pixel_shader;
+    uint32_t host_vertex_shader_type;
+    uint32_t host_primitive_type;
+    uint32_t tessellation_mode;
+    uint32_t host_primitive_reset_enabled;
+    uint32_t host_index_format;
+    uint32_t normalized_depth_control;
+    uint32_t normalized_color_mask;
+    uint32_t bound_render_target_bits;
+    uint32_t bound_render_target_formats[1 + xenos::kMaxColorRenderTargets];
+    uint32_t use_async;
+    uint32_t tessellation_wireframe;
+    uint32_t registers[22];
+  };
+  ConfigureMemoKey configure_memo_key_{};
+  Pipeline* configure_memo_pipeline_ = nullptr;
+  uint64_t configure_memo_checks_ = 0;
+  uint64_t configure_memo_mismatches_ = 0;
 };
 
 }  // namespace rex::graphics::d3d12

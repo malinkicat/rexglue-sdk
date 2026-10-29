@@ -54,6 +54,12 @@ REXCVAR_DEFINE_BOOL(d3d12_dxbc_disasm, false, "GPU/D3D12", "Dump DXBC disassembl
 REXCVAR_DEFINE_BOOL(d3d12_dxbc_disasm_dxilconv, false, "GPU/D3D12",
                     "Dump DXIL conversion disassembly");
 
+REXCVAR_DEFINE_BOOL(d3d12_pipeline_memo, true, "GPU/D3D12",
+                    "Reuse the current pipeline without rebuilding its description when every "
+                    "input of the description is unchanged since the previous draw");
+REXCVAR_DEFINE_BOOL(d3d12_pipeline_memo_verify, false, "GPU/D3D12",
+                    "Debug: build the description anyway and log draws where the memo would "
+                    "have picked a different pipeline");
 REXCVAR_DEFINE_INT32(d3d12_pipeline_creation_threads, -1, "GPU/D3D12",
                      "Number of pipeline creation threads (-1 for auto)")
     .range(-1, 32)
@@ -189,6 +195,7 @@ void PipelineCache::Shutdown() {
 
   // Destroy all pipelines.
   current_pipeline_ = nullptr;
+  configure_memo_pipeline_ = nullptr;
   for (auto it : pipelines_) {
     ID3D12PipelineState* state = it.second->state.load(std::memory_order_acquire);
     if (state) {
@@ -895,7 +902,109 @@ DxbcShaderTranslator::Modification PipelineCache::GetCurrentPixelShaderModificat
   return modification;
 }
 
+// amped3 cp perf: the registers GetCurrentStateDescription reads, directly or
+// through draw_util (IsPrimitivePolygonal, IsRasterizationPotentiallyDone,
+// GetPreferredFacePolygonOffset). Keep in sync with that function.
+static const uint32_t kConfigureMemoRegisters[] = {
+    uint32_t(XE_GPU_REG_PA_SU_SC_MODE_CNTL),
+    uint32_t(XE_GPU_REG_VGT_OUTPUT_PATH_CNTL),
+    uint32_t(XE_GPU_REG_VGT_DRAW_INITIATOR),
+    uint32_t(XE_GPU_REG_RB_MODECONTROL),
+    uint32_t(XE_GPU_REG_SQ_PROGRAM_CNTL),
+    uint32_t(XE_GPU_REG_RB_SURFACE_INFO),
+    uint32_t(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE),
+    uint32_t(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET),
+    uint32_t(XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_SCALE),
+    uint32_t(XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_OFFSET),
+    uint32_t(XE_GPU_REG_RB_DEPTH_INFO),
+    uint32_t(XE_GPU_REG_PA_CL_CLIP_CNTL),
+    uint32_t(XE_GPU_REG_RB_STENCILREFMASK),
+    uint32_t(XE_GPU_REG_RB_STENCILREFMASK_BF),
+    uint32_t(reg::RB_COLOR_INFO::rt_register_indices[0]),
+    uint32_t(reg::RB_COLOR_INFO::rt_register_indices[1]),
+    uint32_t(reg::RB_COLOR_INFO::rt_register_indices[2]),
+    uint32_t(reg::RB_COLOR_INFO::rt_register_indices[3]),
+    uint32_t(reg::RB_BLENDCONTROL::rt_register_indices[0]),
+    uint32_t(reg::RB_BLENDCONTROL::rt_register_indices[1]),
+    uint32_t(reg::RB_BLENDCONTROL::rt_register_indices[2]),
+    uint32_t(reg::RB_BLENDCONTROL::rt_register_indices[3]),
+};
+
 bool PipelineCache::ConfigurePipeline(
+    D3D12Shader::D3D12Translation* vertex_shader, D3D12Shader::D3D12Translation* pixel_shader,
+    const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
+    reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
+    uint32_t bound_depth_and_color_render_target_bits,
+    const uint32_t* bound_depth_and_color_render_target_formats, void** pipeline_handle_out,
+    ID3D12RootSignature** root_signature_out) {
+  if (!REXCVAR_GET(d3d12_pipeline_memo)) {
+    return ConfigurePipelineUncached(vertex_shader, pixel_shader, primitive_processing_result,
+                                     normalized_depth_control, normalized_color_mask,
+                                     bound_depth_and_color_render_target_bits,
+                                     bound_depth_and_color_render_target_formats,
+                                     pipeline_handle_out, root_signature_out);
+  }
+  static_assert(sizeof(ConfigureMemoKey::registers) == sizeof(kConfigureMemoRegisters));
+  ConfigureMemoKey key;
+  std::memset(&key, 0, sizeof(key));
+  key.vertex_shader = vertex_shader;
+  key.pixel_shader = pixel_shader;
+  key.host_vertex_shader_type = uint32_t(primitive_processing_result.host_vertex_shader_type);
+  key.host_primitive_type = uint32_t(primitive_processing_result.host_primitive_type);
+  key.tessellation_mode = uint32_t(primitive_processing_result.tessellation_mode);
+  key.host_primitive_reset_enabled = primitive_processing_result.host_primitive_reset_enabled;
+  key.host_index_format = uint32_t(primitive_processing_result.host_index_format);
+  key.normalized_depth_control = normalized_depth_control.value;
+  key.normalized_color_mask = normalized_color_mask;
+  key.bound_render_target_bits = bound_depth_and_color_render_target_bits;
+  std::memcpy(key.bound_render_target_formats, bound_depth_and_color_render_target_formats,
+              sizeof(key.bound_render_target_formats));
+  key.use_async = REXCVAR_GET(async_shader_compilation) && !creation_threads_.empty() &&
+                  pixel_shader != nullptr;
+  key.tessellation_wireframe = REXCVAR_GET(d3d12_tessellation_wireframe);
+  for (size_t i = 0; i < std::size(kConfigureMemoRegisters); ++i) {
+    key.registers[i] = register_file_.values[kConfigureMemoRegisters[i]];
+  }
+  // A shader whose (async) translation has since failed takes the full path.
+  bool memo_hit = configure_memo_pipeline_ != nullptr &&
+                  current_pipeline_ == configure_memo_pipeline_ &&
+                  !(vertex_shader->is_translated() && !vertex_shader->is_valid()) &&
+                  !(pixel_shader && pixel_shader->is_translated() && !pixel_shader->is_valid()) &&
+                  !std::memcmp(&key, &configure_memo_key_, sizeof(key));
+  const bool verify = REXCVAR_GET(d3d12_pipeline_memo_verify);
+  if (memo_hit && !verify) {
+    *pipeline_handle_out = configure_memo_pipeline_;
+    *root_signature_out = configure_memo_pipeline_->root_signature.load(std::memory_order_acquire);
+    return true;
+  }
+  Pipeline* memo_pipeline = memo_hit ? configure_memo_pipeline_ : nullptr;
+  bool result = ConfigurePipelineUncached(vertex_shader, pixel_shader, primitive_processing_result,
+                                          normalized_depth_control, normalized_color_mask,
+                                          bound_depth_and_color_render_target_bits,
+                                          bound_depth_and_color_render_target_formats,
+                                          pipeline_handle_out, root_signature_out);
+  if (memo_hit) {
+    ++configure_memo_checks_;
+    if (!result || *pipeline_handle_out != memo_pipeline) {
+      if (++configure_memo_mismatches_ <= 20) {
+        REXGPU_WARN("d3d12_pipeline_memo_verify: mismatch ({} of {} memo hits checked)",
+                    configure_memo_mismatches_, configure_memo_checks_);
+      }
+    } else if ((configure_memo_checks_ & 0xFFFFF) == 0) {
+      REXGPU_INFO("d3d12_pipeline_memo_verify: {} memo hits checked, {} mismatches",
+                  configure_memo_checks_, configure_memo_mismatches_);
+    }
+  }
+  if (result) {
+    configure_memo_key_ = key;
+    configure_memo_pipeline_ = static_cast<Pipeline*>(*pipeline_handle_out);
+  } else {
+    configure_memo_pipeline_ = nullptr;
+  }
+  return result;
+}
+
+bool PipelineCache::ConfigurePipelineUncached(
     D3D12Shader::D3D12Translation* vertex_shader, D3D12Shader::D3D12Translation* pixel_shader,
     const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
     reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,

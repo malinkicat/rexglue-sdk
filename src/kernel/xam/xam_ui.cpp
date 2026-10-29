@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/ui/on_screen_keyboard.h>
 #include <rex/logging.h>
 #include <rex/runtime.h>
 #include <rex/string.h>
@@ -17,7 +18,11 @@
 
 #include <imgui.h>
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
+#include <cmath>
+#include <cstring>
 #include <thread>
 
 #ifdef _WIN32
@@ -386,6 +391,11 @@ uint16_t PadButtonsForDialog() {
 uint16_t PadButtonsForDialog() { return 0; }
 #endif
 
+// The rider-name prompt: a "Night session" panel over the game with an
+// on-screen QWERTY keyboard for controllers (rex::ui::OnScreenKeyboard); a
+// physical keyboard types straight into the name. Fonts are the game's bundled
+// Exo 2 ("ReAmped Display" / "ReAmped UI" / "ReAmped UI Bold", added by the
+// app), falling back to the default font.
 class KeyboardInputDialog : public XamDialog {
  public:
   KeyboardInputDialog(rex::ui::ImGuiDrawer* imgui_drawer, std::string title,
@@ -395,7 +405,8 @@ class KeyboardInputDialog : public XamDialog {
         description_(description),
         default_text_(default_text),
         max_length_(max_length),
-        text_buffer_() {
+        // max_length includes the terminator (and a spare): characters that fit.
+        keyboard_(std::string(), max_length > 2 ? max_length - 2 : 0) {
     if (!title_.size()) {
       if (!description_.size()) {
         title_ = "Keyboard Input";
@@ -407,68 +418,41 @@ class KeyboardInputDialog : public XamDialog {
     if (default_text_.empty()) {
       default_text_ = REXCVAR_GET(headless_keyboard_text);
     }
-    text_ = default_text_;
-    text_buffer_.resize(max_length);
-    rex::string::copy_truncating(text_buffer_.data(), default_text_, text_buffer_.size());
+    for (char c : default_text_) {
+      keyboard_.TypeChar(c);
+    }
+    text_ = keyboard_.text();
   }
 
   const std::string& text() const { return text_; }
   bool cancelled() const { return cancelled_; }
 
   void OnDraw(ImGuiIO& io) override {
-    bool first_draw = false;
     if (!has_opened_) {
       ImGui::OpenPopup(title_.c_str());
       has_opened_ = true;
-      first_draw = true;
     }
-    if (ImGui::BeginPopupModal(title_.c_str(), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
-      if (description_.size()) {
-        ImGui::TextWrapped("%s", description_.c_str());
-      }
-      if (first_draw) {
-        ImGui::SetKeyboardFocusHere();
-      }
-      if (ImGui::InputText("##body", text_buffer_.data(), text_buffer_.size(),
-                           ImGuiInputTextFlags_EnterReturnsTrue)) {
-        text_ = std::string(text_buffer_.data());
-        cancelled_ = false;
-        ImGui::CloseCurrentPopup();
-        Close();
-      }
-      if (ImGui::Button("OK")) {
-        text_ = std::string(text_buffer_.data());
-        cancelled_ = false;
-        ImGui::CloseCurrentPopup();
-        Close();
-      }
-      ImGui::SameLine();
-      if (ImGui::Button("Cancel")) {
-        text_ = "";
-        cancelled_ = true;
-        ImGui::CloseCurrentPopup();
-        Close();
-      }
-      ImGui::TextDisabled("Controller: A = OK, B = Cancel");
-      ImGui::Spacing();
-      // Controller: A confirms, B cancels, on release: game input resumes when
-      // the dialog closes, and a still-held A would reopen the prompt. Buttons
-      // count only after all were released, so the press that opened the
-      // dialog does not confirm it.
-      const uint16_t pad = PadButtonsForDialog();
-      constexpr uint16_t kPadA = 0x1000, kPadB = 0x2000;
-      if (!pad_armed_) {
-        pad_armed_ = (pad & (kPadA | kPadB)) == 0;
-      } else if (pad & (kPadA | kPadB)) {
-        pad_pressed_ |= pad & (kPadA | kPadB);
-      } else if (pad_pressed_ & kPadA) {
-        text_ = std::string(text_buffer_.data());
-        cancelled_ = false;
-        ImGui::CloseCurrentPopup();
-        Close();
-      } else if (pad_pressed_ & kPadB) {
-        text_ = "";
-        cancelled_ = true;
+    const float scale = io.DisplaySize.y / 1080.0f;
+    const float width = std::clamp(io.DisplaySize.x * 0.36f, 520.0f * scale, 900.0f * scale);
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
+                            ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSize(ImVec2(width, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_PopupBg, Color(kNavy));
+    ImGui::PushStyleColor(ImGuiCol_Border, Color(kBorder));
+    ImGui::PushStyleColor(ImGuiCol_ModalWindowDimBg, IM_COL32(4, 8, 14, 150));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 12.0f * scale);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
+    if (ImGui::BeginPopupModal(title_.c_str(), nullptr,
+                               ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                                   ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings |
+                                   ImGuiWindowFlags_NoScrollbar)) {
+      HandleInput(io);
+      Draw(scale, width);
+      if (closing_ && !(PadButtons() & (kPadA | kPadB | kPadStart))) {
+        // Closed once the confirming button is released: game input resumes
+        // when the dialog closes, and a still-held A would reopen the prompt.
+        text_ = keyboard_.text();
         ImGui::CloseCurrentPopup();
         Close();
       }
@@ -476,17 +460,312 @@ class KeyboardInputDialog : public XamDialog {
     } else {
       Close();
     }
+    ImGui::PopStyleVar(3);
+    ImGui::PopStyleColor(3);
   }
 
  private:
+  static constexpr uint32_t kNavy = 0x0f1724, kHeader = 0x1c2e48, kField = 0x18253a,
+                            kBorder = 0x263852, kCyan = 0x5fe1f0, kOrange = 0xff7a29,
+                            kText = 0xe6eef6, kMuted = 0x7f97b3, kKeyText = 0xc6d4e3;
+  static constexpr uint16_t kPadUp = 0x0001, kPadDown = 0x0002, kPadLeft = 0x0004,
+                            kPadRight = 0x0008, kPadStart = 0x0010, kPadA = 0x1000,
+                            kPadB = 0x2000, kPadX = 0x4000;
+
+  static ImU32 Color(uint32_t rgb, uint8_t alpha = 255) {
+    return IM_COL32((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF, alpha);
+  }
+  static ImFont* FindFont(const char* name) {
+    for (ImFont* font : ImGui::GetIO().Fonts->Fonts) {
+      if (std::strcmp(font->GetDebugName(), name) == 0) {
+        return font;
+      }
+    }
+    return nullptr;
+  }
+  // D-pad buttons, with the left stick (past half way) as the D-pad.
+  static uint16_t PadButtons() { return PadButtonsForDialog(); }
+
+  static int TypedCharFilter(ImGuiInputTextCallbackData* data) {
+    auto* self = static_cast<KeyboardInputDialog*>(data->UserData);
+    if (!self->closing_ && data->EventChar < 0x80) {
+      self->keyboard_.TypeChar(char(data->EventChar));
+    }
+    return 1;  // Discard: the model holds the text.
+  }
+
+  void Finish(bool cancelled) {
+    cancelled_ = cancelled;
+    closing_ = true;
+  }
+
+  void HandleInput(ImGuiIO& io) {
+    if (closing_) {
+      return;
+    }
+    // Physical keyboard (characters arrive through the hidden text field in
+    // Draw, which keeps SDL text input on).
+    (void)io;
+    if (ImGui::IsKeyPressed(ImGuiKey_Backspace)) {
+      keyboard_.Backspace();
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
+        ImGui::IsKeyPressed(ImGuiKey_KeypadEnter, false)) {
+      Finish(false);
+      return;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+      Finish(true);
+      return;
+    }
+    // Controller: nothing counts until every button was released once (the
+    // press that opened the prompt doesn't type or confirm).
+    const uint16_t pad = PadButtons() | StickAsDpad();
+    const uint16_t all = kPadUp | kPadDown | kPadLeft | kPadRight | kPadStart | kPadA | kPadB |
+                         kPadX;
+    if (!pad_armed_) {
+      pad_armed_ = (pad & all) == 0;
+      last_pad_ = pad;
+      return;
+    }
+    const uint16_t pressed = pad & ~last_pad_;
+    const double now = ImGui::GetTime();
+    const uint16_t dirs = pad & (kPadUp | kPadDown | kPadLeft | kPadRight);
+    bool move = false;
+    if (dirs != (last_pad_ & (kPadUp | kPadDown | kPadLeft | kPadRight))) {
+      move = dirs != 0;
+      next_repeat_ = now + 0.35;
+    } else if (dirs && now >= next_repeat_) {
+      move = true;
+      next_repeat_ = now + 0.09;
+    }
+    if (move) {
+      keyboard_.Move((dirs & kPadRight ? 1 : 0) - (dirs & kPadLeft ? 1 : 0),
+                     (dirs & kPadDown ? 1 : 0) - (dirs & kPadUp ? 1 : 0));
+    }
+    last_pad_ = pad;
+    if (pressed & kPadA) {
+      if (keyboard_.Press() == rex::ui::OnScreenKeyboard::Result::kDone) {
+        Finish(false);
+      }
+    } else if (pressed & kPadB) {
+      if (keyboard_.Back() == rex::ui::OnScreenKeyboard::Result::kCancel) {
+        Finish(true);
+      }
+    } else if (pressed & kPadX) {
+      keyboard_.Space();
+    } else if (pressed & kPadStart) {
+      Finish(false);
+    }
+  }
+
+  static uint16_t StickAsDpad() {
+#if REX_PLATFORM_WIN32
+    struct XInputState {
+      uint32_t packet;
+      uint16_t buttons;
+      uint8_t triggers[2];
+      int16_t thumbs[4];
+    };
+    using GetStateFn = uint32_t(__stdcall*)(uint32_t, XInputState*);
+    static GetStateFn get_state = [] {
+      for (const char* name : {"xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll"}) {
+        if (HMODULE module = LoadLibraryA(name)) {
+          return reinterpret_cast<GetStateFn>(GetProcAddress(module, "XInputGetState"));
+        }
+      }
+      return GetStateFn(nullptr);
+    }();
+    uint16_t dirs = 0;
+    for (uint32_t user = 0; get_state && user < 4; ++user) {
+      XInputState state{};
+      if (get_state(user, &state) != 0) continue;
+      const int x = state.thumbs[0], y = state.thumbs[1];
+      if (x > 16384) dirs |= kPadRight;
+      if (x < -16384) dirs |= kPadLeft;
+      if (y > 16384) dirs |= kPadUp;
+      if (y < -16384) dirs |= kPadDown;
+    }
+    return dirs;
+#else
+    return 0;
+#endif
+  }
+
+  void Draw(float scale, float width) {
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const ImVec2 origin = ImGui::GetWindowPos();
+    const float pad = 24.0f * scale;
+    // Typing on a physical keyboard: SDL sends text only while an ImGui text
+    // field is active, so an invisible one keeps focus; its character filter
+    // feeds the keyboard model and discards the character from the field.
+    ImGui::SetCursorPos(ImVec2(0.0f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.0f);
+    ImGui::SetNextItemWidth(1.0f);
+    if (!ImGui::IsAnyItemActive()) {
+      ImGui::SetKeyboardFocusHere();
+    }
+    char typing[2] = {};
+    ImGui::InputText("##typing", typing, sizeof(typing), ImGuiInputTextFlags_CallbackCharFilter,
+                     &TypedCharFilter, this);
+    ImGui::PopStyleVar();
+    ImGui::SetCursorPos(ImVec2(0.0f, 0.0f));
+
+    ImFont* display = FindFont("ReAmped Display");
+    ImFont* ui = FindFont("ReAmped UI");
+    ImFont* ui_bold = FindFont("ReAmped UI Bold");
+    const float rounding = 12.0f * scale;
+
+    // Header: gradient with a faint, static snowfall speckle.
+    const float header_h = 150.0f * scale;
+    draw->AddRectFilledMultiColor(origin, ImVec2(origin.x + width, origin.y + header_h),
+                                  Color(kHeader), Color(kHeader), Color(kNavy), Color(kNavy));
+    for (int i = 0; i < 70; ++i) {
+      const float fx = float((i * 7919) % 1000) / 1000.0f;
+      const float fy = float((i * 104729) % 1000) / 1000.0f;
+      draw->AddCircleFilled(ImVec2(origin.x + fx * width, origin.y + fy * header_h),
+                            (i % 3 == 0 ? 1.4f : 1.0f) * scale, Color(0xffffff, 45));
+    }
+    float y = origin.y + pad;
+
+    // Title (the game's prompt), small and upper case.
+    std::string title = title_;
+    for (char& c : title) c = char(std::toupper(static_cast<unsigned char>(c)));
+    ImGui::PushFont(ui_bold, 20.0f * scale);
+    draw->AddText(ImVec2(origin.x + pad, y), Color(kMuted), title.c_str());
+    ImGui::PopFont();
+    y += 34.0f * scale;
+
+    // The name, large, in a cyan-bordered field with an orange caret.
+    const float field_h = 72.0f * scale;
+    const ImVec2 f0(origin.x + pad, y), f1(origin.x + width - pad, y + field_h);
+    draw->AddRectFilled(f0, f1, Color(kField), 8.0f * scale);
+    draw->AddRect(f0, f1, Color(kCyan), 8.0f * scale, 0, 2.0f * scale);
+    const float name_size = 50.0f * scale;
+    ImGui::PushFont(display, name_size);
+    const ImVec2 text_size = ImGui::CalcTextSize(keyboard_.text().c_str());
+    const ImVec2 text_pos(f0.x + 16.0f * scale, f0.y + (field_h - name_size) * 0.5f);
+    draw->AddText(text_pos, Color(0xffffff), keyboard_.text().c_str());
+    ImGui::PopFont();
+    if (std::fmod(ImGui::GetTime(), 1.0) < 0.6) {
+      const float cx = text_pos.x + text_size.x + 4.0f * scale;
+      draw->AddRectFilled(ImVec2(cx, f0.y + 14.0f * scale), ImVec2(cx + 3.0f * scale, f1.y - 14.0f * scale),
+                          Color(kOrange));
+    }
+    y += field_h + 6.0f * scale;
+    const std::string count = fmt::format("{} / {}", keyboard_.text().size(),
+                                          max_length_ > 2 ? max_length_ - 2 : 0);
+    ImGui::PushFont(ui, 18.0f * scale);
+    const ImVec2 count_size = ImGui::CalcTextSize(count.c_str());
+    draw->AddText(ImVec2(f1.x - count_size.x, y), Color(kMuted), count.c_str());
+    ImGui::PopFont();
+    y += 30.0f * scale;
+
+    // Keyboard grid (10 columns).
+    const auto& layout = rex::ui::OnScreenKeyboard::Layout();
+    const float gap = 6.0f * scale;
+    const float key_w = (width - 2.0f * pad - 9.0f * gap) / 10.0f;
+    const float key_h = 46.0f * scale;
+    ImGui::PushFont(ui_bold, 22.0f * scale);
+    for (size_t r = 0; r < layout.size(); ++r) {
+      float x = origin.x + pad;
+      for (size_t k = 0; k < layout[r].size(); ++k) {
+        const auto& key = layout[r][k];
+        const float w = key_w * float(key.span) + gap * float(key.span - 1);
+        const ImVec2 k0(x, y), k1(x + w, y + key_h);
+        const bool highlighted = r == keyboard_.row() && k == keyboard_.key();
+        const bool ok = key.type == rex::ui::OnScreenKeyboard::KeyType::kOk;
+        uint32_t fill = ok ? kOrange : kField, label_color = ok ? 0xffffff : kKeyText;
+        if (highlighted) {
+          fill = kCyan;
+          label_color = kNavy;
+        }
+        draw->AddRectFilled(k0, k1, Color(fill), 6.0f * scale);
+        if (!highlighted) {
+          draw->AddRect(k0, k1, Color(ok ? kOrange : kBorder), 6.0f * scale);
+        }
+        std::string label;
+        switch (key.type) {
+          case rex::ui::OnScreenKeyboard::KeyType::kChar:
+            label.assign(1, keyboard_.upper()
+                                ? key.ch
+                                : char(std::tolower(static_cast<unsigned char>(key.ch))));
+            break;
+          case rex::ui::OnScreenKeyboard::KeyType::kShift:
+            label = keyboard_.upper() ? "abc" : "ABC";
+            break;
+          case rex::ui::OnScreenKeyboard::KeyType::kSpace:
+            label = "SPACE";
+            break;
+          case rex::ui::OnScreenKeyboard::KeyType::kBackspace:
+            label = "DEL";
+            break;
+          case rex::ui::OnScreenKeyboard::KeyType::kOk:
+            label = "OK";
+            break;
+        }
+        const ImVec2 ls = ImGui::CalcTextSize(label.c_str());
+        draw->AddText(ImVec2(k0.x + (w - ls.x) * 0.5f, k0.y + (key_h - ls.y) * 0.5f),
+                      Color(label_color), label.c_str());
+        // Mouse: click a key.
+        if (!closing_ && ImGui::IsMouseHoveringRect(k0, k1) && ImGui::IsMouseClicked(0)) {
+          keyboard_.Move(0, 0);
+          while (keyboard_.row() != r) keyboard_.Move(0, 1);
+          while (keyboard_.key() != k) keyboard_.Move(1, 0);
+          if (keyboard_.Press() == rex::ui::OnScreenKeyboard::Result::kDone) {
+            Finish(false);
+          }
+        }
+        x += w + gap;
+      }
+      y += key_h + gap;
+    }
+    ImGui::PopFont();
+
+    // Controller hints.
+    y += 8.0f * scale;
+    struct Hint {
+      const char* glyph;
+      uint32_t color;
+      const char* text;
+    };
+    const Hint hints[] = {{"A", 0x3fae3f, "Type"},
+                          {"B", 0xd43b3b, "Delete"},
+                          {"X", 0x2f6fd6, "Space"},
+                          {"=", 0x6b7685, "Done"}};
+    ImGui::PushFont(ui, 18.0f * scale);
+    float hints_w = 0.0f;
+    for (const Hint& h : hints) {
+      hints_w += 26.0f * scale + ImGui::CalcTextSize(h.text).x + 22.0f * scale;
+    }
+    float hx = origin.x + (width - hints_w) * 0.5f;
+    const float radius = 10.0f * scale;
+    for (const Hint& h : hints) {
+      const ImVec2 c(hx + radius, y + radius);
+      draw->AddCircleFilled(c, radius, Color(h.color));
+      const ImVec2 gs = ImGui::CalcTextSize(h.glyph);
+      draw->AddText(ImVec2(c.x - gs.x * 0.5f, c.y - gs.y * 0.5f), Color(0xffffff), h.glyph);
+      draw->AddText(ImVec2(hx + 26.0f * scale, y + radius - ImGui::CalcTextSize(h.text).y * 0.5f),
+                    Color(kKeyText), h.text);
+      hx += 26.0f * scale + ImGui::CalcTextSize(h.text).x + 22.0f * scale;
+    }
+    ImGui::PopFont();
+    y += 2.0f * radius + pad;
+    (void)rounding;
+    // Reserve the drawn height in the window.
+    ImGui::Dummy(ImVec2(width, y - origin.y));
+  }
+
   bool has_opened_ = false;
   std::string title_;
   std::string description_;
   std::string default_text_;
   size_t max_length_ = 0;
+  rex::ui::OnScreenKeyboard keyboard_;
   bool pad_armed_ = false;
-  uint16_t pad_pressed_ = 0;
-  std::vector<char> text_buffer_;
+  uint16_t last_pad_ = 0;
+  double next_repeat_ = 0.0;
+  bool closing_ = false;
   std::string text_ = "";
   bool cancelled_ = true;
 };

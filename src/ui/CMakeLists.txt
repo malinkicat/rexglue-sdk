@@ -10,6 +10,7 @@ set(REXUI_CORE_SOURCES
     immediate_drawer.cpp
     keybinds.cpp
     menu_item.cpp
+    on_screen_keyboard.cpp
     presenter.cpp
     renderdoc_api.cpp
     sdl_virtual_key.cpp

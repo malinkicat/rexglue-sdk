@@ -587,6 +587,26 @@ bool SharedMemory::EnsureHostGpuMemoryAllocated(uint32_t start, uint32_t length)
       page_first << page_size_log2_ >> host_gpu_memory_sparse_granularity_log2_;
   uint32_t allocation_last =
       page_last << page_size_log2_ >> host_gpu_memory_sparse_granularity_log2_;
+  // Fast path (requests on every draw): everything already allocated, checked a
+  // 64-bit word of the bitmap at a time.
+  {
+    const uint64_t* allocated = host_gpu_memory_sparse_allocated_.data();
+    bool all_allocated = true;
+    for (uint32_t word = allocation_first >> 6; all_allocated && word <= allocation_last >> 6;
+         ++word) {
+      uint64_t mask = ~uint64_t(0);
+      if (word == allocation_first >> 6) {
+        mask &= ~uint64_t(0) << (allocation_first & 63);
+      }
+      if (word == allocation_last >> 6) {
+        mask &= ~uint64_t(0) >> (63 - (allocation_last & 63));
+      }
+      all_allocated = (allocated[word] & mask) == mask;
+    }
+    if (all_allocated) {
+      return true;
+    }
+  }
   while (true) {
     std::pair<size_t, size_t> allocation_range =
         rex::bit::GetNextRangeUnset(host_gpu_memory_sparse_allocated_.data(), allocation_first,

@@ -181,8 +181,10 @@ void CommandProcessor::InvalidateGpuMemory() {}
 ReadbackResolveMode CommandProcessor::GetReadbackResolveMode(
     bool legacy_readback_resolve_enabled) const {
   ReadbackResolveMode shared_mode = ParseReadbackResolveMode(REXCVAR_GET(readback_resolve));
-  bool shared_mode_overrides_legacy = shared_mode != ReadbackResolveMode::kDisabled ||
-                                      rex::cvar::HasNonDefaultValue("readback_resolve");
+  // Looked up by name (a search through all cvars) - once, not on every resolve.
+  static const bool readback_resolve_set = rex::cvar::HasNonDefaultValue("readback_resolve");
+  bool shared_mode_overrides_legacy =
+      shared_mode != ReadbackResolveMode::kDisabled || readback_resolve_set;
   if (shared_mode_overrides_legacy) {
     return shared_mode;
   }

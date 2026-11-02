@@ -2524,10 +2524,15 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     // A video's frames don't all draw it (decoding lags now and then): it has
     // ended after 30 frames without.
     static int frames_without_video = 0;
+    // ...but 3D without a video for 3 frames in a row is the game proper (the
+    // in-engine story after its video): full screen at once, not with the
+    // video's bars for another half second.
+    static int scene_frames = 0;
     if (picture_frame_ && !scene_frame_) video_frame_ = true;  // a loading screen
+    scene_frames = scene_frame_ && !video_frame_ ? scene_frames + 1 : 0;
     picture_frame_ = scene_frame_ = false;
     frames_without_video = video_frame_ ? 0 : frames_without_video + 1;
-    const bool video = video_frame_ || (video_shown && frames_without_video < 30);
+    const bool video = video_frame_ || (video_shown && frames_without_video < 30 && scene_frames < 3);
     video_frame_ = video;
     if (video != video_shown) {
       if (video) letterbox_setting = REXCVAR_GET(present_letterbox);

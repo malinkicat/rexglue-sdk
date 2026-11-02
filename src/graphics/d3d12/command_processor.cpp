@@ -4927,8 +4927,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   // frame looks better than cut). The squeeze scales host clip space about
   // the viewport's centre, so the frame's edges land at k * (+-ndc_scale +
   // ndc_offset). HUD pinned to the screen's edges isn't clipped.
+  // Only draws whose viewport spans the frame: the frame's edges are found
+  // from the viewport, so a HUD element drawn into a viewport of its own (the
+  // score counter's numbers) had its own edges taken for the frame's and was
+  // cut down to a sliver.
+  const uint32_t frame_width = rex::perf::GetRenderInfo().frontbuffer_width * draw_resolution_scale_x;
   if (ultrawide_draw_ && ultrawide_ui_draw_ && ultrawide_pin_ == 0.0f && REXCVAR_GET(ultrawide_hud_clip) &&
-      viewport_info.xy_extent[0]) {
+      viewport_info.xy_extent[0] && (!frame_width || viewport_info.xy_extent[0] * 10 >= frame_width * 9)) {
     const float k = float(REXCVAR_GET(ultrawide_squeeze));
     auto column = [&](float edge) {
       const float ndc = k * (edge * viewport_info.ndc_scale[0] + viewport_info.ndc_offset[0]);

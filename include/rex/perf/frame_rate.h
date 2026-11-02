@@ -52,6 +52,9 @@ struct TextureCacheStats {
   std::atomic<uint64_t> replacement_hash_ns{0};
   std::atomic<uint64_t> replacement_decodes{0}; // image files decoded on the GPU thread
   std::atomic<uint64_t> replacement_decode_ns{0};
+  // Replacements decoded in the background (texture_replace_async).
+  std::atomic<uint64_t> replacement_async_loads{0};
+  std::atomic<uint64_t> replacement_async_ns{0};
   // Current values.
   std::atomic<uint64_t> memory_bytes{0};        // host memory of the cached textures
   std::atomic<uint32_t> limit_soft_mb{0};

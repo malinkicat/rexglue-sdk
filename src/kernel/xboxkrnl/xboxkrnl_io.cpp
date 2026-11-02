@@ -12,6 +12,7 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <rex/audio/user_music.h>
 #include <rex/filesystem/device.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
@@ -216,6 +217,11 @@ u32 NtReadFile_entry(u32 file_handle, u32 event_handle, mapped_void apc_routine_
       result = file->Read(buffer.guest_address(), buffer_length,
                           byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
                           &bytes_read, apc_context.guest_address());
+      // Where the title's songs land (the player's music replaces only them).
+      if (bytes_read) {
+        rex::audio::NoteTitleFileRead(REX_KERNEL_MEMORY()->GetPhysicalAddress(buffer.guest_address()),
+                                      bytes_read, file->name());
+      }
       if (io_status_block) {
         io_status_block->status = result;
         io_status_block->information = bytes_read;
@@ -319,6 +325,16 @@ u32 NtReadFileScatter_entry(u32 file_handle, u32 event_handle, mapped_void apc_r
       result = file->ReadScatter(segment_array.guest_address(), length,
                                  byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
                                  &bytes_read, apc_context.guest_address());
+      // Where the title's songs land, page by page (as ReadScatter reads).
+      {
+        auto* memory = REX_KERNEL_MEMORY();
+        const auto* segments =
+            reinterpret_cast<const rex::be<uint32_t>*>(memory->TranslateVirtual(segment_array.guest_address()));
+        for (uint32_t done = 0; done < bytes_read; done += 4096, ++segments) {
+          rex::audio::NoteTitleFileRead(memory->GetPhysicalAddress(*segments), std::min(4096u, bytes_read - done),
+                                        file->name());
+        }
+      }
       if (io_status_block) {
         io_status_block->status = result;
         io_status_block->information = bytes_read;

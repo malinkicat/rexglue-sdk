@@ -140,6 +140,16 @@ function(rexglue_configure_target target_name)
                 )
             endif()
         endforeach()
+        # NVIDIA DLSS runtime (cmake/rexglue_dlss.cmake), loaded by NGX from the
+        # executable's folder.
+        if(REXGLUE_DLSS_RUNTIME_DLL)
+            add_custom_command(TARGET ${target_name} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${REXGLUE_DLSS_RUNTIME_DLL}"
+                    $<TARGET_FILE_DIR:${target_name}>
+                VERBATIM
+            )
+        endif()
     endif()
 
     # Stage requested GPU emulation plugins next to the executable. Plugins

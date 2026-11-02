@@ -320,7 +320,41 @@ class D3D12Presenter final : public Presenter {
   uint32_t temporal_upscaler_max_output_width_ = 0;
   uint32_t temporal_upscaler_max_output_height_ = 0;
   bool temporal_upscaler_provider_logged_ = false;
+  // AMD FSR 3 frame generation (--frame_generation): its swap chain (which
+  // presents a generated frame between each two of ours) and context.
+  void* frame_generation_swap_chain_context_ = nullptr;
+  void* frame_generation_context_ = nullptr;
+  uint64_t frame_generation_frame_id_ = 0;
+  uint64_t frame_generation_inputs_serial_ = 0;
+  // The guest output's rectangle in the back buffer (x, y, width, height).
+  int32_t frame_generation_rect_[4] = {};
+  // Its depth and motion vector inputs (zero for now: placeholders until the
+  // GPU backend's scene depth and camera motion are passed on).
+  Microsoft::WRL::ComPtr<ID3D12Resource> frame_generation_depth_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> frame_generation_motion_;
+  // --frame_generation_present=own (pgr4-native's way): our own swap chain,
+  // each game frame presented as two FIFO presents (the generated frame, then
+  // the real one), so no AMD swap chain threads spin or present on their own
+  // clock.
+  bool frame_generation_own_ = false;
+  bool frame_generation_reset_ = true;  // this frame's inputs aren't new
+  uint64_t frame_generation_generated_ = 0;  // for the presents log
+  Microsoft::WRL::ComPtr<ID3D12Resource> frame_generation_image_;    // the real frame
+  Microsoft::WRL::ComPtr<ID3D12Resource> frame_generation_hudless_;  // it before our UI
+  Microsoft::WRL::ComPtr<ID3D12Resource> frame_generation_output_;   // the generated frame
+  // The second present's copy.
+  std::array<Microsoft::WRL::ComPtr<ID3D12CommandAllocator>, PaintContext::kSwapChainBufferCount>
+      frame_generation_allocators_;
+  Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> frame_generation_list_;
+  bool CreateFrameGeneration(uint32_t width, uint32_t height);
+  void DestroyFrameGeneration();
+  void PrepareFrameGeneration(ID3D12GraphicsCommandList* command_list);
+  // Copies `from` to `to` (both in the PRESENT state, left in it).
+  static void CopyPresentable(ID3D12GraphicsCommandList* command_list, ID3D12Resource* from,
+                              ID3D12Resource* to);
 #endif
+  // Destroys the swap chain (and frame generation, which owns it if used).
+  void DestroySwapChainAndFrameGeneration();
 };
 
 }  // namespace rex::ui::d3d12

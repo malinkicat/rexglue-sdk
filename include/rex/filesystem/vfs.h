@@ -56,4 +56,8 @@ class VirtualFileSystem {
   bool ResolveSymbolicLink(const std::string_view path, std::string& result);
 };
 
+// Files in `overlay` replace those of the device mounted at `mount_path`
+// (read through ResolvePath). Set before the game opens files.
+void SetDeviceOverlay(const std::string_view mount_path, std::unique_ptr<Device> overlay);
+
 }  // namespace rex::filesystem

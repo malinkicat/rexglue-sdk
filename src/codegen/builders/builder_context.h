@@ -229,6 +229,8 @@ struct BuilderContext {
    * Falls back to symbol lookup for backward compatibility.
    * Handles special cases like setjmp/longjmp and __restgprlr_N functions.
    */
+  void emit_share_registers_out();
+  void emit_share_registers_in();
   void emit_function_call(uint32_t address);
 
   /**

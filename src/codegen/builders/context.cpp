@@ -172,6 +172,26 @@ const CallTarget* BuilderContext::findCallTarget(uint32_t site) const {
   return nullptr;
 }
 
+// The non-volatile locals to ctx, and back, around entering a share_registers
+// function (it keeps them in ctx).
+void BuilderContext::emit_share_registers_out() {
+  for (size_t i = 14; i < 32; ++i) println("\tctx.r{} = {};", i, r(i));
+  for (size_t i = 14; i < 32; ++i) println("\tctx.f{} = {};", i, f(i));
+  for (size_t i = 14; i < 128; ++i) {
+    if (i >= 32 && i < 64) continue;
+    println("\tctx.v{} = {};", i, v(i));
+  }
+}
+
+void BuilderContext::emit_share_registers_in() {
+  for (size_t i = 14; i < 32; ++i) println("\t{} = ctx.r{};", r(i), i);
+  for (size_t i = 14; i < 32; ++i) println("\t{} = ctx.f{};", f(i), i);
+  for (size_t i = 14; i < 128; ++i) {
+    if (i >= 32 && i < 64) continue;
+    println("\t{} = ctx.v{};", v(i), i);
+  }
+}
+
 void BuilderContext::emit_function_call(uint32_t address) {
   const auto& cfg = config();
 
@@ -213,16 +233,12 @@ void BuilderContext::emit_function_call(uint32_t address) {
       // them back afterwards. Only registers already localized here can be live at
       // this point, so that set is the whole live-in the funclet can see.
       if (targetFn->sharesRegisters() && localizeNonVolatiles()) {
-        for (size_t i = 14; i < 32; ++i) {
-          if (locals.r[i])
-            println("\tctx.r{} = r{};", i, i);
-        }
+        // All of them (not only those emitted so far: in a loop a register can
+        // be set in a block emitted after this call), r, f and v.
+        emit_share_registers_out();
         emitCtx.reference(name);
         println("\t{}(ctx, base);", name);
-        for (size_t i = 14; i < 32; ++i) {
-          if (locals.r[i])
-            println("\tr{} = ctx.r{};", i, i);
-        }
+        emit_share_registers_in();
         return;
       }
 
@@ -298,6 +314,12 @@ void BuilderContext::emit_conditional_branch(bool not_, std::string_view cond) {
           auto* targetFn = callTarget->asFunction();
           emitCtx.reference(targetFn->name());
           println("\tif ({}{}.{}) {{", not_ ? "!" : "", cr(insn.operands[0]), cond);
+          // As for a call: a share_registers target reads the non-volatiles
+          // this function holds in locals, so hand them over through ctx (it
+          // doesn't come back here, so nothing to take back).
+          if (targetFn->sharesRegisters() && localizeNonVolatiles()) {
+            emit_share_registers_out();
+          }
           println("\t\t{}(ctx, base);", targetFn->name());
           println("\t\treturn;");
           println("\t}}");

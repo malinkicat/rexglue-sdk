@@ -12,7 +12,10 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <atomic>
+
 #include <rex/audio/audio_system.h>
+#include <rex/audio/user_music.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
 #include <rex/hook.h>
@@ -34,16 +37,18 @@ u32 XAudioGetVoiceCategoryVolumeChangeMask_entry(mapped_void driver_ptr, mapped_
 
   rex::thread::Sleep(std::chrono::microseconds(1));
 
-  // Checking these bits to see if any voice volume changed.
-  // I think.
-  *out_ptr = 0;
+  // A bit per voice category whose volume changed since the last call. The
+  // system turns categories down (e.g. the title's background music while the
+  // player's own music plays, as the dashboard did on a real console).
+  static std::atomic<uint32_t> reported{0};
+  const uint32_t muted = rex::audio::GetMutedVoiceCategories();
+  *out_ptr = muted ^ reported.exchange(muted);
   return X_ERROR_SUCCESS;
 }
 
-u32 XAudioGetVoiceCategoryVolume_entry(u32 unk, mapped_f32 out_ptr) {
-  // Expects a floating point single. Volume %?
-  *out_ptr = 1.0f;
-
+u32 XAudioGetVoiceCategoryVolume_entry(u32 category, mapped_f32 out_ptr) {
+  // The category's volume, 0 to 1.
+  *out_ptr = category < 32 && ((rex::audio::GetMutedVoiceCategories() >> category) & 1) ? 0.0f : 1.0f;
   return X_ERROR_SUCCESS;
 }
 

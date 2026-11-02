@@ -10,12 +10,17 @@
  */
 
 #include <algorithm>
+#include <cstdio>
+#include <filesystem>
+#include <string>
+#include <vector>
 #include <climits>
 #include <cmath>
 #include <memory>
 #include <utility>
 
 #include <rex/assert.h>
+#include <rex/filesystem.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/math.h>
@@ -28,8 +33,26 @@
 #include <ffx_api/dx12/ffx_api_dx12.h>
 #include <ffx_api/ffx_api.h>
 #include <ffx_api/ffx_upscale.h>
+#include <ffx_api/ffx_framegeneration.h>
 #endif
 
+REXCVAR_DEFINE_BOOL(frame_generation, false, "UI/D3D12",
+                    "AMD FSR 3 frame generation: a generated frame between each two of the game's "
+                    "(e.g. 45 FPS shown as 90); needs AMD's signed amd_fidelityfx_dx12.dll");
+REXCVAR_DEFINE_STRING(frame_generation_present, "own", "UI/D3D12",
+                      "How frame generation presents: own (two vsynced presents per game frame from "
+                      "our swap chain, as pgr4-native does; light on the CPU, e.g. the Steam Deck) or "
+                      "amd (AMD's frame generation swap chain and its pacing threads)")
+    .allowed({"own", "amd"});
+REXCVAR_DEFINE_BOOL(frame_generation_spin, false, "UI/D3D12",
+                    "FSR 3 frame generation's pacing threads busy-wait (AMD's default); off = they "
+                    "sleep and wait on fences, leaving the CPU to the game (the Steam Deck)");
+REXCVAR_DEFINE_BOOL(frame_generation_debug, false, "UI/D3D12",
+                    "Debug: FSR 3 frame generation's tear and pacing lines");
+REXCVAR_DEFINE_INT32(frame_generation_dump, 0, "UI/D3D12",
+                     "Debug: save the next N frame pairs (each generated frame, then the game's frame "
+                     "after it) as BMP files in fgdump next to the executable; set it mid-game (the "
+                     "scripted \"set\" command) to catch motion");
 REXCVAR_DEFINE_BOOL(d3d12_allow_variable_refresh_rate_and_tearing, true, "UI/D3D12",
                     "Allow variable refresh rate and tearing");
 
@@ -353,6 +376,18 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
       is_vsync_implicit_out = false;
       return SurfacePaintConnectResult::kSuccessUnchanged;
     }
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+    // Frame generation's swap chain: created again at the new size.
+    if (frame_generation_swap_chain_context_) {
+      DestroySwapChainAndFrameGeneration();
+    } else if (frame_generation_own_) {
+      // Its context and images: made again at the new size below.
+      paint_context_.AwaitSwapChainUsageCompletion();
+      DestroyFrameGeneration();
+    }
+  }
+  if (paint_context_.swap_chain) {
+#endif
     paint_context_.AwaitSwapChainUsageCompletion();
     // Using the current swap_chain_allows_tearing_ value that's consistent with
     // the creation of the swap chain because ResizeBuffers can't toggle the
@@ -380,7 +415,7 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
     if (!swap_chain_resized) {
       REXLOG_ERROR("D3D12Presenter: Failed to resize a swap chain");
       // Failed to resize, retry creating from scratch.
-      paint_context_.DestroySwapChain();
+      DestroySwapChainAndFrameGeneration();
     }
   }
 
@@ -408,7 +443,14 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
     swap_chain_desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     swap_chain_desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
     swap_chain_desc.Flags = 0;
-    if (REXCVAR_GET(d3d12_allow_variable_refresh_rate_and_tearing) && dxgi_supports_tearing_) {
+    bool frame_generation_own = false;
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+    // Our own frame generation presents with vsync (FIFO), never tearing.
+    frame_generation_own =
+        REXCVAR_GET(frame_generation) && REXCVAR_GET(frame_generation_present) == "own";
+#endif
+    if (REXCVAR_GET(d3d12_allow_variable_refresh_rate_and_tearing) && dxgi_supports_tearing_ &&
+        !frame_generation_own) {
       // Allow tearing in borderless fullscreen to support variable refresh
       // rate.
       swap_chain_desc.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
@@ -420,8 +462,56 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
 #if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP | WINAPI_PARTITION_GAMES)
       case Surface::kTypeIndex_Win32Hwnd: {
         HWND surface_hwnd = static_cast<const Win32HwndSurface&>(new_surface).hwnd();
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+        if (frame_generation_own) {
+          frame_generation_own_ = true;
+          REXLOG_INFO("D3D12Presenter: FSR 3 frame generation, presented by us (two vsynced "
+                      "presents per frame)");
+        } else if (REXCVAR_GET(frame_generation)) {
+          // AMD's frame generation swap chain, presenting the generated frames.
+          DXGI_SWAP_CHAIN_FULLSCREEN_DESC fullscreen_desc = {};
+          fullscreen_desc.Windowed = TRUE;
+          IDXGISwapChain4* frame_generation_swap_chain = nullptr;
+          ffxCreateContextDescFrameGenerationSwapChainForHwndDX12 create_desc = {};
+          create_desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_FOR_HWND_DX12;
+          create_desc.swapchain = &frame_generation_swap_chain;
+          create_desc.hwnd = surface_hwnd;
+          create_desc.desc = &swap_chain_desc;
+          create_desc.fullscreenDesc = &fullscreen_desc;
+          create_desc.dxgiFactory = dxgi_factory;
+          create_desc.gameQueue = direct_queue;
+          ffxContext* context = reinterpret_cast<ffxContext*>(&frame_generation_swap_chain_context_);
+          if (ffxCreateContext(context, &create_desc.header, nullptr) == FFX_API_RETURN_OK &&
+              frame_generation_swap_chain) {
+            frame_generation_swap_chain->QueryInterface(IID_PPV_ARGS(&swap_chain_1));
+            frame_generation_swap_chain->Release();
+            REXLOG_INFO("D3D12Presenter: FSR 3 frame generation swap chain");
+            if (!REXCVAR_GET(frame_generation_spin)) {
+              FfxApiSwapchainFramePacingTuning tuning = {};
+              tuning.safetyMarginInMs = 0.1f;
+              tuning.varianceFactor = 0.1f;
+              tuning.allowHybridSpin = true;
+              tuning.hybridSpinTime = 2;
+              tuning.allowWaitForSingleObjectOnFence = true;
+              ffxConfigureDescFrameGenerationSwapChainKeyValueDX12 key_value = {};
+              key_value.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATIONSWAPCHAIN_KEYVALUE_DX12;
+              key_value.key = FFX_API_CONFIGURE_FG_SWAPCHAIN_KEY_FRAMEPACINGTUNING;
+              key_value.ptr = &tuning;
+              ffxConfigure(context, &key_value.header);
+            }
+          } else {
+            frame_generation_swap_chain_context_ = nullptr;
+            REXLOG_WARN("D3D12Presenter: FSR 3 frame generation isn't available (needs AMD's signed "
+                        "amd_fidelityfx_dx12.dll); presenting normally");
+          }
+        }
+        if (!swap_chain_1 &&
+            FAILED(dxgi_factory->CreateSwapChainForHwnd(
+                direct_queue, surface_hwnd, &swap_chain_desc, nullptr, nullptr, &swap_chain_1))) {
+#else
         if (FAILED(dxgi_factory->CreateSwapChainForHwnd(
                 direct_queue, surface_hwnd, &swap_chain_desc, nullptr, nullptr, &swap_chain_1))) {
+#endif
           REXLOG_ERROR("D3D12Presenter: Failed to create a swap chain for the HWND");
           return SurfacePaintConnectResult::kFailure;
         }
@@ -455,11 +545,18 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
               i, IID_PPV_ARGS(&paint_context_.swap_chain_buffers[i])))) {
         REXLOG_ERROR("D3D12Presenter: Failed to get buffer {} of a {}-buffer swap chain", i,
                      PaintContext::kSwapChainBufferCount);
-        paint_context_.DestroySwapChain();
+        DestroySwapChainAndFrameGeneration();
         return SurfacePaintConnectResult::kFailure;
       }
     }
   }
+
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+  if ((frame_generation_swap_chain_context_ || frame_generation_own_) && !frame_generation_context_ &&
+      !CreateFrameGeneration(paint_context_.swap_chain_width, paint_context_.swap_chain_height)) {
+    REXLOG_WARN("D3D12Presenter: FSR 3 frame generation context creation failed");
+  }
+#endif
 
   ID3D12Device* device = provider_.GetDevice();
 
@@ -483,7 +580,7 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
 }
 
 void D3D12Presenter::DisconnectPaintingFromSurfaceFromUIThreadImpl() {
-  paint_context_.DestroySwapChain();
+  DestroySwapChainAndFrameGeneration();
 }
 
 bool D3D12Presenter::RefreshGuestOutputImpl(
@@ -547,6 +644,408 @@ void D3D12Presenter::RefreshGuestOutputImplFinish(uint32_t mailbox_index) {
       guest_output_resource_refresher_submission_tracker_.GetCurrentSubmission();
   guest_output_resource_refresher_submission_tracker_.NextSubmission();
 }
+
+void D3D12Presenter::DestroySwapChainAndFrameGeneration() {
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+  paint_context_.AwaitSwapChainUsageCompletion();
+  DestroyFrameGeneration();
+#endif
+  paint_context_.DestroySwapChain();
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+  frame_generation_own_ = false;
+  if (frame_generation_swap_chain_context_) {
+    ffxDestroyContext(reinterpret_cast<ffxContext*>(&frame_generation_swap_chain_context_), nullptr);
+    frame_generation_swap_chain_context_ = nullptr;
+  }
+#endif
+}
+
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+bool D3D12Presenter::CreateFrameGeneration(uint32_t width, uint32_t height) {
+  ID3D12Device* device = provider_.GetDevice();
+  ffxCreateBackendDX12Desc backend_desc = {};
+  backend_desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
+  backend_desc.device = device;
+  ffxCreateContextDescFrameGeneration create_desc = {};
+  create_desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
+  create_desc.header.pNext = &backend_desc.header;
+  create_desc.flags = REXCVAR_GET(frame_generation_debug) ? FFX_FRAMEGENERATION_ENABLE_DEBUG_CHECKING : 0;
+  create_desc.displaySize = {width, height};
+  create_desc.maxRenderSize = {width, height};
+  create_desc.backBufferFormat = ffxApiGetSurfaceFormatDX12(kSwapChainFormat);
+  if (ffxCreateContext(reinterpret_cast<ffxContext*>(&frame_generation_context_), &create_desc.header,
+                       nullptr) != FFX_API_RETURN_OK) {
+    frame_generation_context_ = nullptr;
+    return false;
+  }
+  // Placeholder inputs: zero depth and zero motion (committed resources are
+  // created zeroed).
+  D3D12_HEAP_PROPERTIES heap_properties = {};
+  heap_properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = width;
+  desc.Height = height;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 1;
+  desc.SampleDesc.Count = 1;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+  desc.Format = DXGI_FORMAT_R32_FLOAT;
+  device->CreateCommittedResource(&heap_properties, D3D12_HEAP_FLAG_NONE, &desc,
+                                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                                  IID_PPV_ARGS(&frame_generation_depth_));
+  desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+  device->CreateCommittedResource(&heap_properties, D3D12_HEAP_FLAG_NONE, &desc,
+                                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                                  IID_PPV_ARGS(&frame_generation_motion_));
+  frame_generation_frame_id_ = 0;
+  if (frame_generation_own_) {
+    desc.Format = kSwapChainFormat;
+    bool created = true;
+    Microsoft::WRL::ComPtr<ID3D12Resource>* images[] = {std::addressof(frame_generation_image_),
+                                                         std::addressof(frame_generation_hudless_),
+                                                         std::addressof(frame_generation_output_)};
+    for (auto* image : images) {
+      desc.Flags = image == images[2] ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
+      created = created && SUCCEEDED(device->CreateCommittedResource(
+                               &heap_properties, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
+                               nullptr, IID_PPV_ARGS(image->ReleaseAndGetAddressOf())));
+    }
+    for (auto& allocator : frame_generation_allocators_) {
+      created = created && SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                                    IID_PPV_ARGS(&allocator)));
+    }
+    created = created && SUCCEEDED(device->CreateCommandList(
+                             0, D3D12_COMMAND_LIST_TYPE_DIRECT, frame_generation_allocators_[0].Get(),
+                             nullptr, IID_PPV_ARGS(&frame_generation_list_)));
+    if (!created) {
+      REXLOG_WARN("D3D12Presenter: FSR 3 frame generation: couldn't create its images");
+      DestroyFrameGeneration();
+      return false;
+    }
+    frame_generation_list_->Close();
+  }
+  // The GPU backend's scene depth and camera motion vectors.
+  if (HMODULE gpu = GetModuleHandleA("rexgpu-xenos.dll")) {
+    if (auto request = reinterpret_cast<void (*)(int32_t)>(
+            GetProcAddress(gpu, "ReXRequestFrameGenerationInputs"))) {
+      request(1);
+    }
+  }
+  REXLOG_INFO("D3D12Presenter: FSR 3 frame generation at {}x{}", width, height);
+  return frame_generation_depth_ && frame_generation_motion_;
+}
+
+void D3D12Presenter::DestroyFrameGeneration() {
+  if (HMODULE gpu = GetModuleHandleA("rexgpu-xenos.dll")) {
+    if (auto request = reinterpret_cast<void (*)(int32_t)>(
+            GetProcAddress(gpu, "ReXRequestFrameGenerationInputs"))) {
+      request(0);
+    }
+  }
+  if (frame_generation_context_) {
+    ffxDestroyContext(reinterpret_cast<ffxContext*>(&frame_generation_context_), nullptr);
+    frame_generation_context_ = nullptr;
+  }
+  frame_generation_depth_.Reset();
+  frame_generation_motion_.Reset();
+  frame_generation_image_.Reset();
+  frame_generation_hudless_.Reset();
+  frame_generation_output_.Reset();
+  frame_generation_list_.Reset();
+  for (auto& allocator : frame_generation_allocators_) {
+    allocator.Reset();
+  }
+}
+
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+namespace {
+// --frame_generation_dump (file scope: D3D12Presenter's layout is left alone).
+struct FrameGenerationDump {
+  std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> buffers;  // generated, real, generated, real...
+  std::vector<bool> generated;  // per pair: a frame was generated (not a reset)
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+  uint32_t width = 0, height = 0;
+  size_t taken = 0;  // pairs copied
+  bool active = false;
+  bool write_pending = false;
+};
+FrameGenerationDump g_fg_dump;
+
+void CopyToReadback(ID3D12GraphicsCommandList* list, ID3D12Resource* from, ID3D12Resource* to,
+                    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint) {
+  D3D12_RESOURCE_BARRIER barrier = {};
+  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  barrier.Transition.pResource = from;
+  barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+  barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  list->ResourceBarrier(1, &barrier);
+  D3D12_TEXTURE_COPY_LOCATION dest = {}, source = {};
+  dest.pResource = to;
+  dest.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  dest.PlacedFootprint = footprint;
+  source.pResource = from;
+  source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  list->CopyTextureRegion(&dest, 0, 0, 0, &source, nullptr);
+  std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+  list->ResourceBarrier(1, &barrier);
+}
+
+// A B8G8R8A8 readback buffer as a 32-bit top-down BMP.
+void WriteBmp(ID3D12Resource* buffer, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint, uint32_t width,
+              uint32_t height, const std::filesystem::path& path) {
+  void* mapped = nullptr;
+  const D3D12_RANGE read = {0, SIZE_T(footprint.Footprint.RowPitch) * height};
+  if (FAILED(buffer->Map(0, &read, &mapped))) return;
+  FILE* file = nullptr;
+  if (_wfopen_s(&file, path.wstring().c_str(), L"wb") == 0 && file) {
+    const uint32_t image_size = width * height * 4;
+    uint8_t header[54] = {'B', 'M'};
+    auto put32 = [&](int at, uint32_t v) {
+      for (int i = 0; i < 4; ++i) header[at + i] = uint8_t(v >> (8 * i));
+    };
+    put32(2, 54 + image_size);
+    put32(10, 54);
+    put32(14, 40);
+    put32(18, width);
+    put32(22, uint32_t(-int32_t(height)));  // top-down
+    header[26] = 1;
+    header[28] = 32;
+    put32(34, image_size);
+    std::fwrite(header, 1, sizeof(header), file);
+    const uint8_t* bytes = static_cast<const uint8_t*>(mapped) + footprint.Offset;
+    for (uint32_t y = 0; y < height; ++y) std::fwrite(bytes + size_t(y) * footprint.Footprint.RowPitch, 1, width * 4, file);
+    std::fclose(file);
+  }
+  const D3D12_RANGE written = {0, 0};
+  buffer->Unmap(0, &written);
+}
+}  // namespace
+#endif
+
+void D3D12Presenter::CopyPresentable(ID3D12GraphicsCommandList* command_list, ID3D12Resource* from,
+                                     ID3D12Resource* to) {
+  D3D12_RESOURCE_BARRIER barriers[2] = {};
+  for (int i = 0; i < 2; ++i) {
+    barriers[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barriers[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barriers[i].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+  }
+  barriers[0].Transition.pResource = from;
+  barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  barriers[1].Transition.pResource = to;
+  barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+  command_list->ResourceBarrier(2, barriers);
+  command_list->CopyResource(to, from);
+  for (auto& barrier : barriers) {
+    std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+  }
+  command_list->ResourceBarrier(2, barriers);
+}
+
+void D3D12Presenter::PrepareFrameGeneration(ID3D12GraphicsCommandList* command_list) {
+  ++frame_generation_frame_id_;
+  const uint32_t width = paint_context_.swap_chain_width;
+  const uint32_t height = paint_context_.swap_chain_height;
+  const uint32_t debug_flags = REXCVAR_GET(frame_generation_debug)
+                                   ? (FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_TEAR_LINES |
+                                      FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_PACING_LINES)
+                                   : 0;
+  ffxConfigureDescFrameGeneration config = {};
+  config.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+  if (frame_generation_own_) {
+    // Generation only: dispatched below and presented by us.
+    config.HUDLessColor =
+        ffxApiGetResourceDX12(frame_generation_hudless_.Get(), FFX_API_RESOURCE_STATE_PRESENT);
+  } else {
+    config.swapChain = paint_context_.swap_chain.Get();
+    config.frameGenerationCallback = [](ffxDispatchDescFrameGeneration* params,
+                                        void* user_context) -> ffxReturnCode_t {
+      return ffxDispatch(reinterpret_cast<ffxContext*>(user_context), &params->header);
+    };
+    config.frameGenerationCallbackUserContext = &frame_generation_context_;
+  }
+  config.frameGenerationEnabled = true;
+  config.allowAsyncWorkloads = false;
+  config.flags = debug_flags;
+  if (frame_generation_own_) {
+    // Debug: the generated frames show FidelityFX's debug view (the tear and
+    // pacing lines are the AMD swap chain's).
+    config.flags |= FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY |
+                    (REXCVAR_GET(frame_generation_debug) ? FFX_FRAMEGENERATION_FLAG_DRAW_DEBUG_VIEW : 0);
+  }
+  if (frame_generation_rect_[2] > 0 && frame_generation_rect_[3] > 0) {
+    config.generationRect = {frame_generation_rect_[0], frame_generation_rect_[1], frame_generation_rect_[2],
+                             frame_generation_rect_[3]};
+  } else {
+    config.generationRect = {0, 0, int32_t(width), int32_t(height)};
+  }
+  config.frameID = frame_generation_frame_id_;
+  if (ffxConfigure(reinterpret_cast<ffxContext*>(&frame_generation_context_), &config.header) !=
+      FFX_API_RETURN_OK) {
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      REXLOG_WARN("D3D12Presenter: FSR 3 frame generation configuration failed");
+    }
+    frame_generation_reset_ = true;
+    return;
+  }
+  ffxDispatchDescFrameGenerationPrepareCameraInfo camera_info = {};
+  camera_info.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_CAMERAINFO;
+  camera_info.cameraUp[1] = 1.0f;
+  camera_info.cameraRight[0] = 1.0f;
+  camera_info.cameraForward[2] = 1.0f;
+  ffxDispatchDescFrameGenerationPrepare prepare = {};
+  prepare.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE;
+  prepare.header.pNext = &camera_info.header;
+  prepare.frameID = frame_generation_frame_id_;
+  prepare.flags = debug_flags;
+  prepare.commandList = command_list;
+  // The scene's depth and camera motion (render-resolution pixels) when the
+  // GPU backend has them, else zero motion.
+  ID3D12Resource* depth = frame_generation_depth_.Get();
+  ID3D12Resource* motion = frame_generation_motion_.Get();
+  uint32_t render_width = width, render_height = height;
+  bool inputs_reset = true;
+  static const auto get_inputs = [] {
+    HMODULE gpu = GetModuleHandleA("rexgpu-xenos.dll");
+    return gpu ? reinterpret_cast<int32_t (*)(ID3D12Resource**, ID3D12Resource**, uint32_t*, uint32_t*,
+                                              int32_t*, uint64_t*)>(
+                     GetProcAddress(gpu, "ReXGetFrameGenerationInputs"))
+               : nullptr;
+  }();
+  {
+    ID3D12Resource* scene_depth;
+    ID3D12Resource* scene_motion;
+    uint32_t scene_width, scene_height;
+    int32_t scene_reset;
+    uint64_t serial;
+    if (get_inputs && get_inputs(&scene_depth, &scene_motion, &scene_width, &scene_height, &scene_reset,
+                                 &serial)) {
+      depth = scene_depth;
+      motion = scene_motion;
+      render_width = scene_width;
+      render_height = scene_height;
+      // Not new (no scene this frame, e.g. a menu): no motion to trust.
+      inputs_reset = scene_reset || serial == frame_generation_inputs_serial_;
+      frame_generation_inputs_serial_ = serial;
+    }
+  }
+  frame_generation_reset_ = inputs_reset;
+  prepare.unused_reset = inputs_reset;
+  prepare.renderSize = {render_width, render_height};
+  prepare.jitterOffset = {0.0f, 0.0f};
+  prepare.motionVectorScale = {1.0f, 1.0f};
+  prepare.frameTimeDelta = 1000.0f / 45.0f;
+  prepare.cameraNear = 0.1f;
+  prepare.cameraFar = 1000.0f;
+  prepare.cameraFovAngleVertical = 1.0f;
+  prepare.viewSpaceToMetersFactor = 1.0f;
+  prepare.depth = ffxApiGetResourceDX12(depth, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+  prepare.motionVectors = ffxApiGetResourceDX12(motion, FFX_API_RESOURCE_STATE_COMPUTE_READ);
+  if (ffxDispatch(reinterpret_cast<ffxContext*>(&frame_generation_context_), &prepare.header) !=
+      FFX_API_RETURN_OK) {
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      REXLOG_WARN("D3D12Presenter: FSR 3 frame generation prepare failed");
+    }
+    frame_generation_reset_ = true;
+    return;
+  }
+  if (!frame_generation_own_) {
+    return;
+  }
+  // The frame between the last one and this (its inputs aren't new: this one
+  // again, e.g. in menus and loading).
+  ID3D12Resource* generated = frame_generation_image_.Get();
+  if (!frame_generation_reset_) {
+    ffxDispatchDescFrameGeneration generate = {};
+    generate.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION;
+    generate.commandList = command_list;
+    generate.presentColor =
+        ffxApiGetResourceDX12(frame_generation_image_.Get(), FFX_API_RESOURCE_STATE_PRESENT);
+    generate.outputs[0] =
+        ffxApiGetResourceDX12(frame_generation_output_.Get(), FFX_API_RESOURCE_STATE_PRESENT);
+    generate.numGeneratedFrames = 1;
+    generate.backbufferTransferFunction = FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
+    generate.generationRect = config.generationRect;
+    generate.frameID = frame_generation_frame_id_;
+    if (ffxDispatch(reinterpret_cast<ffxContext*>(&frame_generation_context_), &generate.header) ==
+        FFX_API_RETURN_OK) {
+      generated = frame_generation_output_.Get();
+      ++frame_generation_generated_;
+    } else {
+      static bool logged = false;
+      if (!logged) {
+        logged = true;
+        REXLOG_WARN("D3D12Presenter: FSR 3 frame generation dispatch failed");
+      }
+    }
+  }
+  // --frame_generation_dump: the pairs are copied for N frames, then written
+  // (after the GPU is done with them) at the next frame.
+  if (g_fg_dump.write_pending) {
+    paint_context_.paint_submission_tracker.AwaitAllSubmissionsCompletion();
+    const std::filesystem::path folder = rex::filesystem::GetExecutableFolder() / "fgdump";
+    std::error_code ec;
+    std::filesystem::create_directories(folder, ec);
+    static int dump_number = 0;
+    ++dump_number;
+    for (size_t i = 0; i < g_fg_dump.buffers.size(); ++i) {
+      char name[64];
+      std::snprintf(name, sizeof(name), "%d_%03zu_%s.bmp", dump_number, i,
+                    i % 2 ? "real" : g_fg_dump.generated[i / 2] ? "generated" : "notgenerated");
+      WriteBmp(g_fg_dump.buffers[i].Get(), g_fg_dump.footprint, g_fg_dump.width, g_fg_dump.height, folder / name);
+    }
+    REXLOG_INFO("D3D12Presenter: frame generation dump: {} frames written to {}", g_fg_dump.buffers.size(),
+                folder.string());
+    g_fg_dump = {};
+  }
+  if (!g_fg_dump.active && REXCVAR_GET(frame_generation_dump) > 0) {
+    const size_t pairs = size_t(std::min(REXCVAR_GET(frame_generation_dump), 64));
+    rex::cvar::SetFlagByName("frame_generation_dump", "0");
+    ID3D12Device* device = provider_.GetDevice();
+    const D3D12_RESOURCE_DESC desc = frame_generation_image_->GetDesc();
+    UINT64 size = 0;
+    device->GetCopyableFootprints(&desc, 0, 1, 0, &g_fg_dump.footprint, nullptr, nullptr, &size);
+    D3D12_RESOURCE_DESC buffer_desc;
+    util::FillBufferResourceDesc(buffer_desc, size, D3D12_RESOURCE_FLAG_NONE);
+    g_fg_dump.buffers.resize(pairs * 2);
+    bool ok = true;
+    for (auto& buffer : g_fg_dump.buffers) {
+      ok = ok && SUCCEEDED(device->CreateCommittedResource(&util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE,
+                                                           &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                           IID_PPV_ARGS(&buffer)));
+    }
+    if (ok) {
+      g_fg_dump.width = uint32_t(desc.Width);
+      g_fg_dump.height = desc.Height;
+      g_fg_dump.active = true;
+    } else {
+      g_fg_dump = {};
+    }
+  }
+  if (g_fg_dump.active) {
+    const size_t k = g_fg_dump.taken++;
+    g_fg_dump.generated.push_back(generated != frame_generation_image_.Get());
+    CopyToReadback(command_list, generated, g_fg_dump.buffers[k * 2].Get(), g_fg_dump.footprint);
+    CopyToReadback(command_list, frame_generation_image_.Get(), g_fg_dump.buffers[k * 2 + 1].Get(),
+                   g_fg_dump.footprint);
+    if (g_fg_dump.taken * 2 == g_fg_dump.buffers.size()) {
+      g_fg_dump.active = false;
+      g_fg_dump.write_pending = true;
+    }
+  }
+  // Presented first, from the back buffer (the real frame is kept in the image).
+  CopyPresentable(command_list,
+                  generated,
+                  paint_context_.swap_chain_buffers[paint_context_.swap_chain->GetCurrentBackBufferIndex()].Get());
+}
+#endif
 
 void D3D12Presenter::PaintContext::DestroySwapChain() {
   if (!swap_chain) {
@@ -614,6 +1113,16 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
         guest_output_properties, paint_context_.swap_chain_width, paint_context_.swap_chain_height,
         D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION, D3D12_REQ_TEXTURE2D_U_OR_V_DIMENSION,
         guest_output_paint_config);
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+    if (guest_output_flow.effect_count) {
+      frame_generation_rect_[0] = guest_output_flow.output_x;
+      frame_generation_rect_[1] = guest_output_flow.output_y;
+      frame_generation_rect_[2] =
+          int32_t(guest_output_flow.effect_output_sizes[guest_output_flow.effect_count - 1].first);
+      frame_generation_rect_[3] =
+          int32_t(guest_output_flow.effect_output_sizes[guest_output_flow.effect_count - 1].second);
+    }
+#endif
 
     // Check if all guest output paint effects are supported by the
     // implementation.
@@ -1124,6 +1633,24 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
     back_buffer_clear_needed = false;
   }
 
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+  const bool frame_generation_own = frame_generation_own_ && frame_generation_context_;
+  if (frame_generation_own) {
+    // The frame before our UI, so generation keeps the UI out of the
+    // interpolation (HUDLessColor).
+    D3D12_RESOURCE_BARRIER barrier = {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = back_buffer;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    command_list->ResourceBarrier(1, &barrier);
+    CopyPresentable(command_list, back_buffer, frame_generation_hudless_.Get());
+    std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+    command_list->ResourceBarrier(1, &barrier);
+  }
+#endif
+
   if (execute_ui_drawers) {
     // Draw the UI.
     if (!back_buffer_bound) {
@@ -1147,6 +1674,16 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   barrier_rtv_to_present.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
   command_list->ResourceBarrier(1, &barrier_rtv_to_present);
 
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+  if (frame_generation_own) {
+    // The real frame, presented second.
+    CopyPresentable(command_list, back_buffer, frame_generation_image_.Get());
+  }
+  if (frame_generation_context_) {
+    PrepareFrameGeneration(command_list);
+  }
+#endif
+
   // Execute and present.
   command_list->Close();
   ID3D12CommandList* execute_command_list = command_list;
@@ -1154,6 +1691,30 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   if (execute_ui_drawers) {
     ui_submission_tracker_.NextSubmission();
   }
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+  if (frame_generation_own) {
+    // The generated frame, then the real one, each shown for a refresh (FIFO:
+    // the second waits for the first's vblank, which paces the game to half
+    // the display's rate). The paint submission ends after the second copy.
+    HRESULT generated_result = paint_context_.swap_chain->Present(1, 0);
+    paint_context_.present_submission_tracker.NextSubmission();
+    if (FAILED(generated_result)) {
+      paint_context_.paint_submission_tracker.NextSubmission();
+      return generated_result == DXGI_ERROR_DEVICE_REMOVED  ? PaintResult::kGpuLostExternally
+             : generated_result == DXGI_ERROR_DEVICE_RESET ? PaintResult::kGpuLostResponsible
+                                                           : PaintResult::kNotPresented;
+    }
+    ID3D12CommandAllocator* allocator =
+        frame_generation_allocators_[current_paint_submission % frame_generation_allocators_.size()].Get();
+    allocator->Reset();
+    frame_generation_list_->Reset(allocator, nullptr);
+    CopyPresentable(frame_generation_list_.Get(), frame_generation_image_.Get(),
+                    paint_context_.swap_chain_buffers[paint_context_.swap_chain->GetCurrentBackBufferIndex()].Get());
+    frame_generation_list_->Close();
+    execute_command_list = frame_generation_list_.Get();
+    provider_.GetDirectQueue()->ExecuteCommandLists(1, &execute_command_list);
+  }
+#endif
   paint_context_.paint_submission_tracker.NextSubmission();
   // Present as soon as possible, without waiting for vsync (the host refresh
   // rate may be something like 144 Hz, which is not a multiple of the common
@@ -1163,9 +1724,44 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   // fullscreen is ever used in, the allow tearing flag must not be passed in
   // fullscreen, but DXGI fullscreen is largely unneeded with the flip
   // presentation model used in Direct3D 12).
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+  HRESULT present_result =
+      frame_generation_own
+          ? paint_context_.swap_chain->Present(1, 0)
+          : paint_context_.swap_chain->Present(
+                0, DXGI_PRESENT_RESTART |
+                       (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
+#else
   HRESULT present_result = paint_context_.swap_chain->Present(
       0, DXGI_PRESENT_RESTART |
              (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
+#endif
+#if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
+  // Frame generation: the swap chain's real presents per second (ours plus the
+  // generated ones), once every 2 s.
+  if (frame_generation_swap_chain_context_ || frame_generation_own) {
+    static uint64_t last_ms = 0, our_presents = 0;
+    static UINT last_present_count = 0;
+    ++our_presents;
+    const uint64_t now_ms = GetTickCount64();
+    if (now_ms - last_ms >= 2000) {
+      DXGI_FRAME_STATISTICS stats = {};
+      if (SUCCEEDED(paint_context_.swap_chain->GetFrameStatistics(&stats))) {
+        if (last_ms) {
+          const double seconds = (now_ms - last_ms) / 1000.0;
+          REXLOG_INFO("D3D12Presenter: frame generation: {:.1f} game frames/s, {:.1f} presented/s, "
+                      "{:.1f} generated/s",
+                      our_presents / seconds, (stats.PresentCount - last_present_count) / seconds,
+                      frame_generation_generated_ / seconds);
+        }
+        last_present_count = stats.PresentCount;
+      }
+      last_ms = now_ms;
+      our_presents = 0;
+      frame_generation_generated_ = 0;
+    }
+  }
+#endif
   // Even if presentation has failed, work might have been enqueued anyway
   // internally before the failure according to Jesse Natalie from the DirectX
   // Discord server.

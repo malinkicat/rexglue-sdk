@@ -66,3 +66,6 @@
 [submodule "thirdparty/tracy"]
 	path = thirdparty/tracy
 	url = https://github.com/wolfpld/tracy.git
+[submodule "thirdparty/smaa"]
+	path = thirdparty/smaa
+	url = https://github.com/iryoku/smaa.git

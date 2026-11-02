@@ -18,6 +18,7 @@
 #include <rex/audio/downmix.h>
 #include <rex/audio/flags.h>
 #include <rex/audio/sdl/sdl_audio_driver.h>
+#include <rex/audio/user_music.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
@@ -123,6 +124,8 @@ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
   }
 
   std::memcpy(output_frame, input_frame, frame_samples_ * sizeof(float));
+  // The player's own music (--user_music), into the front left and right.
+  MixUserMusic(output_frame, channel_samples_);
 
   static uint32_t sdl_submit_count = 0;
   if (sdl_submit_count < 10) {

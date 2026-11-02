@@ -10,7 +10,10 @@
  */
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
+#include <string>
+#include <utility>
 
 #include <rex/dbg.h>
 #include <rex/input/device_assignment.h>
@@ -28,9 +31,58 @@ REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput
     .allowed({"sdl", "xinput"});
 
 REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
+REXCVAR_DEFINE_STRING(pad_button_map, "", "Input",
+                      "Controller button remap for real pads: physical=game pairs, e.g. A=B,B=A "
+                      "(names: A B X Y LB RB Back Start LS RS Up Down Left Right)");
 namespace rex::input {
 
 namespace {
+
+// --pad_button_map: for each physical button bit, the bit the game sees.
+struct ButtonMap {
+  std::string source;
+  uint16_t to[16];
+};
+
+uint16_t ButtonBit(std::string name) {
+  for (char& c : name) c = char(std::tolower(static_cast<unsigned char>(c)));
+  static const std::pair<const char*, uint16_t> kNames[] = {
+      {"up", 0x0001},    {"down", 0x0002}, {"left", 0x0004}, {"right", 0x0008}, {"start", 0x0010},
+      {"back", 0x0020},  {"ls", 0x0040},   {"rs", 0x0080},   {"lb", 0x0100},    {"rb", 0x0200},
+      {"a", 0x1000},     {"b", 0x2000},    {"x", 0x4000},    {"y", 0x8000}};
+  for (const auto& [n, bit] : kNames) {
+    if (name == n) return bit;
+  }
+  return 0;
+}
+
+uint16_t RemapButtons(uint16_t buttons) {
+  thread_local ButtonMap map = {"\x01", {}};  // per thread: GetState runs on several
+  const std::string& source = REXCVAR_GET(pad_button_map);
+  if (map.source != source) {
+    map.source = source;
+    for (int i = 0; i < 16; ++i) map.to[i] = uint16_t(1u << i);
+    size_t pos = 0;
+    while (pos <= source.size()) {
+      const size_t end = std::min(source.find(',', pos), source.size());
+      const std::string pair = source.substr(pos, end - pos);
+      const size_t eq = pair.find('=');
+      if (eq != std::string::npos) {
+        const uint16_t from = ButtonBit(pair.substr(0, eq)), to = ButtonBit(pair.substr(eq + 1));
+        for (int i = 0; i < 16; ++i) {
+          if (from == (1u << i) && to) map.to[i] = to;
+        }
+      }
+      pos = end + 1;
+    }
+  }
+  if (source.empty()) return buttons;
+  uint16_t out = 0;
+  for (int i = 0; i < 16; ++i) {
+    if (buttons & (1u << i)) out |= map.to[i];
+  }
+  return out;
+}
 
 // Synthetic devices are parked past every physical ordinal so they cannot push
 // a real pad off guest user 0. SlotAssignment routes them by their synthetic
@@ -232,6 +284,12 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
     X_INPUT_STATE state = {};
     if (driver->GetDeviceState(id, &state) != X_ERROR_SUCCESS) {
       continue;
+    }
+    // Real pads only: keyboard emulation has its own keybinds, and a game's
+    // virtual pad presses what it means.
+    const auto info = std::find_if(devices_.begin(), devices_.end(), [&](const DeviceInfo& d) { return d.id == id; });
+    if (info != devices_.end() && !info->synthetic) {
+      state.gamepad.buttons = RemapButtons(state.gamepad.buttons);
     }
     active_devices_.Observe(user_index, id, state.gamepad);
     if (!any) {

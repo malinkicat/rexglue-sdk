@@ -79,6 +79,8 @@ class CommandProcessor {
     kNone,
     kFxaa,
     kFxaaExtreme,
+    // amped3: SMAA 1x (D3D12 only).
+    kSmaa,
   };
 
   CommandProcessor(GraphicsSystem* graphics_system, system::KernelState* kernel_state);
@@ -224,6 +226,62 @@ class CommandProcessor {
   // guest pixels (min x, max x, min y, max y), false if unknown.
   virtual bool Amped3ScreenExtents(float extents_out[4]) { return false; }
   void Amped3FillScreenExtents(uint16_t extents[6], uint32_t address);
+  // amped3 (gpu_screen_extents=3): the GPU measures the screen extents of the
+  // draws in the first tile's pass (the one whose EVENT_WRITE_EXTs execute:
+  // bin select bit 63, not everything). EVENT_WRITE_EXT writes the whole
+  // screen and hands the address to Amped3RecordScreenExtents for the
+  // previous draw; Amped3ResolveScreenExtents (at INTERRUPT, where the
+  // guest's callback builds the other tiles' bin masks from them, and at
+  // swaps) awaits the GPU and writes the measured ones.
+  static bool Amped3IsExtentsPass(uint64_t bin_select) {
+    return (bin_select >> 63) && bin_select != ~uint64_t(0);
+  }
+  virtual void Amped3RecordScreenExtents(uint32_t address) {}
+  virtual void Amped3ResolveScreenExtents() {}
+  // The executor's copy of Amped3IsExtentsPass(bin_select_).
+  bool amped3_extents_pass_ = false;
+  // gpu_cp_split parser: the last value queued for the executor.
+  bool amped3_split_extents_pass_ = false;
+  // amped3 tile replay: the predicated tile pass the bin select is for (1-3,
+  // SET_BIN_SELECT bits 33, 35, 37; 0 outside the tiled passes), the
+  // executor's copy, and the parser's last queued value.
+  static uint32_t Amped3TileOf(uint64_t bin_select) {
+    if (bin_select == ~uint64_t(0)) {
+      return 0;
+    }
+    for (uint32_t tile = 1; tile <= 3; ++tile) {
+      if ((bin_select >> (31 + 2 * tile)) & 1) {
+        return tile;
+      }
+    }
+    return 0;
+  }
+  uint32_t amped3_tile_ = 0;
+  uint32_t amped3_split_tile_ = 0;
+  // Called on the executor when amped3_tile_ changes (before it changes).
+  virtual void Amped3OnTileChange(uint32_t new_tile) {}
+  void Amped3SetBinSelectState(bool extents_pass, uint32_t tile) {
+    amped3_extents_pass_ = extents_pass;
+    if (tile != amped3_tile_) {
+      Amped3OnTileChange(tile);
+      amped3_tile_ = tile;
+      if (tile == 1) {
+        amped3_collapse_ = Amped3Collapse();
+      }
+    }
+  }
+  // The guest address of the draw packet being executed (after its header):
+  // the same draw in each tile's replay of an indirect buffer.
+  uint32_t amped3_draw_address_ = 0;
+  // gpu_tile_collapse: tile 1's registers made full-size, before a draw/copy.
+  void Amped3CollapseTile1Registers();
+  bool Amped3CollapseSkipsIndirectBuffer() const;
+  struct Amped3Collapse {
+    uint32_t surface = UINT32_MAX;  // RB_SURFACE_INFO as made full-size
+    uint32_t slot_tiles = 1;        // EDRAM tiles of each target originally
+    uint32_t tile_width = 0;
+    uint32_t tile_height = 0;
+  } amped3_collapse_;
 
   // "Actual" is for the command processor thread, to be read by the
   // implementations.

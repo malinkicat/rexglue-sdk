@@ -1096,6 +1096,10 @@ bool D3D12RenderTargetCache::Update(bool is_rasterization_done,
           last_update_accumulated_render_targets();
       PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
                                        depth_and_color_render_targets, last_update_transfers());
+      if (depth_and_color_render_targets[0]) {
+        last_depth_render_target_ = depth_and_color_render_targets[0];
+      }
+      RunSceneCallback(depth_and_color_render_targets);
       SetCommandListRenderTargets(depth_and_color_render_targets);
     } break;
     case Path::kPixelShaderInterlock: {
@@ -1186,6 +1190,70 @@ void D3D12RenderTargetCache::WriteEdramUintPow2UAVDescriptor(D3D12_CPU_DESCRIPTO
                                 D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
 }
 
+bool D3D12RenderTargetCache::SceneColorTargetFits(uint32_t width) const {
+  if (GetPath() != Path::kHostRenderTargets) {
+    return false;
+  }
+  const RenderTarget* color = last_update_accumulated_render_targets()[1];
+  if (!color) {
+    return false;
+  }
+  const RenderTargetKey key = color->key();
+  return key.msaa_samples == xenos::MsaaSamples::k1X &&
+         key.pitch_tiles_at_32bpp * xenos::kEdramTileWidthSamples >= width;
+}
+
+void D3D12RenderTargetCache::HandOverScene(SceneCallback callback) {
+  if (GetPath() != Path::kHostRenderTargets) {
+    return;
+  }
+  scene_callback_ = std::move(callback);
+  RunSceneCallback(last_update_accumulated_render_targets());
+}
+
+void D3D12RenderTargetCache::RunSceneCallback(RenderTarget* const* depth_and_color_render_targets) {
+  if (scene_callback_) {
+    SceneCallback scene_callback = std::move(scene_callback_);
+    scene_callback_ = nullptr;
+    // The HUD may be drawn without depth (Amped 3's is): the scene's depth
+    // is then the last one bound.
+    auto* depth_rt = static_cast<D3D12RenderTarget*>(depth_and_color_render_targets[0]
+                                                         ? depth_and_color_render_targets[0]
+                                                         : last_depth_render_target_);
+    auto* color_rt = static_cast<D3D12RenderTarget*>(depth_and_color_render_targets[1]);
+    if (color_rt) {
+      static uint32_t logged = 0;
+      if (logged++ % 600 == 0) {
+        const RenderTargetKey key = color_rt->key();
+        REXGPU_INFO("DLSS hand-off: color base tiles {} pitch tiles {} msaa {} format {}; depth {}",
+                    key.base_tiles, key.pitch_tiles_at_32bpp, uint32_t(key.msaa_samples),
+                    key.resource_format, depth_rt ? depth_rt->key().base_tiles : 0xFFFFFFFFu);
+      }
+    }
+    if (!(depth_rt && color_rt && depth_rt->descriptor_srv().IsValid())) {
+      static bool logged = false;
+      if (!logged) {
+        logged = true;
+        REXGPU_WARN("DLSS: scene hand-off without {} render target", color_rt ? "a depth" : "a color");
+      }
+    }
+    if (depth_rt && color_rt && depth_rt->descriptor_srv().IsValid()) {
+      command_processor_.PushTransitionBarrier(
+          depth_rt->resource(),
+          depth_rt->SetResourceState(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      command_processor_.PushTransitionBarrier(
+          color_rt->resource(),
+          color_rt->SetResourceState(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+      color_rt->SetResourceState(scene_callback(color_rt->resource(), depth_rt->resource(),
+                                                depth_rt->descriptor_srv().GetHandle()));
+      // The callback may have run code that binds anything.
+      are_current_command_list_render_targets_valid_ = false;
+    }
+  }
+}
+
 bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMemory& shared_memory,
                                      D3D12TextureCache& texture_cache,
                                      uint32_t& written_address_out, uint32_t& written_length_out) {
@@ -1252,6 +1320,17 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           }
         }
         if (!direct_resolved) {
+          static int fallback_logs = 0;
+          if (fallback_logs < 20) {
+            ++fallback_logs;
+            REXGPU_WARN(
+                "Resolve through the EDRAM buffer: color base {} depth base {} pitch {} msaa {} "
+                "depth {}",
+                resolve_info.color_original_base, resolve_info.depth_original_base,
+                uint32_t(resolve_info.color_edram_info.pitch_tiles),
+                uint32_t(resolve_info.color_edram_info.msaa_samples),
+                uint32_t(resolve_info.IsCopyingDepth()));
+          }
           // Dump the current contents of the render targets owning the affected
           // range to edram_buffer_.
           uint32_t dump_base;

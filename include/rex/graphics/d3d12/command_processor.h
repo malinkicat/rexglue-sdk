@@ -28,6 +28,7 @@
 #include <rex/assert.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/d3d12/deferred_command_list.h>
+#include <rex/graphics/d3d12/dlss.h>
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/pipeline_cache.h>
 #include <rex/graphics/d3d12/primitive_processor.h>
@@ -192,6 +193,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   // invalidation primarily. A submission must be open.
   void SetExternalPipeline(ID3D12PipelineState* pipeline);
   void SetExternalGraphicsRootSignature(ID3D12RootSignature* root_signature);
+  // After third-party code ran on the command list (DeferredCommandList::
+  // ExternalCallback): binds the descriptor heaps again and forgets the cached
+  // command list state. A submission must be open.
+  void InvalidateStateAfterExternalCommands();
   void SetViewport(const D3D12_VIEWPORT& viewport);
   void SetScissorRect(const D3D12_RECT& scissor_rect);
   void SetStencilReference(uint32_t stencil_ref);
@@ -278,10 +283,14 @@ class D3D12CommandProcessor : public CommandProcessor {
   Shader* LoadShader(xenos::ShaderType shader_type, uint32_t guest_address,
                      const uint32_t* host_address, uint32_t dword_count) override;
 
+  int UiSpriteExtents(const Shader& vertex_shader, float extents[4]);
   bool IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;
   bool Amped3ScreenExtents(float extents_out[4]) override;
+  void Amped3RecordScreenExtents(uint32_t address) override;
+  void Amped3OnTileChange(uint32_t new_tile) override;
+  void Amped3ResolveScreenExtents() override;
 
  private:
   static constexpr uint32_t kQueueFrames = 3;
@@ -316,6 +325,8 @@ class D3D12CommandProcessor : public CommandProcessor {
     // (as SRV and as UAV, either may be null if not used), and, if ROV is used
     // for EDRAM, EDRAM R32_UINT UAV.
     kRootParameter_Bindful_SharedMemoryAndEdram,  // +1 = 9 in all.
+    // amped3 (gpu_screen_extents=3): the current draw's screen extents slot.
+    kRootParameter_Bindful_ScreenExtents,  // +2 = 11 in all.
 
     kRootParameter_Bindful_Count_Base,
 
@@ -346,6 +357,8 @@ class D3D12CommandProcessor : public CommandProcessor {
     kRootParameter_Bindless_SamplerHeap,  // +1 = 12 in all.
     // Unbounded SRV/UAV descriptor table - never changed.
     kRootParameter_Bindless_ViewHeap,  // +1 = 13 in all.
+    // amped3 (gpu_screen_extents=3): the current draw's screen extents slot.
+    kRootParameter_Bindless_ScreenExtents,  // +2 = 15 in all.
 
     kRootParameter_Bindless_Count,
   };
@@ -533,6 +546,7 @@ class D3D12CommandProcessor : public CommandProcessor {
   DeferredCommandList deferred_command_list_;
   struct SubmissionJob {
     DeferredCommandStream command_stream;
+    DeferredExternalCallbacks external_callbacks;
     ID3D12CommandAllocator* command_allocator;
     uint64_t fence_value;
     // If set, run instead of submitting (in order with the submissions).
@@ -646,6 +660,21 @@ class D3D12CommandProcessor : public CommandProcessor {
 
   std::unique_ptr<D3D12TextureCache> texture_cache_;
 
+  // NVIDIA DLAA for the 3D scene (null if its pipelines couldn't be created).
+  std::unique_ptr<D3D12Dlss> dlss_;
+  // The current draw is a 3D scene draw (jittered for DLSS).
+  bool dlss_scene_draw_ = false;
+  // --ultrawide_squeeze applies to this draw (IssueDraw: the scene's geometry
+  // and the UI's sprites on the frame-wide surface, not full-screen passes).
+  bool ultrawide_draw_ = false;
+  bool video_frame_ = false;  // a pre-rendered video drawn this frame (letterboxed)
+  bool ui_scale_draw_ = false;           // --ui_scale applies to this draw
+  bool presenter_video_frame_ = false;  // the frame being swapped is one
+  // With --ultrawide_hud_pin, a UI sprite's side (-1 left, 1 right, 0 middle,
+  // from where its matrix puts its origin): pinned to that screen edge.
+  float ultrawide_pin_ = 0.0f;
+  bool ultrawide_ui_draw_ = false;
+
   // Bytes 0x0...0x3FF - 256-entry gamma ramp table with B10G10R10X2 data (read
   // as R10G10B10X2 with swizzle).
   // Bytes 0x400...0x9FF - 128-entry PWL R16G16 gamma ramp (R - base, G - delta,
@@ -656,6 +685,167 @@ class D3D12CommandProcessor : public CommandProcessor {
   // kQueueFrames array layers.
   Microsoft::WRL::ComPtr<ID3D12Resource> gamma_ramp_upload_buffer_;
   uint8_t* gamma_ramp_upload_buffer_mapping_ = nullptr;
+
+  // amped3 (gpu_screen_extents=3): 16-byte slots the measured draws' vertex
+  // shaders accumulate their screen extents in (see
+  // DxbcShaderTranslator::CompleteVertexOrDomainShader), zeroed before the
+  // first draw after a resolve, kept in the UNORDERED_ACCESS state between
+  // copies.
+  static constexpr uint32_t kScreenExtentsSlots = 16384;
+  Microsoft::WRL::ComPtr<ID3D12Resource> screen_extents_buffer_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> screen_extents_zero_buffer_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> screen_extents_readback_buffer_;
+  const uint32_t* screen_extents_readback_mapping_ = nullptr;
+  uint32_t screen_extents_slots_used_ = 0;
+  // The slot the root descriptor points at.
+  uint32_t screen_extents_root_slot_ = 0;
+  struct ScreenExtentsDraw {
+    uint32_t slot;
+    uint32_t address;
+    // Guest X/W and Y/W to guest pixels.
+    float scale[2];
+    float offset[2];
+    // gpu_screen_extents=4: the draw's identity across frames, and the
+    // extents (8x8 tiles: min x, max x, min y, max y) predicted from its last
+    // measurement as is ([0]) and moved on by its last motion ([1]), before
+    // the margin (predicted[0][0] > predicted[0][1] if none).
+    uint64_t key;
+    int32_t predicted[2][4];
+  };
+  // The measured extents in 8x8 tiles, false if no vertex was measured.
+  bool ScreenExtentsFromSlot(const ScreenExtentsDraw& draw, const uint32_t* slot,
+                             uint16_t tiles_out[4]) const;
+  void ScreenExtentsProcessBatches(bool await_oldest);
+  // gpu_screen_extents=4: readbacks in flight, in kScreenExtentsReadbacks
+  // regions of the readback buffer.
+  static constexpr uint32_t kScreenExtentsReadbacks = 4;
+  struct ScreenExtentsBatch {
+    uint64_t submission;
+    uint32_t region;
+    uint32_t resolve;
+    std::vector<ScreenExtentsDraw> draws;
+  };
+  std::deque<ScreenExtentsBatch> screen_extents_batches_;
+  uint32_t screen_extents_next_region_ = 0;
+  struct ScreenExtentsKnown {
+    uint16_t tiles[4];
+    uint32_t resolve;
+    // The measurement before (prev_resolve == UINT32_MAX if none).
+    uint16_t prev_tiles[4];
+    uint32_t prev_resolve;
+  };
+  std::unordered_map<uint64_t, ScreenExtentsKnown> screen_extents_known_;
+  // Occurrences of each draw identity since the last resolve.
+  std::unordered_map<uint64_t, uint32_t> screen_extents_occurrences_;
+  uint32_t screen_extents_resolves_ = 0;
+  // Statistics of the predictions with the margins kScreenExtentsMargins, as
+  // is and with motion: (draw, tile 2 or 3) pairs skipped, and draws missing
+  // from a tile they cover; skips with the measured extents; predicted draws.
+  static constexpr int32_t kScreenExtentsMargins[] = {0, 2, 4, 8, 16, 32};
+  uint64_t screen_extents_skips_[2][6] = {};
+  uint64_t screen_extents_wrong_[2][6] = {};
+  uint64_t screen_extents_ideal_skips_ = 0;
+  uint64_t screen_extents_predicted_ = 0;
+
+  // amped3 tile replay (gpu_tile_replay): tiles 2 and 3 run the same indirect
+  // buffers as tile 1 with only the window offset, scissor and resolve
+  // destinations changed, so a draw there can reuse what tile 1 derived for
+  // the draw at the same packet address - if nothing it depends on still
+  // differs from tile 1. The registers at tile 1's start; at a later tile's
+  // start, the registers that differ from those (and their values then): one
+  // is equal again once the tile's commands write it (current value != the
+  // value at the tile's start), as they wrote the same in tile 1.
+  std::vector<uint32_t> tile_replay_start_registers_;
+  const Shader* tile_replay_start_shaders_[2] = {};
+  // At a later tile's start: the registers other than constants that differ
+  // (index, value then), and the constants that do (float constants as
+  // float4 bits: vertex 0-255, pixel 256-511; fetch constants as bits).
+  std::vector<std::pair<uint32_t, uint32_t>> tile_replay_divergent_;
+  std::vector<std::pair<uint32_t, uint32_t>> tile_replay_divergent_constants_;
+  uint64_t tile_replay_divergent_float_[8] = {};
+  uint32_t tile_replay_divergent_fetch_ = 0;
+  const Shader* tile_replay_divergent_shaders_[2] = {};
+  bool tile_replay_shader_divergent_[2] = {};
+  // Too much differs at this tile's start: no replays in it.
+  bool tile_replay_disabled_ = false;
+  // Tile 1's draws' packet addresses in order; tiles 2 and 3 run the same
+  // sequence (the next draw is expected at tile_replay_cursor_).
+  std::vector<uint32_t> tile_replay_addresses_;
+  uint32_t tile_replay_cursor_ = 0;
+  // What differed at the last frame's tile 2 start (the same every frame,
+  // often written again in the tile with the value it already had) is watched
+  // in this frame's tile 1: the values of those other than constants at each
+  // draw (draw index * count), and a hash of the watched constants each draw
+  // uses. The sets for this frame and, being found, for the next.
+  std::vector<uint32_t> tile_replay_watch_;
+  uint64_t tile_replay_watch_float_[8] = {};
+  uint32_t tile_replay_watch_fetch_ = 0;
+  std::vector<uint32_t> tile_replay_watch_next_;
+  uint64_t tile_replay_watch_float_next_[8] = {};
+  uint32_t tile_replay_watch_fetch_next_ = 0;
+  std::vector<int8_t> tile_replay_watch_position_;
+  std::vector<uint32_t> tile_replay_watch_values_;
+  std::vector<uint64_t> tile_replay_watch_hashes_;
+  uint64_t TileReplayWatchedConstantsHash(const Shader* vertex_shader, const Shader* pixel_shader,
+                                          uint32_t used_fetch_mask) const;
+  // Whether the current draw could be replayed (statistics for now).
+  bool TileReplayEligible(const Shader* vertex_shader, const Shader* pixel_shader,
+                          uint32_t used_texture_mask);
+  // Tile 2/3 draws: eligible, no tile 1 draw, other registers divergent,
+  // float constants, fetch constants, shaders; tile 1 draws; tile 1 passes.
+  uint64_t tile_replay_stats_[8] = {};
+  std::unordered_map<uint32_t, uint64_t> tile_replay_blocking_registers_;
+  // What tile 1's draws derived (valid if the draw completed normally).
+  struct TileReplayRecord {
+    bool valid;
+    void* pipeline_handle;
+    ID3D12RootSignature* root_signature;
+    const void* vertex_translation;
+    const void* pixel_translation;
+    PrimitiveProcessor::ProcessingResult primitive;
+    D3D_PRIMITIVE_TOPOLOGY topology;
+    uint32_t normalized_depth_control;
+    uint32_t normalized_color_mask;
+    uint32_t used_texture_mask;
+    uint32_t render_target_bits;
+    uint32_t render_target_formats[1 + xenos::kMaxColorRenderTargets];
+    // gpu_tile_replay_verify: the inputs the bindings are built from.
+    uint64_t hashes[6];
+    // Replay: the bound constant buffers (fetch, float vertex, float pixel,
+    // bool/loop, descriptor indices pixel, vertex), the bindless sampler heap
+    // generation, and the texture SRV keys (tile_replay_srv_keys_ from
+    // srv_keys_start: vertex then pixel shader bindings).
+    D3D12_GPU_VIRTUAL_ADDRESS constant_buffers[6];
+    uint64_t sampler_heap_generation;
+    uint32_t srv_keys_start;
+    uint32_t srv_key_counts[2];
+  };
+  std::vector<D3D12TextureCache::TextureSRVKey> tile_replay_srv_keys_;
+  uint64_t tile_replay_sampler_heap_generation_ = 0;
+  // Sets the bindings for a replayed draw; false if its textures have changed
+  // since tile 1 (UpdateBindings then).
+  bool TileReplayBindings(const TileReplayRecord& record, const D3D12Shader* vertex_shader,
+                          const D3D12Shader* pixel_shader);
+  // Constant buffer root parameters set by replays (valid while the root
+  // signature is tile_replay_root_signature_).
+  ID3D12RootSignature* tile_replay_root_signature_ = nullptr;
+  D3D12_GPU_VIRTUAL_ADDRESS tile_replay_root_addresses_[6] = {};
+  uint64_t tile_replay_replayed_ = 0;
+  uint64_t tile_replay_fallbacks_[3] = {};
+  std::vector<TileReplayRecord> tile_replay_records_;
+  // The current draw's tile 1 record: tile 1 - being recorded, tiles 2-3 -
+  // eligible for replay; -1 otherwise.
+  int32_t tile_replay_current_ = -1;
+  void TileReplayHashes(const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,
+                        uint64_t hashes_out[6]) const;
+  // Verification: tile 2-3 draws compared, and mismatches by field.
+  uint64_t tile_replay_verified_ = 0;
+  uint64_t tile_replay_mismatches_[16] = {};
+  // The last draw, slot UINT32_MAX if it's not measured.
+  ScreenExtentsDraw screen_extents_draw_{UINT32_MAX};
+  // Measured draws whose EVENT_WRITE_EXT has been seen.
+  std::vector<ScreenExtentsDraw> screen_extents_pending_;
+  uint64_t screen_extents_stats_[4] = {};
   bool gamma_ramp_256_entry_table_up_to_date_ = false;
   bool gamma_ramp_pwl_up_to_date_ = false;
 
@@ -690,6 +880,36 @@ class D3D12CommandProcessor : public CommandProcessor {
   Microsoft::WRL::ComPtr<ID3D12RootSignature> fxaa_root_signature_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> fxaa_pipeline_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> fxaa_extreme_pipeline_;
+
+  // amped3: SMAA 1x (swap_post_effect=smaa; thirdparty/smaa, MIT) - edges,
+  // blending weights and neighborhood blending passes over the FXAA source
+  // texture (gamma applied), into the guest output.
+  enum class SmaaRootParameter : UINT {
+    kConstants,
+    kSource0,
+    kSource1,
+    kSource2,
+    kDestination,
+    kCount,
+  };
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> smaa_root_signature_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> smaa_pipelines_[3];
+  // AreaTex (R8G8) and SearchTex (R8), uploaded on first use.
+  Microsoft::WRL::ComPtr<ID3D12Resource> smaa_area_texture_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> smaa_search_texture_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> smaa_lut_upload_buffer_;
+  bool smaa_luts_uploaded_ = false;
+  // Edges and blending weights (RGBA8, the guest output size).
+  Microsoft::WRL::ComPtr<ID3D12Resource> smaa_textures_[2];
+  uint64_t smaa_textures_submission_ = 0;
+  // amped3: a draw of the game's sprite shader smaller than a pixel on screen.
+  bool Amped3IsSubpixelSprite(const Shader& vertex_shader);
+  // amped3 debug: d3d12_debug_pink_probe (reads back the output pixel at (527, 602)).
+  void Amped3PinkProbe(ID3D12Resource* output, uint32_t width, uint32_t height);
+  bool SetupSmaa();
+  // Records the SMAA passes; source in NON_PIXEL_SHADER_RESOURCE, destination
+  // (the guest output) in UNORDERED_ACCESS.
+  bool ApplySmaa(ID3D12Resource* destination, uint32_t width, uint32_t height);
 
   struct ResolveDownscaleConstants {
     uint32_t scale_x;

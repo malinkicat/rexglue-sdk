@@ -410,7 +410,18 @@ constexpr uint32_t kRenderTargetFormatBits =
 
 constexpr uint32_t kEdramTileWidthSamples = 80;
 constexpr uint32_t kEdramTileHeightSamples = 16;
+// amped3: twice the Xenos' 2048 tiles, for gpu_tile_collapse (two color
+// targets and depth at 1280x720: 3 * 720 tiles; bases stay 11-bit). Normal
+// rendering checked with it (menus, story, riding). AMPED3_EDRAM_2048 builds
+// the original size. (An 8192-tile EDRAM with 13-bit bases for collapse with
+// 2x MSAA broke the picture - not yet understood.)
+#if defined(AMPED3_EDRAM_2048)
 constexpr uint32_t kEdramTileCount = 2048;
+#elif defined(AMPED3_EDRAM_8192)
+constexpr uint32_t kEdramTileCount = 8192;
+#else
+constexpr uint32_t kEdramTileCount = 4096;
+#endif
 constexpr uint32_t kEdramSizeBytes =
     kEdramTileCount * kEdramTileHeightSamples * kEdramTileWidthSamples * sizeof(uint32_t);
 
@@ -418,7 +429,12 @@ constexpr uint32_t kEdramSizeBytes =
 constexpr uint32_t kEdramPitchPixelsBits = 14;
 // The part of RB_COLOR_INFO::color_base and RB_DEPTH_INFO::depth_base width
 // usable on the Xenos, which has periodic 11-bit EDRAM tile addressing.
+// AMPED3_WIDE_BASES (experiment): 13-bit bases for an 8192-tile EDRAM.
+#ifdef AMPED3_WIDE_BASES
+constexpr uint32_t kEdramBaseTilesBits = 13;
+#else
 constexpr uint32_t kEdramBaseTilesBits = 11;
+#endif
 
 constexpr uint32_t GetSurfacePitchTiles(uint32_t pitch_pixels, MsaaSamples msaa_samples,
                                         bool is_64bpp) {
@@ -435,7 +451,11 @@ constexpr uint32_t GetSurfacePitchTiles(uint32_t pitch_pixels, MsaaSamples msaa_
 // 8192, but to avoid bounds checking).
 // log2_ceil of 16383, multiplied by 2 for 4x MSAA, rounded to 80 samples,
 // multiplied by 2 for 64bpp.
+#ifdef AMPED3_NARROW_PITCH
+constexpr uint32_t kEdramPitchTilesBits = 9;
+#else
 constexpr uint32_t kEdramPitchTilesBits = 10;
+#endif
 
 constexpr uint32_t kFormatBits = 6;
 

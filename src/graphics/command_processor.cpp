@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <deque>
 #include <cinttypes>
 #include <cmath>
@@ -21,6 +22,7 @@
 
 #include <fmt/format.h>
 
+#include <rex/hash.h>
 #include <rex/cvar.h>
 #include <rex/platform.h>
 #if REX_PLATFORM_WIN32
@@ -50,18 +52,33 @@ REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 REXCVAR_DEFINE_INT32(gpu_cp_split, -1, "GPU",
                      "Run the command processor in two threads: one reads the command buffers "
                      "and register writes, the other executes the draws: -1 auto (on under "
-                     "Proton/Wine, measured on the Steam Deck; off on Windows), 0 off, 1 on");
+                     "Proton/Wine, measured on the Steam Deck; off on Windows: on a Ryzen 9 "
+                     "3900X it raised the uncapped average ~3% but lowered the 1% lows), 0 off, 1 on");
 REXCVAR_DEFINE_INT32(gpu_screen_extents, 0, "GPU",
                      "Test: the screen extents EVENT_WRITE_EXT reports for the previous draw: "
                      "0 the whole screen (Xenia's), 1 a single 8x8 tile at the origin, 2 the "
-                     "draw's vertices' bounding box from its vertex shader run on the CPU (slow)");
+                     "draw's vertices' bounding box from its vertex shader run on the CPU (slow), 3 "
+                     "the same measured by the GPU (Direct3D 12): the first tile's draws "
+                     "accumulate it in their vertex shaders, read back when the guest needs it");
 REXCVAR_DEFINE_INT32(gpu_screen_extents_delay, 0, "GPU",
                      "Test (gpu_screen_extents=2): write the measured extents this many frames "
                      "late (the whole screen until then), as a GPU measurement would arrive; -1: at "
-                     "the next EVENT_WRITE_SHD or swap (the end of the frame's GPU work)");
+                     "the next EVENT_WRITE_SHD or swap (the end of the frame's GPU work); -2: at the "
+                     "next INTERRUPT (the game's callback that patches the bin masks of tiles 2 "
+                     "and 3 from tile 1's extents)");
+REXCVAR_DEFINE_BOOL(gpu_tile_collapse, false, "GPU",
+                    "amped3: draw the game's 3 predicated tiles (vertical columns of a 2x MSAA "
+                    "surface) as one full-width pass without MSAA in tile 1, skipping tiles 2 "
+                    "and 3 (needs the 4096-tile EDRAM)");
+REXCVAR_DEFINE_BOOL(gpu_tile_collapse_msaa, false, "GPU",
+                    "gpu_tile_collapse: keep 2x MSAA (experimental: the gameplay scene comes out wrong; menus 4x "
+                    "becomes 2x) instead of none");
 REXCVAR_DEFINE_INT32(gpu_cp_split_spin, 200000, "GPU",
                      "gpu_cp_split: pause instructions the draw thread spins for before sleeping "
                      "when it runs out of work (waking it again takes a system call)");
+REXCVAR_DEFINE_BOOL(vblank_spin_wait, true, "GPU",
+                    "Poll instead of sleeping in GPU waits when a guest vblank is due within "
+                    "1.5 ms, so frames flip on time");
 REXCVAR_DEFINE_BOOL(swap_times, false, "GPU",
                     "Debug: write the time of every guest swap to swaptimes.csv");
 
@@ -112,6 +129,13 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
 
 namespace rex::graphics {
 
+// Guest tick counts of the last guest vblank and the next one (0 with vsync
+// off), set by the GPU VSync thread.
+std::atomic<uint64_t> g_last_vblank_tick{0}, g_next_vblank_tick{0};
+// When the last vblank was marked and when its interrupt callback returned
+// (for swaptimes.csv).
+std::atomic<uint64_t> g_vblank_mark_tick{0}, g_vblank_done_tick{0};
+
 using namespace rex::graphics::xenos;
 
 namespace {
@@ -145,8 +169,10 @@ struct CommandProcessor::Amped3Split {
     kOpPacket,         // a whole big-endian packet (ExecutePacket)
     kOpPrimaryEnd,     // OnPrimaryBufferEnd
     kOpWrap,           // the rest of the buffer is unused, continue at its start
-    kOpDraw,           // VGT_DRAW_INITIATOR, VGT_DMA_BASE, VGT_DMA_SIZE (Amped3ExecuteDraw)
+    kOpDraw,           // VGT_DRAW_INITIATOR, VGT_DMA_BASE, VGT_DMA_SIZE (Amped3ExecuteDraw),
+                       // amped3_draw_address_
     kOpShader,         // shader type, Shader* (low, high) loaded by the parser
+    kOpExtentsPass,    // amped3_extents_pass_, amped3_tile_
   };
   static constexpr uint32_t kCapacity = uint32_t(1) << 22;  // dwords
   std::unique_ptr<uint32_t[]> buffer{new uint32_t[kCapacity]};
@@ -1059,6 +1085,9 @@ bool CommandProcessor::Amped3SplitParsePacket(memory::RingBuffer* reader) {
       uint32_t list_ptr = CpuToGpu(reader->ReadAndSwap<uint32_t>());
       uint32_t list_length = reader->ReadAndSwap<uint32_t>() & 0xFFFFF;
       reader->AdvanceRead((count - 2) * sizeof(uint32_t));
+      if (Amped3CollapseSkipsIndirectBuffer()) {
+        return true;
+      }
       Amped3SplitParseIndirectBuffer(GpuToCpu(list_ptr), list_length);
       return true;
     }
@@ -1071,6 +1100,8 @@ bool CommandProcessor::Amped3SplitParsePacket(memory::RingBuffer* reader) {
     case PM4_DRAW_INDX_2: {
       uint32_t count_remaining = count;
       const char* opcode_name = opcode == PM4_DRAW_INDX ? "PM4_DRAW_INDX" : "PM4_DRAW_INDX_2";
+      uint32_t draw_address =
+          uint32_t(reader->read_ptr() - uintptr_t(memory_->TranslatePhysical(0)));
       if (opcode == PM4_DRAW_INDX) {
         // The viz query token (unused, as in ExecutePacketType3Draw).
         reader->ReadAndSwap<uint32_t>();
@@ -1078,8 +1109,9 @@ bool CommandProcessor::Amped3SplitParsePacket(memory::RingBuffer* reader) {
       }
       uint32_t words[3];
       if (Amped3ReadDraw(reader, opcode_name, count_remaining, words)) {
-        uint32_t* payload = Amped3SplitReserve(Amped3Split::kOpDraw, 3);
+        uint32_t* payload = Amped3SplitReserve(Amped3Split::kOpDraw, 4);
         std::memcpy(payload, words, sizeof(words));
+        payload[3] = draw_address;
         Amped3SplitPublish();
       }
       return true;
@@ -1141,7 +1173,7 @@ bool CommandProcessor::Amped3SplitParsePacket(memory::RingBuffer* reader) {
       break;
     case PM4_EVENT_WRITE_EXT:
       // (gpu_screen_extents=2 measures the previous draw: on the executor.)
-      if (count == 2 && REXCVAR_GET(gpu_screen_extents) != 2) {
+      if (count == 2 && REXCVAR_GET(gpu_screen_extents) < 2) {
         // Fake screen extents (as ExecutePacketType3_EVENT_WRITE_EXT): not
         // dependent on drawing.
         uint32_t initiator = reader->ReadAndSwap<uint32_t>();
@@ -1194,6 +1226,14 @@ bool CommandProcessor::Amped3SplitParsePacket(memory::RingBuffer* reader) {
         case PM4_SET_BIN_SELECT:
           bin_select_ = (uint64_t(words[0]) << 32) | words[1];
           break;
+      }
+      if (Amped3IsExtentsPass(bin_select_) != amped3_split_extents_pass_ ||
+          Amped3TileOf(bin_select_) != amped3_split_tile_) {
+        amped3_split_extents_pass_ = Amped3IsExtentsPass(bin_select_);
+        amped3_split_tile_ = Amped3TileOf(bin_select_);
+        uint32_t* payload = Amped3SplitReserve(Amped3Split::kOpExtentsPass, 2);
+        payload[0] = uint32_t(amped3_split_extents_pass_);
+        payload[1] = amped3_split_tile_;
       }
       return true;
     }
@@ -1257,7 +1297,11 @@ void CommandProcessor::Amped3SplitExecutorMain() {
         OnPrimaryBufferEnd();
         break;
       case Amped3Split::kOpDraw:
+        amped3_draw_address_ = header[4];
         Amped3ExecuteDraw(header + 1, "PM4_DRAW_INDX");
+        break;
+      case Amped3Split::kOpExtentsPass:
+        Amped3SetBinSelectState(header[1] != 0, header[2]);
         break;
       case Amped3Split::kOpShader: {
         auto shader =
@@ -1468,11 +1512,13 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     case PM4_SET_BIN_SELECT_LO: {
       uint32_t value = reader->ReadAndSwap<uint32_t>();
       bin_select_ = (bin_select_ & 0xFFFFFFFF00000000ull) | value;
+      Amped3SetBinSelectState(Amped3IsExtentsPass(bin_select_), Amped3TileOf(bin_select_));
       result = true;
     } break;
     case PM4_SET_BIN_SELECT_HI: {
       uint32_t value = reader->ReadAndSwap<uint32_t>();
       bin_select_ = (bin_select_ & 0xFFFFFFFFull) | (static_cast<uint64_t>(value) << 32);
+      Amped3SetBinSelectState(Amped3IsExtentsPass(bin_select_), Amped3TileOf(bin_select_));
       result = true;
     } break;
     case PM4_SET_BIN_MASK: {
@@ -1487,6 +1533,7 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       uint64_t val_hi = reader->ReadAndSwap<uint32_t>();
       uint64_t val_lo = reader->ReadAndSwap<uint32_t>();
       bin_select_ = (val_hi << 32) | val_lo;
+      Amped3SetBinSelectState(Amped3IsExtentsPass(bin_select_), Amped3TileOf(bin_select_));
       result = true;
     } break;
     case PM4_CONTEXT_UPDATE: {
@@ -1543,6 +1590,14 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
 
   // generate interrupt from the command stream
   uint32_t cpu_mask = reader->ReadAndSwap<uint32_t>();
+  Amped3ResolveScreenExtents();
+  if (REXCVAR_GET(gpu_screen_extents_delay) == -2) {
+    for (const Amped3DelayedExtents& delayed : g_amped3_delayed_extents) {
+      memory::copy_and_swap_16_unaligned(memory_->TranslatePhysical(delayed.address),
+                                         delayed.extents, 6);
+    }
+    g_amped3_delayed_extents.clear();
+  }
   for (int n = 0; n < 6; n++) {
     if (cpu_mask & (1 << n)) {
       if (graphics_system_) {
@@ -1571,6 +1626,7 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   }
 #endif
   rex::perf::Profiler::Flip();
+  Amped3ResolveScreenExtents();
   ++g_amped3_extents_frame;
   while (!g_amped3_delayed_extents.empty() &&
          (REXCVAR_GET(gpu_screen_extents_delay) < 0 ||
@@ -1617,11 +1673,18 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
     const uint64_t now = rex::chrono::Clock::QueryHostTickCount();
     const double freq = double(rex::chrono::Clock::QueryHostTickFrequency());
     if (!csv && (csv = std::fopen("swaptimes.csv", "w"))) {
-      std::fputs("time_s,frame_ms\n", csv);
+      std::fputs("time_s,frame_ms,since_vblank_ms,mark_ms,interrupt_done_ms\n", csv);
       first = last = now;
     }
     if (csv) {
-      std::fprintf(csv, "%.5f,%.3f\n", (now - first) / freq, (now - last) * 1000.0 / freq);
+      const uint64_t vblank = g_last_vblank_tick.load(std::memory_order_relaxed);
+      const uint64_t guest_now = rex::chrono::Clock::QueryGuestTickCount();
+      const double guest_ms = 1000.0 / rex::chrono::Clock::guest_tick_frequency();
+      const auto since = [&](uint64_t t) { return t ? (int64_t(t) - int64_t(vblank)) * guest_ms : -1.0; };
+      std::fprintf(csv, "%.5f,%.3f,%.3f,%.3f,%.3f\n", (now - first) / freq,
+                   (now - last) * 1000.0 / freq, since(guest_now),
+                   since(g_vblank_mark_tick.load(std::memory_order_relaxed)),
+                   since(g_vblank_done_tick.load(std::memory_order_relaxed)));
       last = now;
       if (++n % 120 == 0) std::fflush(csv);
     }
@@ -1639,6 +1702,9 @@ bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* re
   uint32_t list_length = reader->ReadAndSwap<uint32_t>();
   assert_zero(list_length & ~0xFFFFF);
   list_length &= 0xFFFFF;
+  if (Amped3CollapseSkipsIndirectBuffer()) {
+    return true;
+  }
   ExecuteIndirectBuffer(GpuToCpu(list_ptr), list_length);
   return true;
 }
@@ -1707,9 +1773,19 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       // Wait.
       if (wait >= 0x100) {
         PrepareForWait();
+        const uint64_t next_vblank = g_next_vblank_tick.load(std::memory_order_relaxed);
+        const uint64_t now = rex::chrono::Clock::QueryGuestTickCount();
         if (!REXCVAR_GET(vsync)) {
           // User wants it fast and dangerous.
           rex::thread::MaybeYield();
+        } else if (REXCVAR_GET(vblank_spin_wait) && next_vblank &&
+                   now + rex::chrono::Clock::guest_tick_frequency() * 3 / 2000 >= next_vblank) {
+          // A vblank is due within 1.5 ms: poll for it instead of sleeping on
+          // the wake event, whose wake-up can come ~0.5 ms late (Wine), and the
+          // swap after this wait with it.
+          for (int i = 0; i < 64; ++i) {
+            _mm_pause();
+          }
         } else {
           rex::thread::Wait(VblankWakeEvent(), false,
                             std::chrono::milliseconds(wait / 0x100));
@@ -1878,7 +1954,7 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
 
   // Writeback initiator.
   WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
-  if (REXCVAR_GET(gpu_screen_extents_delay) < 0) {
+  if (REXCVAR_GET(gpu_screen_extents_delay) == -1) {
     for (const Amped3DelayedExtents& delayed : g_amped3_delayed_extents) {
       memory::copy_and_swap_16_unaligned(memory_->TranslatePhysical(delayed.address),
                                          delayed.extents, 6);
@@ -1926,7 +2002,80 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* re
   assert_true(endianness == xenos::Endian::k8in16);
   memory::copy_and_swap_16_unaligned(memory_->TranslatePhysical(address), extents,
                                      rex::countof(extents));
+  if (REXCVAR_GET(gpu_screen_extents) >= 3) {
+    Amped3RecordScreenExtents(address);
+  }
   return true;
+}
+
+namespace draw_util {
+extern bool amped3_collapse_tile_1;
+extern uint32_t amped3_collapse_tile_right;
+extern uint32_t amped3_collapse_tile_bottom;
+}  // namespace draw_util
+
+bool CommandProcessor::Amped3CollapseSkipsIndirectBuffer() const {
+  // gpu_tile_collapse: tiles 2 and 3 run the indirect buffers tile 1 already
+  // ran (drawn full-size there); skipping them leaves the registers as tile 1
+  // left them plus the outer stream's per-tile writes, as running them would.
+  return Amped3TileOf(bin_select_) >= 2 && xenos::kEdramTileCount >= 4096 &&
+         REXCVAR_GET(gpu_tile_collapse);
+}
+
+void CommandProcessor::Amped3CollapseTile1Registers() {
+  // gpu_tile_collapse: the game draws its 720p scene in 3 predicated tiles
+  // (vertical columns of a 2x MSAA surface in gameplay, horizontal bands of a
+  // 4x MSAA one in menus), each fitting the 10 MB EDRAM. Tile 1 draws
+  // everything, so drawn full-size (1280x720, no MSAA, the targets in
+  // 720-tile EDRAM slots in their order) it is the whole picture.
+  constexpr uint32_t kWidth = 1280, kHeight = 720;
+  // 1280x720 at 1x is 16 x 45 tiles; 2x MSAA has twice the rows.
+  // (2x MSAA needs 3 * 1440 tiles: only with an 8192-tile EDRAM build.)
+  const bool keep_msaa = REXCVAR_GET(gpu_tile_collapse_msaa) && xenos::kEdramTileCount >= 8192;
+  const uint32_t kSlotTiles = keep_msaa ? 1440 : 720;
+  RegisterFile& regs = *register_file_;
+  Amped3Collapse& c = amped3_collapse_;
+  uint32_t& scissor_tl = regs.values[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL];
+  uint32_t& scissor_br = regs.values[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR];
+  uint32_t right = scissor_br & 0x7FFF, bottom = (scissor_br >> 16) & 0x7FFF;
+  if (right < kWidth || bottom < kHeight) {
+    // Tile 1's own rectangle (resolves of it are widened too).
+    c.tile_width = right - (scissor_tl & 0x7FFF);
+    c.tile_height = bottom - ((scissor_tl >> 16) & 0x7FFF);
+    draw_util::amped3_collapse_tile_right = right < kWidth ? right : 0;
+    draw_util::amped3_collapse_tile_bottom = bottom < kHeight ? bottom : 0;
+    scissor_br = (scissor_br & ~uint32_t(0x7FFF7FFF)) | std::max(right, kWidth) |
+                 (std::max(bottom, kHeight) << 16);
+  }
+  uint32_t& surface = regs.values[XE_GPU_REG_RB_SURFACE_INFO];
+  uint32_t pitch = surface & 0x3FFF;
+  auto msaa = xenos::MsaaSamples((surface >> 16) & 3);
+  if (surface != c.surface && (msaa != xenos::MsaaSamples::k1X || pitch < kWidth) && c.tile_height) {
+    // The EDRAM tiles each target of the tiled surface takes.
+    uint32_t pitch_tiles = xenos::GetSurfacePitchTiles(pitch, msaa, false);
+    uint32_t rows = (c.tile_height << uint32_t(msaa >= xenos::MsaaSamples::k2X)) / 16;
+    c.slot_tiles = std::max(pitch_tiles * rows, uint32_t(1));
+    uint32_t new_msaa = keep_msaa ? std::min(uint32_t(msaa), uint32_t(xenos::MsaaSamples::k2X)) : 0;
+    surface = (surface & ~uint32_t(0x33FFF)) | kWidth | (new_msaa << 16);
+    c.surface = surface;
+  } else if (surface != c.surface) {
+    return;
+  }
+  // With MSAA, from slot 1 up: the game's full-size 1x surfaces (the final
+  // composite) use the first 1440 tiles, and overlapping them with a 2x target
+  // would reinterpret one's samples as the other's.
+  const uint32_t first_slot = keep_msaa ? 1 : 0;
+  auto remap = [&c, kSlotTiles, first_slot](uint32_t& info) {
+    uint32_t base = info & 0x7FF;
+    uint32_t slot = (base + c.slot_tiles / 2) / c.slot_tiles + first_slot;
+    constexpr uint32_t kBaseMask = (uint32_t(1) << xenos::kEdramBaseTilesBits) - 1;
+    info = (info & ~kBaseMask) | std::min(slot * kSlotTiles, kBaseMask);
+  };
+  remap(regs.values[XE_GPU_REG_RB_COLOR_INFO]);
+  remap(regs.values[XE_GPU_REG_RB_COLOR1_INFO]);
+  remap(regs.values[XE_GPU_REG_RB_COLOR2_INFO]);
+  remap(regs.values[XE_GPU_REG_RB_COLOR3_INFO]);
+  remap(regs.values[XE_GPU_REG_RB_DEPTH_INFO]);
 }
 
 void CommandProcessor::Amped3FillScreenExtents(uint16_t extents[6], uint32_t address) {
@@ -2004,6 +2153,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
   // when true, render conditionally based on query result
   // uint32_t viz_use = viz_query_condition & 0x100;
   uint32_t words[3];
+  amped3_draw_address_ = uint32_t(reader->read_ptr() - uintptr_t(memory_->TranslatePhysical(0)));
   if (!Amped3ReadDraw(reader, opcode_name, count_remaining, words)) {
     return false;
   }
@@ -2112,6 +2262,48 @@ bool CommandProcessor::Amped3ExecuteDraw(const uint32_t words[3], const char* op
 
       bool major_mode_explicit =
           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
+      // (Only with the 4096-tile EDRAM the full-size targets need.)
+      const bool collapse = REXCVAR_GET(gpu_tile_collapse) && xenos::kEdramTileCount >= 4096;
+      draw_util::amped3_collapse_tile_1 = amped3_tile_ == 1 && collapse;
+      if (amped3_tile_ && collapse) {
+        if (amped3_tile_ >= 2) {
+          // Tile 1 drew (and resolved) everything.
+          return true;
+        }
+        Amped3CollapseTile1Registers();
+      }
+      if (g_amped3_tiling_trace) {
+        // amped3 debug: the state of each draw / copy, to compare the tiles:
+        // key registers and XXH3 of the register file in 256-register chunks.
+        const RegisterFile& r = *register_file_;
+        std::fprintf(g_amped3_tiling_trace,
+                     "D mode=%u prim=%u n=%u wo=%08X ws=%08X,%08X surf=%08X c0=%08X c1=%08X "
+                     "dep=%08X cpc=%08X cpd=%08X cpp=%08X cpi=%08X ss=%08X vp=%08X,%08X,%08X,%08X "
+                     "h=",
+                     uint32_t(r.Get<reg::RB_MODECONTROL>().edram_mode),
+                     uint32_t(vgt_draw_initiator.prim_type), vgt_draw_initiator.num_indices,
+                     r[XE_GPU_REG_PA_SC_WINDOW_OFFSET], r[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL],
+                     r[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR], r[XE_GPU_REG_RB_SURFACE_INFO],
+                     r[XE_GPU_REG_RB_COLOR_INFO], r[XE_GPU_REG_RB_COLOR1_INFO],
+                     r[XE_GPU_REG_RB_DEPTH_INFO], r[XE_GPU_REG_RB_COPY_CONTROL],
+                     r[XE_GPU_REG_RB_COPY_DEST_BASE], r[XE_GPU_REG_RB_COPY_DEST_PITCH],
+                     r[XE_GPU_REG_RB_COPY_DEST_INFO], r[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_BR],
+                     r[XE_GPU_REG_PA_CL_VPORT_XSCALE], r[XE_GPU_REG_PA_CL_VPORT_XOFFSET],
+                     r[XE_GPU_REG_PA_CL_VPORT_YSCALE], r[XE_GPU_REG_PA_CL_VPORT_YOFFSET]);
+        for (size_t i = 0; i < RegisterFile::kRegisterCount; i += 256) {
+          size_t n = std::min(size_t(256), RegisterFile::kRegisterCount - i);
+          std::fprintf(g_amped3_tiling_trace, "%08X",
+                       uint32_t(XXH3_64bits(&r.values[i], n * sizeof(uint32_t))));
+        }
+        // The register groups that differ between the tiles, in full.
+        for (uint32_t chunk : {64u, 67u, 68u, 71u, 72u}) {
+          std::fprintf(g_amped3_tiling_trace, " c%u:", chunk);
+          for (uint32_t i = chunk * 256; i < chunk * 256 + 256; ++i) {
+            std::fprintf(g_amped3_tiling_trace, "%X,", r.values[i]);
+          }
+        }
+        std::fputc('\n', g_amped3_tiling_trace);
+      }
       draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
                                  is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
       if (!draw_succeeded) {

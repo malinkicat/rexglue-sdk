@@ -32,6 +32,9 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
 
+REXCVAR_DEFINE_BOOL(xma_loop_data_fix, true, "Audio",
+                    "Read XMASetLoopData's loop points as the game's XMA_LOOP_DATA (false: the old "
+                    "reading as a context, which never looped)");
 REXCVAR_DEFINE_BOOL(xma_trace, false, "Audio", "Debug: log XMA context calls");
 #define XMA_TRACE(...) \
   do { if (REXCVAR_GET(xma_trace)) REXKRNL_INFO(__VA_ARGS__); } while (0)
@@ -272,18 +275,34 @@ u32 XMAInitializeContext_entry(mapped_void context_ptr, ppc_ptr_t<XMA_CONTEXT_IN
   return 0;
 }
 
-u32 XMASetLoopData_entry(mapped_void context_ptr, ppc_ptr_t<XMA_CONTEXT_DATA> loop_data) {
+// The game passes an XMA_LOOP_DATA (12 bytes: LoopStart and LoopEnd as
+// big-endian bit offsets, then LoopCount, LoopSubframeEnd and
+// LoopSubframeSkip as bytes), not a context: reading it as XMA_CONTEXT_DATA
+// (as Xenia did) gave garbage loop points.
+u32 XMASetLoopData_entry(mapped_void context_ptr, mapped_void loop_data_ptr) {
   if (REXCVAR_GET(xma_trace)) XmaTraceCount(context_ptr.guest_address(), "SetLoopData");
+  const auto* loop = static_cast<const uint8_t*>(loop_data_ptr.host_address());
+  if (!loop) return 0;
+  auto be32 = [](const uint8_t* p) {
+    return uint32_t(p[0]) << 24 | uint32_t(p[1]) << 16 | uint32_t(p[2]) << 8 | p[3];
+  };
+  uint32_t loop_start = be32(loop), loop_end = be32(loop + 4);
+  uint32_t loop_count = loop[8], loop_subframe_end = loop[9], loop_subframe_skip = loop[10];
+  if (!REXCVAR_GET(xma_loop_data_fix)) {
+    // The old reading, for comparison: the structure taken as a context.
+    const XMA_CONTEXT_DATA as_context(loop);
+    loop_start = as_context.loop_start, loop_end = as_context.loop_end, loop_count = as_context.loop_count;
+    loop_subframe_end = as_context.loop_subframe_end, loop_subframe_skip = as_context.loop_subframe_skip;
+  }
   XMA_CONTEXT_DATA context(context_ptr);
-  XMA_TRACE("XMA loop {:08X} {:X}-{:X} n={}", context_ptr.guest_address(),
-            uint32_t(loop_data->loop_start), uint32_t(loop_data->loop_end),
-            uint32_t(loop_data->loop_count));
+  XMA_TRACE("XMA loop {:08X} {:X}-{:X} n={} subframes {}/{}", context_ptr.guest_address(), loop_start, loop_end,
+            loop_count, loop_subframe_end, loop_subframe_skip);
 
-  context.loop_start = loop_data->loop_start;
-  context.loop_end = loop_data->loop_end;
-  context.loop_count = loop_data->loop_count;
-  context.loop_subframe_end = loop_data->loop_subframe_end;
-  context.loop_subframe_skip = loop_data->loop_subframe_skip;
+  context.loop_start = loop_start;
+  context.loop_end = loop_end;
+  context.loop_count = loop_count;
+  context.loop_subframe_end = loop_subframe_end;
+  context.loop_subframe_skip = loop_subframe_skip;
 
   context.Store(context_ptr);
 

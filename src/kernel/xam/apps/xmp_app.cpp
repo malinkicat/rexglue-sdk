@@ -9,10 +9,17 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/audio/user_music.h>
+#include <rex/cvar.h>
 #include <rex/kernel/xam/apps/xmp_app.h>
 #include <rex/logging.h>
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
+
+// Off by default: told, Amped 3 silences all its music, event cues too; the
+// runtime mutes just its songs (xma_context.cpp) instead.
+REXCVAR_DEFINE_BOOL(user_music_tells_title, false, "Audio",
+                    "Tell the title (XMP) when your music or another player replaces its songs");
 
 namespace rex {
 namespace kernel {
@@ -33,7 +40,16 @@ XmpApp::XmpApp(KernelState* kernel_state)
       active_playlist_(nullptr),
       active_song_index_(0),
       next_playlist_handle_(1),
-      next_song_handle_(1) {}
+      next_song_handle_(1) {
+  // The player's music starting or stopping (the mode changed, the other
+  // player, a cutscene): the title asks XMPGetPlaybackController again only
+  // when told, so tell it.
+  static KernelState* state = nullptr;
+  state = kernel_state;
+  rex::audio::SetTitleMusicChangedCallback([](bool replacing) {
+    if (state) state->BroadcastNotification(kMsgPlaybackControllerChanged, replacing ? 1 : 0);
+  });
+}
 
 X_HRESULT XmpApp::XMPGetStatus(uint32_t state_ptr) {
   if (!XThread::GetCurrentThread()->main_thread()) {
@@ -43,8 +59,15 @@ X_HRESULT XmpApp::XMPGetStatus(uint32_t state_ptr) {
   }
 
   REXKRNL_TRACE("XMPGetStatus({:08X})", state_ptr);
+  // The player's own music (--user_music) is the system's music, as music
+  // played from the dashboard was.
+  State state = state_;
+  if (REXCVAR_GET(user_music_tells_title) && playback_client_ == PlaybackClient::kSystem &&
+      rex::audio::UserMusicActive()) {
+    state = rex::audio::UserMusicPaused() ? State::kPaused : State::kPlaying;
+  }
   memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(state_ptr),
-                                   static_cast<uint32_t>(state_));
+                                   static_cast<uint32_t>(state));
   return X_E_SUCCESS;
 }
 
@@ -145,7 +168,8 @@ X_HRESULT XmpApp::XMPPlayTitlePlaylist(uint32_t playlist_handle, uint32_t song_h
 }
 
 X_HRESULT XmpApp::XMPContinue() {
-  REXKRNL_DEBUG("XMPContinue()");
+  REXKRNL_INFO("XMPContinue()");
+  rex::audio::PauseUserMusic(false);
   if (state_ == State::kPaused) {
     state_ = State::kPlaying;
   }
@@ -156,6 +180,7 @@ X_HRESULT XmpApp::XMPContinue() {
 X_HRESULT XmpApp::XMPStop(uint32_t unk) {
   assert_zero(unk);
   REXKRNL_DEBUG("XMPStop({:08X})", unk);
+  rex::audio::PauseUserMusic(true);
   active_playlist_ = nullptr;  // ?
   active_song_index_ = 0;
   state_ = State::kIdle;
@@ -164,7 +189,8 @@ X_HRESULT XmpApp::XMPStop(uint32_t unk) {
 }
 
 X_HRESULT XmpApp::XMPPause() {
-  REXKRNL_DEBUG("XMPPause()");
+  REXKRNL_INFO("XMPPause()");
+  rex::audio::PauseUserMusic(true);
   if (state_ == State::kPlaying) {
     state_ = State::kPaused;
   }
@@ -173,7 +199,11 @@ X_HRESULT XmpApp::XMPPause() {
 }
 
 X_HRESULT XmpApp::XMPNext() {
-  REXKRNL_DEBUG("XMPNext()");
+  REXKRNL_INFO("XMPNext()");
+  if (rex::audio::UserMusicActive()) {
+    rex::audio::SkipUserMusicTrack(1);
+    return X_E_SUCCESS;
+  }
   if (!active_playlist_) {
     return X_E_NOTFOUND;
   }
@@ -184,7 +214,11 @@ X_HRESULT XmpApp::XMPNext() {
 }
 
 X_HRESULT XmpApp::XMPPrevious() {
-  REXKRNL_DEBUG("XMPPrevious()");
+  REXKRNL_INFO("XMPPrevious()");
+  if (rex::audio::UserMusicActive()) {
+    rex::audio::SkipUserMusicTrack(-1);
+    return X_E_SUCCESS;
+  }
   if (!active_playlist_) {
     return X_E_NOTFOUND;
   }
@@ -385,10 +419,13 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
 
       assert_true((args->xmp_client == 0x00000002 && args->controller == 0x00000000) ||
                   (args->xmp_client == 0x00000000 && args->controller == 0x00000001));
-      REXKRNL_DEBUG("XMPSetPlaybackController({:08X}, {:08X})", uint32_t(args->controller),
+      REXKRNL_INFO("XMPSetPlaybackController({:08X}, {:08X})", uint32_t(args->controller),
                     uint32_t(args->playback_client));
 
       playback_client_ = PlaybackClient(uint32_t(args->playback_client));
+      // The title taking playback over silences the player's music (and gives
+      // the title's own music its volume back); handing it back resumes it.
+      rex::audio::PauseUserMusic(playback_client_ == PlaybackClient::kTitle);
       kernel_state_->BroadcastNotification(kMsgPlaybackControllerChanged, !args->playback_client);
       return X_E_SUCCESS;
     }
@@ -405,7 +442,16 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
       assert_true(args->xmp_client == 0x00000002);
       REXKRNL_DEBUG("XMPGetPlaybackController({:08X}, {:08X}, {:08X})", uint32_t(args->xmp_client),
                     uint32_t(args->controller_ptr), uint32_t(args->locked_ptr));
-      memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->controller_ptr), 0);
+      // 1: the system's player has the music (the player's own music,
+      // --user_music=on), and the title keeps its own music silent, as titles
+      // had to on a real console (the approach of pinyon-shift's shiftglue
+      // SDK, BSD-3).
+      // (--user_music_tells_title=false: the title keeps the controller - its
+      // own music is muted by the runtime anyway - so its radio popup shows.)
+      const uint32_t system_has_music =
+          REXCVAR_GET(user_music_tells_title) && rex::audio::UserMusicReplacingTitleMusic() ? 1 : 0;
+      memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->controller_ptr),
+                                       system_has_music);
       memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->locked_ptr), 0);
 
       if (!XThread::GetCurrentThread()->main_thread()) {

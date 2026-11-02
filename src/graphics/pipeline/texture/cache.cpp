@@ -10,22 +10,37 @@
  */
 
 #include <algorithm>
+#include <chrono>
+#include <cctype>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <string>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
+#include <rex/filesystem.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/texture/cache.h>
 #include <rex/graphics/pipeline/texture/info.h>
+#include <rex/graphics/pipeline/texture/replacement.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/perf/frame_rate.h>
 
+// d3d12/command_processor.cpp: also logs the texture loads.
+REXCVAR_DECLARE(int32_t, gpu_debug_log_draws);
+
+REXCVAR_DEFINE_BOOL(texture_replace_stats, false, "GPU/Texture Replacement",
+                    "Log texture replacement lookups and hashing per second");
 REXCVAR_DEFINE_INT32(texture_cache_memory_limit_render_to_texture, 24, "GPU",
                      "Texture cache memory limit for render-to-texture (MB)")
     .range(1, 256)
@@ -41,6 +56,13 @@ REXCVAR_DEFINE_INT32(texture_cache_memory_limit_hard, 768, "GPU",
     .range(128, 8192)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(texture_cache_pack_limits, true, "GPU",
+                    "While a texture pack is used, raise the texture cache memory limits to fit "
+                    "it (from the video memory: up to a quarter / half of it, at most 4096 / 8192 "
+                    "MB, never below texture_cache_memory_limit_soft / _hard)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload)
+    .debug_only();
+
 REXCVAR_DEFINE_INT32(texture_cache_memory_limit_soft_lifetime, 30, "GPU",
                      "Soft texture cache memory limit lifetime (seconds)")
     .range(1, 3600);
@@ -49,7 +71,7 @@ REXCVAR_DEFINE_BOOL(gpu_3d_to_2d_texture, true, "GPU",
                     "Sample problematic 3D textures through 2D-compatible wrappers")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_INT32(anisotropic_override, 3, "GPU",
+REXCVAR_DEFINE_INT32(anisotropic_override, 5, "GPU",
                      "Forces anisotropic filtering for eligible textures.\n"
                      "Higher values keep textures sharper at oblique angles, but increase texture "
                      "sampling cost.\n"
@@ -79,6 +101,46 @@ REXCVAR_DEFINE_INT32(resolution_scale, 1, "GPU",
 
 REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
                     "Pre-mask scaled resolve L2 blocks to the write range before iterating");
+
+REXCVAR_DEFINE_BOOL(texture_dump_enabled, false, "GPU/Texture Replacement",
+                    "Dump loaded textures to DDS files for replacement authoring")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(texture_replace_enabled, false, "GPU/Texture Replacement",
+                    "Inject replacement textures from disk when available")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(texture_replace_preload, true, "GPU/Texture Replacement",
+                    "Decode all the replacement textures in the background at startup, so they "
+                    "don't stutter the game the first time they're used (keeps all of them in "
+                    "RAM)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_BOOL(texture_replace_async, true, "GPU/Texture Replacement",
+                    "Never wait for a replacement to decode: the original texture is shown until "
+                    "the replacement is ready (a moment later), so new textures don't stutter the "
+                    "game");
+
+REXCVAR_DEFINE_INT32(texture_replace_ram_mb, 3072, "GPU/Texture Replacement",
+                     "RAM for decoded replacement textures (MB). The least recently used ones are "
+                     "dropped past it (and decoded again if needed), and a pack bigger than this "
+                     "isn't preloaded")
+    .range(256, 65536)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_STRING(texture_replace_alpha, "auto", "GPU/Texture Replacement",
+                      "How the pack's images store transparency: auto (each image compared with "
+                      "the game's own texture it replaces - or, without one, a sample of the "
+                      "pack decides), straight (colour not multiplied by alpha, like the game's own "
+                      "textures) or premultiplied (colour multiplied by alpha, as some upscaling "
+                      "tools export it - converted to straight alpha when loaded; drawn as it is, "
+                      "soft edges, glows, clouds and decals come out dark)")
+    .allowed({"auto", "straight", "premultiplied"})
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_STRING(texture_folder, "", "GPU/Texture Replacement",
+                      "Texture dump folder (empty = <executable folder>/textures)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 // DEFINE_int32(
 //     draw_resolution_scale_x, 1,
@@ -126,6 +188,14 @@ REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
 //     "GPU");
 
 namespace rex::graphics {
+
+static std::filesystem::path GetTextureDumpFolder() {
+  const std::string configured_texture_folder = REXCVAR_GET(texture_folder);
+  if (!configured_texture_folder.empty()) {
+    return rex::to_path(configured_texture_folder);
+  }
+  return rex::filesystem::GetExecutableFolder() / "textures";
+}
 
 const TextureCache::LoadShaderInfo TextureCache::load_shader_info_[kLoadShaderCount] = {
     // k8bpb
@@ -215,14 +285,51 @@ TextureCache::TextureCache(const RegisterFile& register_file, SharedMemory& shar
   assert_true(draw_resolution_scale_y >= 1);
   assert_true(draw_resolution_scale_y <= kMaxDrawResolutionScaleAlongAxis);
 
+  // The pages last written by resolves: scaled textures are made from them
+  // above 1x, and texture replacement skips them (render-to-texture data
+  // changes all the time - finding a replacement for it would hash the whole
+  // texture again each time it's used). At 1x they're tracked only once
+  // texture dumping or replacement is on (EnsureTextureReplacement), so with
+  // both off nothing changes.
   if (draw_resolution_scale_x > 1 || draw_resolution_scale_y > 1) {
-    constexpr uint32_t kScaledResolvePageDwordCount = SharedMemory::kBufferSize / 4096 / 32;
-    scaled_resolve_pages_ = std::unique_ptr<uint32_t[]>(new uint32_t[kScaledResolvePageDwordCount]);
-    std::memset(scaled_resolve_pages_.get(), 0, kScaledResolvePageDwordCount * sizeof(uint32_t));
-    std::memset(scaled_resolve_pages_l2_, 0, sizeof(scaled_resolve_pages_l2_));
-    scaled_resolve_global_watch_handle_ =
-        shared_memory.RegisterGlobalWatch(ScaledResolveGlobalWatchCallbackThunk, this);
+    EnableResolvedPageTracking();
   }
+
+  EnsureTextureReplacement();
+}
+
+void TextureCache::EnableResolvedPageTracking() {
+  if (scaled_resolve_pages_) {
+    return;
+  }
+  constexpr uint32_t kScaledResolvePageDwordCount = SharedMemory::kBufferSize / 4096 / 32;
+  scaled_resolve_pages_ = std::unique_ptr<uint32_t[]>(new uint32_t[kScaledResolvePageDwordCount]);
+  std::memset(scaled_resolve_pages_.get(), 0, kScaledResolvePageDwordCount * sizeof(uint32_t));
+  std::memset(scaled_resolve_pages_l2_, 0, sizeof(scaled_resolve_pages_l2_));
+  scaled_resolve_global_watch_handle_ =
+      shared_memory().RegisterGlobalWatch(ScaledResolveGlobalWatchCallbackThunk, this);
+}
+
+void TextureCache::EnsureTextureReplacement() {
+  // Nothing (no folder scan, no threads, no hashing) until texture_dump_enabled
+  // or texture_replace_enabled is turned on; then made once.
+  if (replacement_ ||
+      (!REXCVAR_GET(texture_dump_enabled) && !REXCVAR_GET(texture_replace_enabled))) {
+    return;
+  }
+  EnableResolvedPageTracking();
+  InitTextureReplacement(GetTextureDumpFolder());
+}
+
+void TextureCache::InitTextureReplacement(const std::filesystem::path& textures_dir) {
+  replacement_ = std::make_unique<TextureReplacement>(textures_dir);
+  // A replacement decoded in the background: look the bound textures up again,
+  // so it's used from the next draws.
+  replacement_->SetReadyCallback(
+      [this]() { texture_became_outdated_.store(true, std::memory_order_release); });
+  // Its upload data made on the loading thread too, so the frame only copies.
+  replacement_->SetPrepareCallback(
+      [this](const TextureReplacementData& data) { return PrepareReplacementUploadImpl(data); });
 }
 
 TextureCache::~TextureCache() {
@@ -232,6 +339,76 @@ TextureCache::~TextureCache() {
     shared_memory().UnregisterGlobalWatch(scaled_resolve_global_watch_handle_);
   }
 }
+
+namespace {
+
+// The replacement key of a texture: XXH3 of its base level as the guest
+// stores it, with the bytes the texture doesn't use - the padding of tiles
+// and rows around its texels - taken as zero. Games leave whatever was in
+// memory there, which would give the same texture a different key from run
+// to run; zero is what the tools building a pack from the game files see.
+// Textures without padding (or with a layout this doesn't handle - 3D,
+// arrays, a base in the packed mip tail) hash their bytes as they are.
+uint64_t HashReplacementBase(const texture_util::TextureGuestLayout& layout,
+                             xenos::DataDimension dimension, xenos::TextureFormat format,
+                             bool tiled, const uint8_t* guest_bytes, uint32_t guest_size) {
+  const texture_util::TextureGuestLayout::Level& base = layout.base;
+  const FormatInfo* format_info = FormatInfo::Get(format);
+  const uint32_t bytes_per_block = format_info->bytes_per_block();
+  if (dimension != xenos::DataDimension::k2DOrStacked || layout.array_size != 1 ||
+      layout.packed_level == 0 || !bytes_per_block ||
+      (bytes_per_block & (bytes_per_block - 1)) || !base.row_pitch_bytes) {
+    return TextureReplacement::HashGuestData(guest_bytes, guest_size);
+  }
+  const uint32_t x_blocks = base.x_extent_blocks;
+  const uint32_t y_blocks = base.y_extent_blocks;
+  const uint32_t row_bytes = x_blocks * bytes_per_block;
+  if (uint64_t(row_bytes) * y_blocks >= guest_size) {
+    return TextureReplacement::HashGuestData(guest_bytes, guest_size);
+  }
+  std::vector<uint8_t> used(guest_size, 0);
+  if (tiled) {
+    const uint32_t bytes_per_block_log2 = rex::log2_floor(bytes_per_block);
+    const uint32_t pitch_blocks = base.row_pitch_bytes / bytes_per_block;
+    for (uint32_t y = 0; y < y_blocks; ++y) {
+      for (uint32_t x = 0; x < x_blocks; ++x) {
+        const uint32_t offset = uint32_t(
+            texture_util::GetTiledOffset2D(int32_t(x), int32_t(y), pitch_blocks,
+                                           bytes_per_block_log2));
+        if (uint64_t(offset) + bytes_per_block <= guest_size) {
+          std::memcpy(used.data() + offset, guest_bytes + offset, bytes_per_block);
+        }
+      }
+    }
+  } else {
+    for (uint32_t y = 0; y < y_blocks; ++y) {
+      const uint64_t offset = uint64_t(y) * base.row_pitch_bytes;
+      if (offset + row_bytes > guest_size) {
+        break;
+      }
+      std::memcpy(used.data() + offset, guest_bytes + offset, row_bytes);
+    }
+  }
+  return TextureReplacement::HashGuestData(used.data(), used.size());
+}
+
+// What HashReplacementBase depends on besides the bytes.
+uint64_t ReplacementLayoutSignature(const texture_util::TextureGuestLayout& layout,
+                                    xenos::DataDimension dimension, xenos::TextureFormat format,
+                                    bool tiled) {
+  const uint32_t values[] = {uint32_t(dimension),
+                             uint32_t(format),
+                             uint32_t(tiled),
+                             layout.array_size,
+                             layout.packed_level,
+                             layout.base.row_pitch_bytes,
+                             layout.base.x_extent_blocks,
+                             layout.base.y_extent_blocks};
+  return TextureReplacement::HashGuestData(reinterpret_cast<const uint8_t*>(values),
+                                           sizeof(values));
+}
+
+}  // namespace
 
 bool TextureCache::GetConfigDrawResolutionScale(uint32_t& x_out, uint32_t& y_out) {
   uint32_t shared_scale = uint32_t(std::max(INT32_C(1), REXCVAR_GET(resolution_scale)));
@@ -253,19 +430,79 @@ void TextureCache::ClearCache() {
   DestroyAllTextures();
 }
 
-void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_index) {
-  // If memory usage is too high, destroy unused textures.
-  uint64_t current_time = rex::chrono::Clock::QueryHostUptimeMillis();
+void TextureCache::GetMemoryLimits(uint32_t& soft_mb_out, uint32_t& hard_mb_out) {
+  uint32_t soft_mb = uint32_t(std::max(REXCVAR_GET(texture_cache_memory_limit_soft), INT32_C(1)));
+  uint32_t hard_mb = uint32_t(std::max(REXCVAR_GET(texture_cache_memory_limit_hard), INT32_C(1)));
+  // A texture pack's images are several times the size of the originals (and
+  // have full mip chains), so the defaults - made for the game's own textures
+  // - can't hold the ones a scene uses, and textures would be destroyed and
+  // made again from the decoded images all the time. The pack's limits come
+  // from the video memory, and don't depend on the draw resolution scale (the
+  // render-to-texture part below is added on top as usual).
+  if (REXCVAR_GET(texture_cache_pack_limits) && REXCVAR_GET(texture_replace_enabled) &&
+      replacement_ && replacement_->GetReplacementCount()) {
+    if (!pack_limit_hard_mb_) {
+      uint64_t budget = 0, usage = 0;
+      if (!QueryLocalVideoMemory(budget, usage)) {
+        budget = 0;
+      }
+      const uint64_t budget_mb = budget >> 20;
+      if (budget_mb) {
+        pack_limit_soft_mb_ = uint32_t(std::min<uint64_t>(budget_mb / 4, 4096));
+        pack_limit_hard_mb_ = uint32_t(std::min<uint64_t>(budget_mb / 2, 8192));
+      } else {
+        pack_limit_soft_mb_ = 1024;
+        pack_limit_hard_mb_ = 2048;
+      }
+      const uint32_t log_soft = std::max(soft_mb, pack_limit_soft_mb_);
+      const uint32_t log_hard = std::max(hard_mb, pack_limit_hard_mb_);
+      // Once per value (the cache is made again when the scale changes).
+      static uint64_t logged_limits = 0;
+      const uint64_t limits = (uint64_t(log_soft) << 32) | log_hard;
+      if (logged_limits != limits) {
+        logged_limits = limits;
+        REXLOG_INFO(
+            "Texture cache: a texture pack is in use ({} replacements) - memory limits soft {} "
+            "MB / hard {} MB (video memory budget {} MB{}; texture_cache_memory_limit_soft / "
+            "_hard {} / {} MB)",
+            replacement_->GetReplacementCount(), log_soft, log_hard, budget_mb,
+            budget_mb ? "" : " unknown", soft_mb, hard_mb);
+      }
+    }
+    soft_mb = std::max(soft_mb, pack_limit_soft_mb_);
+    hard_mb = std::max(hard_mb, pack_limit_hard_mb_);
+  }
   // texture_cache_memory_limit_render_to_texture is assumed to be included in
   // texture_cache_memory_limit_soft and texture_cache_memory_limit_hard, at 1x,
   // so subtracting 1 from the scale.
-  uint32_t limit_scaled_resolve_add_mb =
+  const uint32_t limit_scaled_resolve_add_mb =
       REXCVAR_GET(texture_cache_memory_limit_render_to_texture) *
       (draw_resolution_scale_x() * draw_resolution_scale_y() - 1);
-  uint32_t limit_soft_mb =
-      REXCVAR_GET(texture_cache_memory_limit_soft) + limit_scaled_resolve_add_mb;
-  uint32_t limit_hard_mb =
-      REXCVAR_GET(texture_cache_memory_limit_hard) + limit_scaled_resolve_add_mb;
+  soft_mb_out = soft_mb + limit_scaled_resolve_add_mb;
+  hard_mb_out = hard_mb + limit_scaled_resolve_add_mb;
+}
+
+void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_index) {
+  // If memory usage is too high, destroy unused textures.
+  uint64_t current_time = rex::chrono::Clock::QueryHostUptimeMillis();
+  uint32_t limit_soft_mb, limit_hard_mb;
+  GetMemoryLimits(limit_soft_mb, limit_hard_mb);
+  {
+    rex::perf::TextureCacheStats& stats = rex::perf::GetTextureCacheStats();
+    stats.memory_bytes.store(textures_total_host_memory_usage_, std::memory_order_relaxed);
+    stats.limit_soft_mb.store(limit_soft_mb, std::memory_order_relaxed);
+    stats.limit_hard_mb.store(limit_hard_mb, std::memory_order_relaxed);
+    // The process's video memory, for perf_report - once a second.
+    static uint64_t last_vram_query_time = 0;
+    if (current_time - last_vram_query_time >= 1000) {
+      last_vram_query_time = current_time;
+      uint64_t budget = 0, usage = 0;
+      if (QueryLocalVideoMemory(budget, usage)) {
+        stats.vram_budget_bytes.store(budget, std::memory_order_relaxed);
+        stats.vram_usage_bytes.store(usage, std::memory_order_relaxed);
+      }
+    }
+  }
   uint32_t limit_soft_lifetime = REXCVAR_GET(texture_cache_memory_limit_soft_lifetime) * 1000;
   bool destroyed_any = false;
   while (texture_used_first_ != nullptr) {
@@ -298,6 +535,7 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
       assert_true(found_texture_it->second.get() == texture);
       textures_.erase(found_texture_it);
       // `texture` is invalid now.
+      rex::perf::GetTextureCacheStats().destroyed.fetch_add(1, std::memory_order_relaxed);
     }
   }
   if (destroyed_any) {
@@ -325,7 +563,8 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
   start_unscaled &= 0x1FFFFFFF;
   length_unscaled = std::min(length_unscaled, 0x20000000 - start_unscaled);
 
-  if (IsDrawResolutionScaled()) {
+  // (Tracked above 1x, or with texture dumping / replacement on.)
+  if (scaled_resolve_pages_) {
     uint32_t page_first = start_unscaled >> 12;
     uint32_t page_last = (start_unscaled + length_unscaled - 1) >> 12;
     uint32_t block_first = page_first >> 5;
@@ -362,6 +601,25 @@ uint32_t TextureCache::GuestToHostSwizzle(uint32_t guest_swizzle, uint32_t host_
       host_swizzle_component = (host_format_swizzle >> (3 * guest_swizzle_component)) & 0b111;
     }
     host_swizzle |= host_swizzle_component << (3 * i);
+  }
+  return host_swizzle;
+}
+
+uint32_t TextureCache::ReplacementHostSwizzle(uint32_t guest_swizzle,
+                                              uint32_t host_format_swizzle) {
+  // Only formats whose host texture keeps the guest components in place
+  // (RGBA-like: 8_8_8_8, DXT1-5, ...); single- and two-channel formats
+  // replicate components and keep the plain mapping.
+  uint32_t channel_of[4];
+  if (host_format_swizzle != xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA ||
+      !TextureReplacement::GetSwizzleColorOrder(guest_swizzle, channel_of)) {
+    return GuestToHostSwizzle(guest_swizzle, host_format_swizzle);
+  }
+  uint32_t host_swizzle = 0;
+  for (uint32_t i = 0; i < 4; ++i) {
+    const uint32_t c = (guest_swizzle >> (3 * i)) & 0b111;
+    const uint32_t host_c = c >= xenos::XE_GPU_TEXTURE_SWIZZLE_0 ? (c & 0b101) : channel_of[c];
+    host_swizzle |= host_c << (3 * i);
   }
   return host_swizzle;
 }
@@ -435,9 +693,57 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
     }
   }
 
-  if (!LoadTextureDataFromResidentMemoryImpl(texture, pending_load.load_base,
+  bool uploaded_replacement = false;
+  if (texture.replacement_content_hash_ != 0 && replacement_) {
+    const auto upload_start = std::chrono::steady_clock::now();
+    const TextureReplacementData* replacement =
+        replacement_->FindReplacement(texture.replacement_content_hash_);
+    const auto found = std::chrono::steady_clock::now();
+    if (replacement) {
+      uploaded_replacement = LoadTextureDataFromReplacementImpl(texture, *replacement);
+    }
+    const auto upload_end = std::chrono::steady_clock::now();
+    const double upload_ms =
+        std::chrono::duration<double, std::milli>(upload_end - upload_start).count();
+    if (upload_ms > 8.0 && replacement) {
+      REXLOG_INFO("TextureReplacement: {}x{} took {:.1f} ms (find {:.1f} ms, upload {:.1f} ms)",
+                  replacement->width, replacement->height, upload_ms,
+                  std::chrono::duration<double, std::milli>(found - upload_start).count(),
+                  std::chrono::duration<double, std::milli>(upload_end - found).count());
+    }
+    // The texture has the replacement's size and format: the guest data can't
+    // go in. The file is marked failed and the bindings looked up again, so
+    // the original texture is made instead.
+    if (!uploaded_replacement) {
+      replacement_->MarkFailed(texture.replacement_content_hash_);
+      replacement_memo_.clear();  // lookups that resolved to it go through again
+      texture_became_outdated_.store(true, std::memory_order_release);
+      return false;
+    }
+  }
+
+  if (!uploaded_replacement &&
+      !LoadTextureDataFromResidentMemoryImpl(texture, pending_load.load_base,
                                              pending_load.load_mips)) {
     return false;
+  }
+
+  // Dump the originals (a replaced texture's key has the replacement's size
+  // and format, and its original is in the pack already).
+  if (replacement_ && pending_load.load_base && REXCVAR_GET(texture_dump_enabled) &&
+      !texture_key.scaled_resolve && !texture.replacement_content_hash_) {
+    const uint32_t guest_addr = texture_key.base_page << 12;
+    const uint32_t guest_size = texture.GetGuestBaseSize();
+    if (guest_size > 0 && !IsRangeResolved(guest_addr, guest_size)) {
+      const uint8_t* guest_bytes = shared_memory().TranslatePhysical(guest_addr);
+      const uint64_t content_hash =
+          HashReplacementBase(texture.guest_layout(), texture_key.dimension, texture_key.format,
+                              texture_key.tiled != 0, guest_bytes, guest_size);
+      replacement_->DumpTexture(content_hash, texture_key.GetWidth(), texture_key.GetHeight(),
+                                texture_key.pitch, texture_key.tiled != 0, texture_key.format,
+                                texture_key.endianness, guest_bytes, guest_size,
+                                texture.last_guest_swizzle_);
+    }
   }
 
   // Mark the ranges as uploaded and watch them. This is needed for scaled
@@ -446,12 +752,37 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
   // not up to date anymore.
   texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
   texture.LogAction("Loaded");
+  {
+    rex::perf::TextureCacheStats& stats = rex::perf::GetTextureCacheStats();
+    stats.loaded.fetch_add(1, std::memory_order_relaxed);
+    if (uploaded_replacement) {
+      stats.replacement_uploads.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (rex::perf::IsGpuProfiling()) {
+      rex::perf::GpuProfileStats& gpu_stats = rex::perf::GetGpuProfileStats();
+      gpu_stats.texture_loads.fetch_add(1, std::memory_order_relaxed);
+      gpu_stats.texture_load_bytes.fetch_add(texture.GetHostMemoryUsage(),
+                                             std::memory_order_relaxed);
+    }
+    if (REXCVAR_GET(gpu_debug_log_draws) > 0) {
+      REXGPU_INFO("TEXLOAD {:08X} {}x{} fmt {} scaled {} mips {} host {} KB{}",
+                  texture_key.base_page << 12, texture_key.GetWidth(), texture_key.GetHeight(),
+                  uint32_t(texture_key.format), uint32_t(texture_key.scaled_resolve),
+                  uint32_t(texture_key.mip_max_level), texture.GetHostMemoryUsage() >> 10,
+                  uploaded_replacement ? " replacement" : "");
+    }
+  }
 
   return true;
 }
 
 void TextureCache::RequestTextures(uint32_t used_texture_mask) {
   const auto& regs = register_file();
+
+  // Texture dumping / replacement turned on while running (hot reload).
+  if (!replacement_) {
+    EnsureTextureReplacement();
+  }
 
   // A plain load first: the exchange (a locked instruction) on every draw is
   // costly, and the flag is rarely set.
@@ -504,6 +835,9 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     uint8_t old_swizzled_signs = binding.swizzled_signs;
     BindingInfoFromFetchConstant(fetch, binding.key, &binding.swizzled_signs);
     texture_bindings_in_sync_ |= index_bit;
+    // For FindOrCreateTexture below (a replacement's original is compared in
+    // the colours this binding shows).
+    replacement_lookup_swizzle_ = fetch.swizzle;
     if (!binding.key.is_valid) {
       if (old_key.is_valid) {
         bindings_changed |= index_bit;
@@ -513,6 +847,10 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
     }
     uint32_t old_host_swizzle = binding.host_swizzle;
     binding.host_swizzle = GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(binding.key));
+    if (binding.key == old_key && binding.texture && binding.texture->replacement_content_hash_) {
+      binding.host_swizzle =
+          ReplacementHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(binding.key));
+    }
 
     // Check if need to load the unsigned and the signed versions of the texture
     // (if the format is emulated with different host bit representations for
@@ -562,6 +900,31 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       }
       binding.texture_signed = nullptr;
     }
+    // A replacement image holds the colours the game shows: guest data
+    // stored in another component order (ARGB read with ZYXW) must not be
+    // reordered once more.
+    if (binding.texture && binding.texture->replacement_content_hash_) {
+      const uint32_t replacement_swizzle =
+          ReplacementHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(binding.key));
+      if (replacement_swizzle != binding.host_swizzle) {
+        // Once per replacement (bindings are looked up again every frame).
+        static std::unordered_set<uint64_t> logged;
+        if (logged.size() < 256 && logged.insert(binding.texture->replacement_content_hash_).second) {
+          REXLOG_INFO(
+              "TextureReplacement: {:016x} (guest format {}, fetch swizzle {:03o}) shown in "
+              "the replacement's own colour order",
+              binding.texture->replacement_content_hash_, uint32_t(binding.key.format),
+              uint32_t(fetch.swizzle));
+        }
+        binding.host_swizzle = replacement_swizzle;
+        if (replacement_swizzle != old_host_swizzle) {
+          bindings_changed |= index_bit;
+        }
+      }
+    }
+    if (binding.texture) {
+      binding.texture->last_guest_swizzle_ = fetch.swizzle;
+    }
     if (load_unsigned_data) {
       queue_pending_texture_load(binding.texture);
     }
@@ -569,6 +932,8 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
       queue_pending_texture_load(binding.texture_signed);
     }
   }
+
+  replacement_lookup_swizzle_ = 0x688;  // XYZW
 
   COUNT_profile_set("gpu/texture_cache/request_textures_pending_load_count",
                     uint32_t(pending_texture_loads.size()));
@@ -753,6 +1118,7 @@ void TextureCache::Texture::WatchCallback(
     base_outdated_ = true;
     base_watch_handle_ = nullptr;
     outdated_mask_.fetch_or(kOutdatedBitBase, std::memory_order_release);
+    texture_cache_.InvalidateHashCache(key().base_page);
   }
 }
 
@@ -865,27 +1231,207 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     get_host_extent(host_width, host_height, host_depth_or_array_size);
   }
 
+  // Look for a replacement using a stable hash of the original guest bytes.
+  texture_util::TextureGuestLayout original_guest_layout{};
+  bool has_replacement = false;
+  uint64_t replacement_content_hash = 0;
+
+  // (The program's in-memory replacements count too, with or without a pack.)
+  const bool replacing = replacement_ &&
+                         (REXCVAR_GET(texture_replace_enabled) || rex::graphics::HasTextureMemoryReplacements()) &&
+                         key.base_page != 0 && !key.scaled_resolve;
+  const TextureKey original_key = key;
+  bool memo_final = false;  // the result can be remembered (not waiting for a decode)
+  if (replacing) {
+    auto memo = replacement_memo_.find(key);
+    if (memo != replacement_memo_.end()) {
+      auto texture_it = textures_.find(memo->second);
+      if (texture_it != textures_.end() && !texture_it->second->outdated_mask()) {
+        return texture_it->second.get();
+      }
+      replacement_memo_.erase(memo);
+    }
+  }
+  if (replacing) {
+    memo_final = true;
+    original_guest_layout = key.GetGuestLayout();
+    const uint32_t guest_size = original_guest_layout.base.level_data_extent_bytes;
+
+    // Not render-to-texture data (resolved, and not written by the CPU since):
+    // that changes from frame to frame, so its key would be hashed again on
+    // every use - at 1x, where it isn't a scaled resolve texture, several
+    // full-screen textures a frame took most of the frame time.
+    if (guest_size > 0 && !IsRangeResolved(key.base_page << 12, guest_size)) {
+      const uint32_t base_page = key.base_page;
+      const uint8_t* guest_bytes = shared_memory().TranslatePhysical(key.base_page << 12);
+      const uint64_t fingerprint =
+          TextureReplacement::FingerprintGuestData(guest_bytes, guest_size);
+      const uint64_t layout = ReplacementLayoutSignature(original_guest_layout, key.dimension,
+                                                         key.format, key.tiled != 0);
+      auto cached_hash = base_page_hash_cache_.find(base_page);
+
+      rex::perf::TextureCacheStats& stats = rex::perf::GetTextureCacheStats();
+      stats.replacement_lookups.fetch_add(1, std::memory_order_relaxed);
+      if (REXCVAR_GET(texture_replace_stats)) {
+        static auto next = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        static uint64_t lookups = 0, hashes = 0, hash_ns = 0;
+        if (std::chrono::steady_clock::now() >= next) {
+          next += std::chrono::seconds(5);
+          const uint64_t l = stats.replacement_lookups, h = stats.replacement_hashes, n = stats.replacement_hash_ns;
+          REXLOG_INFO("TextureReplacement: per second: {} lookups, {} hashes ({:.2f} ms hashing)", (l - lookups) / 5,
+                      (h - hashes) / 5, double(n - hash_ns) / 5e6);
+          lookups = l, hashes = h, hash_ns = n;
+        }
+      }
+      if (cached_hash != base_page_hash_cache_.end() &&
+          cached_hash->second.size == guest_size &&
+          cached_hash->second.fingerprint == fingerprint &&
+          cached_hash->second.layout == layout) {
+        replacement_content_hash = cached_hash->second.hash;
+      } else {
+        const auto hash_start = std::chrono::steady_clock::now();
+        replacement_content_hash =
+            HashReplacementBase(original_guest_layout, key.dimension, key.format, key.tiled != 0,
+                                guest_bytes, guest_size);
+        base_page_hash_cache_[base_page] = {guest_size, fingerprint, layout,
+                                            replacement_content_hash};
+        stats.replacement_hashes.fetch_add(1, std::memory_order_relaxed);
+        stats.replacement_hash_ns.fetch_add(
+            uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now() - hash_start)
+                         .count()),
+            std::memory_order_relaxed);
+      }
+
+      // Only the size here - the pixels are decoded when the texture is
+      // loaded (and may have been dropped from RAM since).
+      uint32_t replacement_width = 0, replacement_height = 0;
+      if (replacement_->FindReplacementSize(replacement_content_hash, replacement_width,
+                                            replacement_height)) {
+        // The key holds up to 8192 per side (bigger images are given at that
+        // size already - TextureReplacement::FitReplacementSize).
+        const uint32_t max_size = std::min(GetMaxHostTextureWidthHeight(key.dimension),
+                                           xenos::kTexture2DCubeMaxWidthHeight);
+
+        if (replacement_width > max_size || replacement_height > max_size) {
+          static std::unordered_set<uint64_t> logged_too_big;
+          if (logged_too_big.size() < 256 &&
+              logged_too_big.insert(replacement_content_hash).second) {
+            REXLOG_WARN(
+                "TextureReplacement: {:016x} is {}x{}, more than this GPU's textures can be "
+                "({} per side) - the original texture is shown",
+                replacement_content_hash, replacement_width, replacement_height, max_size);
+          }
+        } else {
+          const uint32_t original_width = key.GetWidth();
+          const uint32_t original_height = key.GetHeight();
+
+          TextureKey replacement_key = key;
+          replacement_key.width_minus_1 = replacement_width - 1;
+          replacement_key.height_minus_1 = replacement_height - 1;
+          replacement_key.format = xenos::TextureFormat::k_8_8_8_8;
+          // Mips (made when the replacement is loaded) down to the game's own
+          // last level at the replacement's scale - level log2(scale) is the
+          // original's base: a texture the game made without mips keeps the
+          // original's detail at a distance (not blurred below it) and isn't
+          // sampled finer than the original either (no extra shimmer); one
+          // with a full chain gets a full chain.
+          const float scale = std::max(float(replacement_width) / float(original_width),
+                                       float(replacement_height) / float(original_height));
+          const uint32_t scale_log2 =
+              scale > 1.0f ? uint32_t(std::floor(std::log2(scale) + 0.01f)) : 0;
+          replacement_key.mip_max_level =
+              std::min({rex::log2_floor(std::max(replacement_width, replacement_height)),
+                        uint32_t(xenos::kTextureMaxMips - 1),
+                        uint32_t(key.mip_max_level) + scale_log2});
+          replacement_key.replacement_id = uint32_t(replacement_content_hash & 0xFFFFFFF) | 1;
+
+          // Premultiplied alpha (texture_replace_alpha): the original's data
+          // for the loading thread to compare the replacement with, while the
+          // guest memory holds it.
+          if (textures_.find(replacement_key) == textures_.end() &&
+              key.dimension == xenos::DataDimension::k2DOrStacked &&
+              original_guest_layout.array_size == 1 && original_guest_layout.packed_level != 0 &&
+              TextureReplacement::CanDecodeGuestFormat(key.format) &&
+              replacement_->WantsGuestReference(replacement_content_hash)) {
+            auto guest = std::make_shared<TextureReplacementGuest>();
+            guest->bytes.assign(guest_bytes, guest_bytes + guest_size);
+            guest->width = original_width;
+            guest->height = original_height;
+            guest->row_pitch_bytes = original_guest_layout.base.row_pitch_bytes;
+            guest->tiled = key.tiled != 0;
+            guest->format = key.format;
+            guest->endianness = key.endianness;
+            guest->swizzle = replacement_lookup_swizzle_;
+            replacement_->SetGuestReference(replacement_content_hash, std::move(guest));
+          }
+
+          // Not decoded yet: the original texture this time, the replacement
+          // decoded in the background (its ready callback has the bindings
+          // looked up again). A replacement texture already made is used.
+          if (REXCVAR_GET(texture_replace_async) &&
+              textures_.find(replacement_key) == textures_.end() &&
+              !replacement_->IsResident(replacement_content_hash)) {
+            replacement_->RequestAsync(replacement_content_hash);
+            memo_final = false;
+          } else {
+            key = replacement_key;
+            has_replacement = true;
+          }
+
+          REXGPU_DEBUG(
+              "TextureReplacement: injecting {}x{} replacement for original {}x{} "
+              "(hash {:016x})",
+              replacement_width, replacement_height,
+              original_width, original_height, replacement_content_hash);
+        }
+      }
+    }
+  }
+
   // Try to find an existing texture.
   // TODO(Triang3l): Reuse a texture with mip_page unchanged, but base_page
   // previously 0, now not 0, to save memory - common case in streaming.
+  auto remember = [&] {
+    if (!memo_final) return;
+    if (replacement_memo_.size() > 65536) replacement_memo_.clear();
+    replacement_memo_[original_key] = key;
+  };
   auto found_texture_it = textures_.find(key);
   if (found_texture_it != textures_.end()) {
+    remember();
     return found_texture_it->second.get();
   }
 
   // Create the texture and add it to the map.
   Texture* texture;
   {
+    const auto create_start = std::chrono::steady_clock::now();
     std::unique_ptr<Texture> new_texture = CreateTexture(key);
+    const double create_ms = std::chrono::duration<double, std::milli>(
+                                 std::chrono::steady_clock::now() - create_start)
+                                 .count();
+    if (create_ms > 4.0) {
+      REXLOG_INFO("Texture cache: creating a {}x{} texture took {:.1f} ms", key.GetWidth(),
+                  key.GetHeight(), create_ms);
+    }
     if (!new_texture) {
       key.LogAction("Failed to create");
       return nullptr;
     }
     assert_true(new_texture->key() == key);
+
+    if (has_replacement) {
+      new_texture->replacement_content_hash_ = replacement_content_hash;
+      new_texture->OverrideGuestLayout(original_guest_layout);
+    }
+
     texture = textures_.emplace(key, std::move(new_texture)).first->second.get();
   }
   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
+  rex::perf::GetTextureCacheStats().created.fetch_add(1, std::memory_order_relaxed);
   texture->LogAction("Created");
+  remember();
   return texture;
 }
 
@@ -1025,10 +1571,13 @@ void TextureCache::UpdateTexturesTotalHostMemoryUsage(uint64_t add, uint64_t sub
 }
 
 bool TextureCache::IsRangeScaledResolved(uint32_t start_unscaled, uint32_t length_unscaled) {
-  if (!IsDrawResolutionScaled()) {
+  return IsDrawResolutionScaled() && IsRangeResolved(start_unscaled, length_unscaled);
+}
+
+bool TextureCache::IsRangeResolved(uint32_t start_unscaled, uint32_t length_unscaled) {
+  if (!scaled_resolve_pages_) {
     return false;
   }
-
   start_unscaled = std::min(start_unscaled, SharedMemory::kBufferSize);
   length_unscaled = std::min(length_unscaled, SharedMemory::kBufferSize - start_unscaled);
   if (!length_unscaled) {
@@ -1084,7 +1633,6 @@ void TextureCache::ScaledResolveGlobalWatchCallbackThunk(
 void TextureCache::ScaledResolveGlobalWatchCallback(
     const std::unique_lock<std::recursive_mutex>& global_lock, uint32_t address_first,
     uint32_t address_last, bool invalidated_by_gpu) {
-  assert_true(IsDrawResolutionScaled());
   if (invalidated_by_gpu) {
     // Resolves themselves do exactly the opposite of what this should do.
     return;

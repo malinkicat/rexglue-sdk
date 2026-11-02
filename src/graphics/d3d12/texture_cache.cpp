@@ -423,6 +423,45 @@ D3D12TextureCache::~D3D12TextureCache() {
   }
   scaled_resolve_heaps_.clear();
   COUNT_profile_set("gpu/texture_cache/scaled_resolve_buffer_used_mb", 0);
+
+  if (dxgi_adapter_) {
+    dxgi_adapter_->Release();
+  }
+}
+
+bool D3D12TextureCache::QueryLocalVideoMemory(uint64_t& budget_out, uint64_t& usage_out) {
+  if (!dxgi_adapter_looked_up_) {
+    dxgi_adapter_looked_up_ = true;
+    const LUID luid = command_processor_.GetD3D12Provider().GetDevice()->GetAdapterLuid();
+    IDXGIFactory4* factory = nullptr;
+    if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
+      if (FAILED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&dxgi_adapter_)))) {
+        dxgi_adapter_ = nullptr;
+      }
+      factory->Release();
+    }
+    if (!dxgi_adapter_) {
+      REXGPU_WARN("Texture cache: can't query the adapter's video memory");
+    }
+  }
+  if (!dxgi_adapter_) {
+    return false;
+  }
+  DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
+  if (SUCCEEDED(dxgi_adapter_->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)) &&
+      info.Budget) {
+    budget_out = info.Budget;
+    usage_out = info.CurrentUsage;
+    return true;
+  }
+  // No budget (shouldn't happen on WDDM 2): the dedicated memory instead.
+  DXGI_ADAPTER_DESC1 desc = {};
+  if (SUCCEEDED(dxgi_adapter_->GetDesc1(&desc)) && desc.DedicatedVideoMemory) {
+    budget_out = uint64_t(desc.DedicatedVideoMemory);
+    usage_out = 0;
+    return true;
+  }
+  return false;
 }
 
 bool D3D12TextureCache::Initialize() {
@@ -861,6 +900,12 @@ void D3D12TextureCache::ClearCache() {
 void D3D12TextureCache::BeginSubmission(uint64_t new_submission_index) {
   TextureCache::BeginSubmission(new_submission_index);
 
+  const uint64_t completed_submission = command_processor_.GetCompletedSubmission();
+  while (!retained_upload_buffers_.empty() &&
+         retained_upload_buffers_.front().first <= completed_submission) {
+    retained_upload_buffers_.pop_front();
+  }
+
   // ExecuteCommandLists is a full UAV and aliasing barrier.
   if (IsDrawResolutionScaled()) {
     size_t scaled_resolve_buffer_count = GetScaledResolveBufferCount();
@@ -1186,6 +1231,31 @@ D3D12TextureCache::SamplerParameters D3D12TextureCache::ComputeSamplerParameters
   xenos::TextureFilter mip_filter = binding.mip_filter == xenos::TextureFilter::kUseFetchConst
                                         ? fetch.mip_filter
                                         : binding.mip_filter;
+  // A texture pack's replacement of a texture the game made without mips has
+  // its own (down to the original's size - its key's mip_max_level, see
+  // TextureCache::FindOrCreateTexture). Its smaller levels stand for the
+  // original's base level, so they're sampled as such: the anisotropic
+  // filtering setting applies (floors at grazing angles), and a base map
+  // fetch picks the nearest of them instead of the 4x-8x top level only
+  // (which would alias far more than the original did).
+  bool replacement_levels_as_base = false;
+  if (!has_mips) {
+    const TextureBinding* texture_binding = GetValidTextureBinding(binding.fetch_constant);
+    const Texture* texture = texture_binding ? texture_binding->texture : nullptr;
+    replacement_levels_as_base =
+        texture && texture->replacement_content_hash_ && texture->key().mip_max_level > 0;
+  }
+  bool mip_from_base_map = false;
+  if (replacement_levels_as_base) {
+    has_mips = true;
+    if (mip_filter == xenos::TextureFilter::kBaseMap || mip_filter == xenos::TextureFilter::kPoint) {
+      // Blended between its levels (trilinear): text and edges look the same
+      // at every size, not sharper at some and rougher at others.
+      mip_filter = xenos::TextureFilter::kLinear;
+      mip_from_base_map = true;
+    }
+  }
+
   bool min_mag_linear = (mag_filter == xenos::TextureFilter::kLinear) &&
                         (min_filter == xenos::TextureFilter::kLinear);
   bool mip_filter_bilinear_or_trilinear =
@@ -1197,9 +1267,15 @@ D3D12TextureCache::SamplerParameters D3D12TextureCache::ComputeSamplerParameters
                                         ? fetch.aniso_filter
                                         : binding.aniso_filter;
   int32_t anisotropic_override = REXCVAR_GET(anisotropic_override);
+  // (Not for a base map made nearest-mip above: anisotropic filtering always
+  // blends levels, which would soften UI the game draws with base maps.)
   if (anisotropic_override > -1 && anisotropic_override < 6 && has_mips && !mip_base_map &&
-      min_mag_linear && mip_filter_bilinear_or_trilinear) {
+      !mip_from_base_map && min_mag_linear && mip_filter_bilinear_or_trilinear) {
     aniso_filter = xenos::AnisoFilter(anisotropic_override);
+  }
+  if (mip_from_base_map) {
+    // The game's own anisotropy (if any) would blend levels too.
+    aniso_filter = xenos::AnisoFilter::kDisabled;
   }
   aniso_filter = std::min(aniso_filter, xenos::AnisoFilter::kMax_16_1);
   parameters.aniso_filter = aniso_filter;
@@ -1870,6 +1946,9 @@ bool D3D12TextureCache::DirectResolveToTexture(
       }
     }
     TextureKey key = texture->key();
+    if (key.replacement_id) {
+      continue;
+    }
     if (key.format != (depth24   ? (source->dest_float24 ? xenos::TextureFormat::k_24_8_FLOAT
                                                          : xenos::TextureFormat::k_24_8)
                        : float32 ? xenos::TextureFormat::k_32_FLOAT
@@ -2370,6 +2449,11 @@ void D3D12TextureCache::TransitionDirectResolveStencil(DirectResolveStencil& ste
 }
 
 bool D3D12TextureCache::IsDirectResolveTargetKey(TextureKey key) const {
+  // A texture pack replacement holds the pack's image, not the guest data:
+  // resolves to its guest memory must not write into it.
+  if (key.replacement_id) {
+    return false;
+  }
   if (!direct_resolve_pipeline_ || !REXCVAR_GET(gpu_direct_resolve) ||
       !REXCVAR_GET(gpu_texture_load_to_texture) ||
       key.dimension != xenos::DataDimension::k2DOrStacked || key.GetDepthOrArraySize() != 1 ||
@@ -2405,7 +2489,9 @@ bool D3D12TextureCache::IsDirectResolveTargetKey(TextureKey key) const {
 }
 
 bool D3D12TextureCache::IsLoadToTextureKey(TextureKey key) const {
-  return load_pipeline_32bpb_to_texture_ && REXCVAR_GET(gpu_texture_load_to_texture) &&
+  // (Not a texture pack replacement: uploaded from the pack's image.)
+  return !key.replacement_id && load_pipeline_32bpb_to_texture_ &&
+         REXCVAR_GET(gpu_texture_load_to_texture) &&
          key.dimension == xenos::DataDimension::k2DOrStacked && key.GetDepthOrArraySize() == 1 &&
          key.tiled && !key.mip_max_level &&
          // Resolution-scaled resolve data has its own layout.
@@ -2499,8 +2585,9 @@ bool D3D12TextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, 
   TextureKey texture_key = d3d12_texture.key();
 
   // Copies of render targets: straight into the texture if it was made for
-  // that.
-  if (load_base && !texture_key.mip_max_level && REXCVAR_GET(gpu_texture_load_to_texture) &&
+  // that (never a texture pack replacement - IsLoadToTextureKey).
+  if (load_base && !texture_key.mip_max_level && !texture_key.replacement_id &&
+      REXCVAR_GET(gpu_texture_load_to_texture) &&
       LoadTextureDataToTexture(d3d12_texture)) {
     return true;
   }
@@ -3145,6 +3232,235 @@ xenos::ClampMode D3D12TextureCache::NormalizeClampMode(xenos::ClampMode clamp_mo
     return xenos::ClampMode::kMirrorClampToEdge;
   }
   return clamp_mode;
+}
+
+namespace {
+
+// A replacement already in upload memory (PrepareReplacementUploadImpl): the
+// buffer with every mip level laid out for CopyTextureRegion.
+struct PreparedReplacementUpload {
+  Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+  std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints;
+};
+
+// The mip levels the texture cache gives a replacement's texture (its key's
+// mip_max_level + 1).
+uint32_t ReplacementLevelCount(uint32_t width, uint32_t height) {
+  return std::min(rex::log2_floor(std::max(width, height)),
+                  uint32_t(xenos::kTextureMaxMips - 1)) +
+         1;
+}
+
+}  // namespace
+
+std::shared_ptr<void> D3D12TextureCache::PrepareReplacementUploadImpl(
+    const TextureReplacementData& data) {
+  if (data.pixels.empty() || data.width == 0 || data.height == 0) {
+    return nullptr;
+  }
+  const uint32_t level_count = ReplacementLevelCount(data.width, data.height);
+  if (data.mips.size() < level_count - 1) {
+    return nullptr;
+  }
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = data.width;
+  desc.Height = data.height;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = UINT16(level_count);
+  desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  desc.SampleDesc.Count = 1;
+  desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  auto prepared = std::make_shared<PreparedReplacementUpload>();
+  prepared->footprints.resize(level_count);
+  UINT64 upload_size = 0;
+  device->GetCopyableFootprints(&desc, 0, level_count, 0, prepared->footprints.data(), nullptr,
+                                nullptr, &upload_size);
+  D3D12_RESOURCE_DESC buffer_desc{};
+  ui::d3d12::util::FillBufferResourceDesc(buffer_desc, upload_size, D3D12_RESOURCE_FLAG_NONE);
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesUpload,
+          command_processor_.GetD3D12Provider().GetHeapFlagCreateNotZeroed(), &buffer_desc,
+          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&prepared->buffer)))) {
+    return nullptr;
+  }
+  void* mapped = nullptr;
+  const D3D12_RANGE no_read{0, 0};
+  if (FAILED(prepared->buffer->Map(0, &no_read, &mapped))) {
+    return nullptr;
+  }
+  for (uint32_t level = 0; level < level_count; ++level) {
+    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint = prepared->footprints[level];
+    const uint32_t width = std::max(data.width >> level, uint32_t(1));
+    const uint32_t height = std::max(data.height >> level, uint32_t(1));
+    const uint32_t row_bytes = width * 4;
+    const uint8_t* source = level ? data.mips[level - 1].data() : data.pixels.data();
+    uint8_t* destination = static_cast<uint8_t*>(mapped) + footprint.Offset;
+    if (footprint.Footprint.RowPitch == row_bytes) {
+      std::memcpy(destination, source, size_t(row_bytes) * height);
+    } else {
+      for (uint32_t y = 0; y < height; ++y) {
+        std::memcpy(destination, source, row_bytes);
+        source += row_bytes;
+        destination += footprint.Footprint.RowPitch;
+      }
+    }
+  }
+  prepared->buffer->Unmap(0, nullptr);
+  return prepared;
+}
+
+bool D3D12TextureCache::LoadTextureDataFromReplacementImpl(
+    Texture& texture, const TextureReplacementData& data) {
+  D3D12Texture& d3d12_texture = static_cast<D3D12Texture&>(texture);
+  ID3D12Resource* resource = d3d12_texture.resource();
+
+  if (!resource || data.width == 0 || data.height == 0) {
+    return false;
+  }
+
+  // Already in upload memory: only the copies to record.
+  if (data.prepared_upload) {
+    const auto* prepared = static_cast<const PreparedReplacementUpload*>(data.prepared_upload.get());
+    const D3D12_RESOURCE_DESC prepared_desc = resource->GetDesc();
+    // The buffer has the full mip chain; the texture may take fewer (the
+    // game's own last level at the replacement's scale - see
+    // FindOrCreateTexture) - the first ones are the same.
+    const uint32_t copy_level_count = std::max(uint32_t(prepared_desc.MipLevels), uint32_t(1));
+    if (prepared_desc.Width != data.width || prepared_desc.Height != data.height ||
+        copy_level_count > prepared->footprints.size()) {
+      return false;
+    }
+    const D3D12_RESOURCE_STATES old_state =
+        d3d12_texture.SetResourceState(D3D12_RESOURCE_STATE_COPY_DEST);
+    command_processor_.PushTransitionBarrier(resource, old_state, D3D12_RESOURCE_STATE_COPY_DEST);
+    command_processor_.SubmitBarriers();
+    DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
+    for (uint32_t level = 0; level < copy_level_count; ++level) {
+      D3D12_TEXTURE_COPY_LOCATION destination_location{};
+      destination_location.pResource = resource;
+      destination_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      destination_location.SubresourceIndex = level;
+      D3D12_TEXTURE_COPY_LOCATION source_location{};
+      source_location.pResource = prepared->buffer.Get();
+      source_location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+      source_location.PlacedFootprint = prepared->footprints[level];
+      command_list.D3DCopyTextureRegion(&destination_location, 0, 0, 0, &source_location, nullptr);
+    }
+    // The buffer is shared with the replacement cache, which may drop it
+    // before the GPU has copied from it.
+    retained_upload_buffers_.emplace_back(command_processor_.GetCurrentSubmission(),
+                                          prepared->buffer);
+    return true;
+  }
+  if (data.pixels.empty()) {
+    return false;
+  }
+
+  const D3D12_RESOURCE_DESC resource_desc = resource->GetDesc();
+
+  if (resource_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+      data.width != resource_desc.Width ||
+      data.height != resource_desc.Height) {
+    return false;
+  }
+
+  if (resource_desc.Format != DXGI_FORMAT_R8G8B8A8_TYPELESS &&
+      resource_desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM &&
+      resource_desc.Format != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
+    return false;
+  }
+
+  ID3D12Device* device = command_processor_.GetD3D12Provider().GetDevice();
+
+  D3D12_RESOURCE_DESC footprint_desc = resource_desc;
+  if (footprint_desc.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS) {
+    footprint_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+  }
+
+  // The smaller mips are made when the replacement is loaded.
+  const uint32_t level_count = std::max(uint32_t(resource_desc.MipLevels), uint32_t(1));
+  std::vector<std::vector<uint8_t>> built_mips;
+  const std::vector<std::vector<uint8_t>>* mips = &data.mips;
+  if (data.mips.size() < level_count - 1) {
+    built_mips = TextureReplacement::BuildMips(data.pixels.data(), data.width, data.height);
+    mips = &built_mips;
+  }
+
+  std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints(level_count);
+  UINT64 upload_size = 0;
+
+  device->GetCopyableFootprints(&footprint_desc, 0, level_count, 0, footprints.data(), nullptr,
+                                nullptr, &upload_size);
+
+  D3D12_RESOURCE_DESC buffer_desc{};
+  ui::d3d12::util::FillBufferResourceDesc(
+      buffer_desc, upload_size, D3D12_RESOURCE_FLAG_NONE);
+
+  Microsoft::WRL::ComPtr<ID3D12Resource> upload_buffer;
+
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesUpload,
+          command_processor_.GetD3D12Provider().GetHeapFlagCreateNotZeroed(),
+          &buffer_desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+          IID_PPV_ARGS(&upload_buffer)))) {
+    REXLOG_WARN("TextureReplacement: failed to create D3D12 upload buffer");
+    return false;
+  }
+
+  void* mapped = nullptr;
+  const D3D12_RANGE no_read{0, 0};
+
+  if (FAILED(upload_buffer->Map(0, &no_read, &mapped))) {
+    REXLOG_WARN("TextureReplacement: failed to map D3D12 upload buffer");
+    return false;
+  }
+
+  for (uint32_t level = 0; level < level_count; ++level) {
+    const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& footprint = footprints[level];
+    const uint32_t width = std::max(data.width >> level, uint32_t(1));
+    const uint32_t height = std::max(data.height >> level, uint32_t(1));
+    const uint32_t source_row_bytes = width * 4;
+    const uint8_t* source = level ? (*mips)[level - 1].data() : data.pixels.data();
+    uint8_t* destination = static_cast<uint8_t*>(mapped) + footprint.Offset;
+    for (uint32_t y = 0; y < height; ++y) {
+      std::memcpy(destination, source, source_row_bytes);
+      source += source_row_bytes;
+      destination += footprint.Footprint.RowPitch;
+    }
+  }
+
+  upload_buffer->Unmap(0, nullptr);
+
+  const D3D12_RESOURCE_STATES old_state =
+      d3d12_texture.SetResourceState(D3D12_RESOURCE_STATE_COPY_DEST);
+
+  command_processor_.PushTransitionBarrier(
+      resource, old_state, D3D12_RESOURCE_STATE_COPY_DEST);
+  command_processor_.SubmitBarriers();
+
+  DeferredCommandList& command_list =
+      command_processor_.GetDeferredCommandList();
+
+  for (uint32_t level = 0; level < level_count; ++level) {
+    D3D12_TEXTURE_COPY_LOCATION destination_location{};
+    destination_location.pResource = resource;
+    destination_location.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    destination_location.SubresourceIndex = level;
+
+    D3D12_TEXTURE_COPY_LOCATION source_location{};
+    source_location.pResource = upload_buffer.Get();
+    source_location.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    source_location.PlacedFootprint = footprints[level];
+
+    command_list.D3DCopyTextureRegion(&destination_location, 0, 0, 0, &source_location, nullptr);
+  }
+
+  retained_upload_buffers_.emplace_back(
+      command_processor_.GetCurrentSubmission(), std::move(upload_buffer));
+
+  return true;
 }
 
 }  // namespace rex::graphics::d3d12

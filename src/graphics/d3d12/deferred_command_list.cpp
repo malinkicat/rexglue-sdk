@@ -26,6 +26,7 @@ DeferredCommandList::DeferredCommandList(const D3D12CommandProcessor& command_pr
 
 void DeferredCommandList::Reset() {
   command_stream_.clear();
+  external_callbacks_.clear();
   profile_query_heap_ = nullptr;
   profile_passes_.clear();
 }
@@ -307,6 +308,11 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
         const char* label_name = reinterpret_cast<const char*>(
             reinterpret_cast<const uint8_t*>(stream) + sizeof(DebugMarkerHeader));
         command_list->SetMarker(1, label_name, static_cast<UINT>(args.label_length + 1));
+      } break;
+      case Command::kExternalCallback: {
+        external_callbacks_[*reinterpret_cast<const size_t*>(stream)](command_list);
+        // The external code may have bound anything.
+        current_pipeline_state = nullptr;
       } break;
       default:
         assert_unhandled_case(header.command);

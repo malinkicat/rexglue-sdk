@@ -1443,6 +1443,7 @@ enum class Opcode : uint32_t {
   kStoreRaw = 166,
   kAtomicAnd = 169,
   kAtomicOr = 170,
+  kAtomicUMax = 176,
   kEvalSampleIndex = 204,
   kEvalCentroid = 205,
 };
@@ -2267,6 +2268,10 @@ class Assembler {
   void OpAtomicOr(const Dest& dest, const Src& address, uint32_t address_components,
                   const Src& value) {
     EmitAtomicOp(Opcode::kAtomicOr, dest, address, address_components, value);
+  }
+  void OpAtomicUMax(const Dest& dest, const Src& address, uint32_t address_components,
+                    const Src& value) {
+    EmitAtomicOp(Opcode::kAtomicUMax, dest, address, address_components, value);
   }
   void OpEvalSampleIndex(const Dest& dest, const Src& value, const Src& sample_index) {
     uint32_t dest_write_mask = dest.GetMask();

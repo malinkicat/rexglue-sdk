@@ -17,15 +17,20 @@
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 
+#include <rex/audio/user_music.h>
 #include <rex/audio/xma/context.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
 
+REXCVAR_DEFINE_BOOL(xma_stream_log, false, "Audio",
+                    "Debug: log each XMA stream's shape (stereo, packets, muted) when it changes, and song starts");
 REXCVAR_DEFINE_BOOL(audio_levels, false, "Audio",
                     "Debug: log the RMS of decoded XMA chunks and mixed frames to audio_levels.csv");
 REXCVAR_DEFINE_STRING(xma_mute, "", "Audio",
                       "Debug: silence the XMA context at this guest address (e.g. FFCA6040)");
+REXCVAR_DEFINE_INT32(title_music_volume, 100, "Audio", "Volume of the title's own songs, 0-100");
 REXCVAR_DEFINE_BOOL(xma_single_music, false, "Audio",
                     "Keep one music stream audible: after 2 s of two playing together, "
                     "silence the older (Amped 3 resumes paused menu music next to the next song)");
@@ -40,9 +45,111 @@ struct MusicStream {
 std::mutex music_mutex;
 std::unordered_map<uint32_t, MusicStream> music_streams;
 
+void ForgetMusicIds(uint32_t id);
+
 void ForgetMusicStream(uint32_t id) {
-  std::lock_guard lock(music_mutex);
-  music_streams.erase(id);
+  {
+    std::lock_guard lock(music_mutex);
+    music_streams.erase(id);
+  }
+  ForgetMusicIds(id);
+}
+
+// Contexts playing a streamed stereo track (a title's music, as opposed to
+// sound effects and voices in small, mostly mono buffers). Amped 3's music
+// streams in 80 or 160 packet buffers (fewer at a track's end); its effects
+// are mono in 2-28. Sticks until the context starts a new stream.
+std::mutex music_ids_mutex;
+std::unordered_set<uint32_t> music_ids;
+
+// The title's songs (the ones the player's music replaces), judged by the
+// buffer each context decodes: a song-sized buffer read from the song bank
+// makes it a song, which it stays through the song's shorter last buffers
+// (also from the bank); a buffer from anywhere else (an event's music, an
+// effect) ends it. Before reads from the bank are seen: song-sized buffers.
+std::unordered_map<uint32_t, bool> title_song_ids;
+// Contexts decoding the title's other background music (the loading screens'),
+// judged the same way: silent while the player's music plays, never a song.
+std::unordered_set<uint32_t> title_background_ids;
+
+void ForgetMusicIds(uint32_t id) {
+  std::lock_guard lock(music_ids_mutex);
+  music_ids.erase(id);
+  title_song_ids.erase(id);
+  title_background_ids.erase(id);
+}
+
+bool IsMusicStream(uint32_t id, const XMA_CONTEXT_DATA& data) {
+  // An event's music (stereo or not): the player's music holds meanwhile.
+  if (data.IsCurrentInputBufferValid() &&
+      IsTitleEventMusicBuffer(data.GetCurrentInputBufferAddress(),
+                              data.GetCurrentInputBufferPacketCount() * XmaContext::kBytesPerPacket)) {
+    NoteEventMusicChunk();
+  }
+  std::lock_guard lock(music_ids_mutex);
+  if (!data.is_stereo) {
+    music_ids.erase(id);
+    title_song_ids.erase(id);
+    title_background_ids.erase(id);
+    return false;
+  }
+  const uint32_t packets = std::max(data.input_buffer_0_packet_count, data.input_buffer_1_packet_count);
+  if (packets >= 64) music_ids.insert(id);
+  if (data.IsCurrentInputBufferValid()) {
+    // The buffer being decoded (the other one may still hold an earlier
+    // stream's address).
+    const uint32_t address = data.GetCurrentInputBufferAddress();
+    const uint32_t current_packets = data.GetCurrentInputBufferPacketCount();
+    // As songs: a music-sized buffer of that data starts it, a short one
+    // (its tail) keeps it, anything else (an effect reusing the context) ends it.
+    const bool background =
+        IsTitleBackgroundMusicBuffer(address, current_packets * XmaContext::kBytesPerPacket);
+    const bool changed = !background                ? title_background_ids.erase(id) != 0
+                         : current_packets >= 64 ? title_background_ids.insert(id).second
+                                                 : false;
+    if (changed && REXCVAR_GET(xma_stream_log)) {
+      REXAPU_INFO("XmaContext {}: background music {} ({} packets at {:08X})", id,
+                  background ? "starts" : "ends", current_packets, address);
+    }
+    bool& song = title_song_ids[id];
+    const bool was_song = song;
+    if (!TitleMusicReadsSeen()) {
+      if (current_packets >= 64) song = current_packets >= 128;
+    } else if (!IsTitleMusicBuffer(address, current_packets * XmaContext::kBytesPerPacket)) {
+      song = false;
+    } else if (current_packets >= 128) {
+      song = true;
+    }
+    if (song && !was_song) {
+      if (MixMode() || REXCVAR_GET(xma_stream_log)) REXAPU_INFO("XmaContext {}: title song starts ({} packets)", id, current_packets);
+      TitleMusicStreamStarted();
+    } else if (was_song && !song && REXCVAR_GET(xma_stream_log)) {
+      REXAPU_INFO("XmaContext {}: title song ends ({} packets at {:08X})", id, current_packets, address);
+    } else if (!song && current_packets >= 128 && REXCVAR_GET(xma_stream_log)) {
+      static std::unordered_map<uint32_t, uint32_t> logged;
+      if (logged[id] != address) {
+        logged[id] = address;
+        REXAPU_INFO("XmaContext {}: {} packets at {:08X}, not from the song bank", id, current_packets, address);
+      }
+    }
+  }
+  return music_ids.count(id) != 0;
+}
+
+// One of the title's songs (the ones the player's music replaces), as judged
+// by IsMusicStream.
+bool TitleSongStream(uint32_t id, bool music_stream) {
+  if (!music_stream) return false;
+  std::lock_guard lock(music_ids_mutex);
+  const auto it = title_song_ids.find(id);
+  return it != title_song_ids.end() && it->second;
+}
+
+// The title's other background music (IsMusicStream).
+bool TitleBackgroundStream(uint32_t id, bool music_stream) {
+  if (!music_stream) return false;
+  std::lock_guard lock(music_ids_mutex);
+  return title_background_ids.count(id) != 0;
 }
 
 // Called for each decoded chunk; true when this context's output should be silent.
@@ -550,11 +657,49 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA* 
   static const std::array<uint8_t, kBytesPerFrameChannel * 2> silence{};
   char context_name[16];
   std::snprintf(context_name, sizeof(context_name), "%08X", guest_ptr());
+  // (Checked always: mix mode sees the title's songs start, and the music
+  // volume applies to them.)
+  const bool music_stream = IsMusicStream(id(), *data);
+  if (TitleSongStream(id(), music_stream)) NoteTitleSongChunk();
   const bool muted = (!REXCVAR_GET(xma_mute).empty() && REXCVAR_GET(xma_mute) == context_name) ||
-                     (REXCVAR_GET(xma_single_music) && SupersededMusic(id(), *data));
-  output_rb->Write((muted ? silence.data() : raw_frame_.data()) +
-                       (kOutputBytesPerBlock * raw_frame_read_offset),
-                   subframes_to_write * kOutputBytesPerBlock);
+                     (REXCVAR_GET(xma_single_music) && SupersededMusic(id(), *data)) ||
+                     // The player's own music in place of the title's songs only: the
+                     // streams decoding from its song bank (TitleMusicReadsSeen), else
+                     // its 160-packet streams, and its other background music (the
+                     // loading screens'). Event music and effects keep playing.
+                     (UserMusicReplacingTitleMusic() &&
+                      (TitleSongStream(id(), music_stream) || TitleBackgroundStream(id(), music_stream)));
+  const uint8_t* out = (muted ? silence.data() : raw_frame_.data()) + kOutputBytesPerBlock * raw_frame_read_offset;
+  const int title_volume = std::clamp(REXCVAR_GET(title_music_volume), 0, 100);
+  if (!muted && music_stream && title_volume < 100) {
+    // The title's songs at --title_music_volume (16-bit big-endian PCM).
+    std::array<uint8_t, kBytesPerFrameChannel * 2> scaled;
+    const size_t bytes = std::min(scaled.size(), size_t(subframes_to_write) * kOutputBytesPerBlock);
+    for (size_t i = 0; i + 1 < bytes; i += 2) {
+      const int v = int16_t((out[i] << 8) | out[i + 1]) * title_volume / 100;
+      scaled[i] = uint8_t(uint16_t(v) >> 8);
+      scaled[i + 1] = uint8_t(v);
+    }
+    output_rb->Write(scaled.data(), bytes);
+  } else {
+    output_rb->Write(out, subframes_to_write * kOutputBytesPerBlock);
+  }
+  if (REXCVAR_GET(audio_levels) || REXCVAR_GET(xma_stream_log)) {
+    static std::mutex described_mutex;
+    static std::unordered_map<uint32_t, uint32_t> described;
+    std::lock_guard lock(described_mutex);
+    const uint32_t key = (uint32_t(data->is_stereo) << 31) |
+                         (std::max(data->input_buffer_0_packet_count, data->input_buffer_1_packet_count) << 1) |
+                         uint32_t(muted);
+    auto [it, inserted] = described.try_emplace(guest_ptr(), ~0u);
+    if (it->second != key) {
+      it->second = key;
+      REXAPU_INFO("XmaContext {:08X}: stereo {} packets {}/{} muted {} title song {}", guest_ptr(),
+                  bool(data->is_stereo), uint32_t(data->input_buffer_0_packet_count),
+                  uint32_t(data->input_buffer_1_packet_count), muted,
+                  TitleSongStream(id(), music_stream));
+    }
+  }
   if (REXCVAR_GET(audio_levels)) {
     const uint8_t* pcm = raw_frame_.data() + (kOutputBytesPerBlock * raw_frame_read_offset);
     const size_t samples = subframes_to_write * kOutputBytesPerBlock / 2;
@@ -725,7 +870,23 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
 
     uint64_t frame_size = combined.Peek(kBitsPerFrameHeader);
     if (frame_size == xma::kMaxFrameLength) {
-      data->error_status = 4;
+      // The end-of-frames marker: no more frames start in this packet. On to
+      // the next packet with a frame, or the next buffer. (Returning here
+      // without moving on left the stream stuck on this spot for good: the
+      // game's voice looped its last output, its song never ended, and
+      // leaving the mountain waited for it forever.)
+      static std::atomic<int> logged{0};
+      if (logged.fetch_add(1) < 20) {
+        REXAPU_INFO("XmaContext {}: end-of-frames marker across packets at {}; moving on", id(),
+                    static_cast<uint32_t>(data->input_buffer_read_offset));
+      }
+      const uint32_t next_input_offset =
+          GetNextPacketReadOffset(current_input_buffer, next_packet_index, current_input_packet_count);
+      if (next_input_offset == kBitsPerPacketHeader) {
+        SwapInputBuffer(data);
+      } else {
+        data->input_buffer_read_offset = next_input_offset;
+      }
       return;
     }
     packet_info.current_frame_size_ = static_cast<uint32_t>(frame_size);
@@ -748,9 +909,27 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
       const uint8_t* next_packet =
           GetNextPacket(data, next_packet_index, current_input_packet_count);
       if (!next_packet) {
-        data->error_status = 4;
+        // Its frame goes on in the next buffer, not queued yet: wait for it,
+        // as the hardware does. The end of a stream never gets one (and the
+        // title may wait for this buffer to finish before queuing more): after
+        // a quarter of a second, this buffer is done.
+        const auto now = std::chrono::steady_clock::now();
+        if (input_stall_since_ == std::chrono::steady_clock::time_point{}) input_stall_since_ = now;
+        if (now - input_stall_since_ < std::chrono::milliseconds(250)) {
+          data->error_status = 4;
+          return;
+        }
+        static std::atomic<int> logged{0};
+        if (logged.fetch_add(1) < 20) {
+          REXAPU_INFO("XmaContext {}: no next buffer for 250 ms at the end of this one ({} packets); finishing it",
+                      id(), current_input_packet_count);
+        }
+        input_stall_since_ = {};
+        data->error_status = 0;
+        SwapInputBuffer(data);
         return;
       }
+      input_stall_since_ = {};
       std::memcpy(input_buffer_.data() + kBytesPerPacketData, next_packet + kBytesPerPacketHeader,
                   kBytesPerPacketData);
     }

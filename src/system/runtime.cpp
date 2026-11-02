@@ -29,6 +29,8 @@
 #include <rex/thread.h>
 
 REXCVAR_DEFINE_STRING(game_data_root, "", "Runtime", "Override game data path");
+REXCVAR_DEFINE_STRING(game_data_overlay, "", "Runtime",
+                      "Folder of files that replace the game data's (same relative paths)");
 REXCVAR_DEFINE_STRING(user_data_root, "", "Runtime", "Override user data path");
 REXCVAR_DEFINE_STRING(update_data_root, "", "Runtime", "Override update data path");
 REXCVAR_DEFINE_STRING(cache_root, "", "Runtime", "Override shader cache path");
@@ -316,6 +318,16 @@ bool Runtime::SetupVfs() {
     return false;
   }
   REXSYS_DEBUG("  Mounted {} at {}", abs_game_root.string(), mount_path);
+
+  const std::string overlay_root = REXCVAR_GET(game_data_overlay);
+  if (!overlay_root.empty() && std::filesystem::is_directory(overlay_root)) {
+    auto overlay = std::make_unique<rex::filesystem::HostPathDevice>(
+        mount_path, std::filesystem::absolute(overlay_root), true);
+    if (overlay->Initialize()) {
+      rex::filesystem::SetDeviceOverlay(mount_path, std::move(overlay));
+      REXSYS_INFO("  Game data overlay: {}", overlay_root);
+    }
+  }
 
   // Register symbolic links for game: and D:
   file_system_->RegisterSymbolicLink("game:", mount_path);

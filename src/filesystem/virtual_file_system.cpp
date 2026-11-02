@@ -102,6 +102,19 @@ bool VirtualFileSystem::ResolveSymbolicLink(const std::string_view path, std::st
   return was_resolved;
 }
 
+// Files that replace a device's own (e.g. patched game data): the overlay
+// device is asked first for file paths on the device mounted at
+// g_overlay_mount.
+namespace {
+std::string g_overlay_mount;
+std::unique_ptr<Device> g_overlay;
+}  // namespace
+
+void SetDeviceOverlay(const std::string_view mount_path, std::unique_ptr<Device> overlay) {
+  g_overlay_mount = mount_path;
+  g_overlay = std::move(overlay);
+}
+
 Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
   auto global_lock = global_critical_region_.Acquire();
 
@@ -131,6 +144,14 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
 
   const auto& device = *it;
   auto relative_path = normalized_path.substr(device->mount_path().size());
+  if (g_overlay && device->mount_path() == g_overlay_mount) {
+    // Files only: a folder stays the device's own (its other files).
+    auto* overlay_entry = g_overlay->ResolvePath(relative_path);
+    if (overlay_entry && !(overlay_entry->attributes() & kFileAttributeDirectory)) {
+      REXFS_DEBUG("VFS: '{}' from the overlay", path);
+      return overlay_entry;
+    }
+  }
   auto* entry = device->ResolvePath(relative_path);
 
   if (entry) {
@@ -225,6 +246,12 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry, const std::string_view p
 
     auto file_name = rex::string::utf8_find_name_from_guest_path(path);
     entry = parent_entry->GetChild(file_name);
+    // An overlay file in place of the device's (ResolvePath checks it).
+    if (entry && !root_entry && g_overlay && !(entry->attributes() & kFileAttributeDirectory)) {
+      if (Entry* overlay_entry = ResolvePath(path); overlay_entry && overlay_entry != entry) {
+        entry = overlay_entry;
+      }
+    }
   } else {
     entry = !root_entry ? ResolvePath(path) : root_entry->GetChild(path);
   }

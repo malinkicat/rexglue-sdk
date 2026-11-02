@@ -762,6 +762,13 @@ const ResolveCopyShaderInfo resolve_copy_shader_info[size_t(ResolveCopyShaderInd
     {"Resolve Copy Full 128bpp", true, 2, 4, 4, 3},
 };
 
+// gpu_tile_collapse: a draw / copy of tile 1 being drawn full-size.
+bool amped3_collapse_tile_1 = false;
+// gpu_tile_collapse: tile 1's right / bottom edge (0: not a tile edge); resolves
+// up to it are widened to the full 1280x720.
+uint32_t amped3_collapse_tile_right = 0;
+uint32_t amped3_collapse_tile_bottom = 0;
+
 bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
                     uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
                     bool fixed_rg16_truncated_to_minus_1_to_1,
@@ -826,6 +833,14 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
     y1 += pa_sc_window_offset.window_y_offset;
   }
 
+  if (amped3_collapse_tile_1) {
+    if (amped3_collapse_tile_right && x1 == int32_t(amped3_collapse_tile_right)) {
+      x1 = 1280;
+    }
+    if (amped3_collapse_tile_bottom && y1 == int32_t(amped3_collapse_tile_bottom)) {
+      y1 = 720;
+    }
+  }
   // Apply the scissor and prevent negative origin (behind the EDRAM base).
   Scissor scissor;
   // False because clamping to the surface pitch will be done later (it will be
@@ -901,7 +916,14 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
   // Get the sample selection to safely pass to the shader.
   xenos::CopySampleSelect sample_select = SanitizeCopySampleSelect(
       rb_copy_control.copy_sample_select, rb_surface_info.msaa_samples, is_depth);
-  if (rb_copy_control.copy_sample_select != sample_select) {
+  // (Once per kind: with gpu_tile_collapse the game's 2x MSAA resolves read a
+  // 1x surface every frame.)
+  static uint32_t sample_select_warned = 0;
+  const uint32_t sample_select_kind = 1u << ((uint32_t(rb_copy_control.copy_sample_select) & 7) +
+                                             8 * uint32_t(is_depth));
+  if (rb_copy_control.copy_sample_select != sample_select &&
+      !(sample_select_warned & sample_select_kind)) {
+    sample_select_warned |= sample_select_kind;
     REXGPU_WARN(
         "Incorrect resolve sample selected for {}-sample {}: {}, treating like "
         "{}",

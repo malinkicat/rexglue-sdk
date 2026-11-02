@@ -12,6 +12,7 @@
 #pragma once
 
 #include <array>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <unordered_map>
@@ -177,9 +178,19 @@ class D3D12TextureCache final : public TextureCache {
   bool LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                              bool load_mips) override;
 
+  bool LoadTextureDataFromReplacementImpl(
+      Texture& texture, const TextureReplacementData& data) override;
+  std::shared_ptr<void> PrepareReplacementUploadImpl(const TextureReplacementData& data) override;
+
   void UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) override;
 
+  bool QueryLocalVideoMemory(uint64_t& budget_out, uint64_t& usage_out) override;
+
  private:
+  // The adapter of the device, for QueryLocalVideoMemory (looked up once).
+  IDXGIAdapter3* dxgi_adapter_ = nullptr;
+  bool dxgi_adapter_looked_up_ = false;
+
   static constexpr uint32_t kLoadGuestXThreadsPerGroupLog2 = 2;
   static constexpr uint32_t kLoadGuestYBlocksPerGroupLog2 = 5;
 

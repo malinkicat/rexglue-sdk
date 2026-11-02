@@ -738,9 +738,14 @@ union alignas(uint32_t) RB_COLOR_INFO {
     // The original R400 structure has 12-bit color_base, however the Xenos has
     // periodic 11-bit EDRAM tile addressing, so this field was split in Xenia
     // for convenience and to avoid mistakes.
+#ifdef AMPED3_WIDE_BASES
+    uint32_t color_base : 13;                         // +0 in tiles (amped3 experiment).
+    uint32_t _pad_13 : 3;                             // +13
+#else
     uint32_t color_base : 11;                         // +0 in tiles.
     uint32_t color_base_bit_11 : 1;                   // +11
     uint32_t _pad_12 : 4;                             // +12
+#endif
     xenos::ColorRenderTargetFormat color_format : 4;  // +16
     int32_t color_exp_bias : 6;                       // +20
     uint32_t _pad_26 : 6;                             // +26
@@ -837,9 +842,14 @@ union alignas(uint32_t) RB_DEPTH_INFO {
     // The original R400 structure has 12-bit depth_base, however the Xenos has
     // periodic 11-bit EDRAM tile addressing, so this field was split in Xenia
     // for convenience and to avoid mistakes.
+#ifdef AMPED3_WIDE_BASES
+    uint32_t depth_base : 13;                         // +0 in tiles (amped3 experiment).
+    uint32_t _pad_13 : 3;                             // +13
+#else
     uint32_t depth_base : 11;                         // +0 in tiles.
     uint32_t depth_base_bit_11 : 1;                   // +11
     uint32_t _pad_12 : 4;                             // +12
+#endif
     xenos::DepthRenderTargetFormat depth_format : 1;  // +16
     uint32_t _pad_17 : 15;                            // +17
   };

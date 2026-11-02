@@ -13,6 +13,7 @@
 #include <set>
 #include <chrono>
 #include <intrin.h>
+#include <cfloat>
 #include <cmath>
 #include <atomic>
 #include <bit>
@@ -24,11 +25,14 @@
 #include <sstream>
 #include <utility>
 
+#include <rex/hash.h>
 #include <rex/assert.h>
 #include <rex/cvar.h>
+#include <rex/ui/flags.h>
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
 #include <rex/graphics/d3d12/command_processor.h>
+#include <rex/perf/frame_rate.h>
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
@@ -42,6 +46,29 @@
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
+REXCVAR_DEFINE_DOUBLE(ui_scale, 1.0, "GPU",
+                      "Menus and HUD drawn at this size (0.5-1.3), about the screen's centre");
+
+// --ui_scale changed while running (the game's menu), as a plain C export
+// looked up by name (the GPU plugin keeps its own copy of its cvars).
+extern "C" __declspec(dllexport) void ReXSetUiScale(double scale) { REXCVAR_SET(ui_scale, std::clamp(scale, 0.5, 1.3)); }
+REXCVAR_DEFINE_INT32(ultrawide_pin_log, 0, "GPU",
+                      "Debug: log the UI draws' sprite matrices (c0, c1) for this many draws");
+REXCVAR_DEFINE_INT32(ui_scale_log_after, 0, "GPU",
+                      "Debug: with ultrawide_pin_log and ui_scale, log UI draws only after this many seconds");
+REXCVAR_DEFINE_BOOL(ultrawide_hud_pin, false, "GPU",
+                    "With ultrawide_squeeze: UI sprites in the left / right third go to the screen's "
+                    "edges (set by the game while riding; menus stay centred)");
+REXCVAR_DEFINE_BOOL(ultrawide_hud_clip, false, "GPU",
+                    "With ultrawide_squeeze: the UI is clipped to the 16:9 frame, as on a 16:9 screen "
+                    "(set by the game while riding: HUD sliding in stays out of the sides; menus' art "
+                    "may run into them)");
+REXCVAR_DEFINE_DOUBLE(tall_squeeze, 1.0, "GPU",
+                      "Squeeze the scene and UI vertically by this factor (the screen's aspect / 16:9, "
+                      "e.g. 0.9 for 16:10) with present_letterbox=false: a taller view instead of bars; 1 = off");
+REXCVAR_DEFINE_DOUBLE(ultrawide_squeeze, 1.0, "GPU",
+                      "Experiment: squeeze every draw horizontally by this factor (16:9 / the "
+                      "window's aspect) for ultrawide with present_letterbox=false; 1 = off");
 REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
@@ -157,6 +184,73 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DECLARE(bool, gpu_skip_overwritten_transfers);
+REXCVAR_DECLARE(int32_t, gpu_screen_extents);
+REXCVAR_DEFINE_STRING(dlss_handoff, "resolve", "GPU/Debug",
+                      "Where the scene is handed to DLSS: hud (the first HUD draw) or resolve (the "
+                      "last frontbuffer-wide color resolve before the HUD)")
+    .allowed({"hud", "resolve"});
+REXCVAR_DEFINE_INT32(dlss_trace_frame, 0, "GPU/Debug",
+                     "Log every frontbuffer-wide draw and every resolve of this frame number (0 = off)");
+REXCVAR_DEFINE_INT32(scene_render_percent, 100, "GPU",
+                     "Experimental: draw the 3D scene into the top-left part of the frame, this "
+                     "percent of the size (an upscaler brings it back to full size)")
+    .range(50, 100);
+REXCVAR_DEFINE_BOOL(dlss_log, false, "GPU/Debug",
+                    "Log the DLSS draw classification once a second (scene draws, HUD draws, hand-offs)");
+namespace {
+struct DlssStats {
+  uint32_t frames, scene, hud, taken, wide, narrow, fb_width;
+} g_dlss_stats;
+// The scene's resolve: the last frontbuffer-wide color resolve before the HUD
+// (Amped 3 resolves G-buffer-like targets of the same width earlier in the
+// frame), learnt from the previous frame.
+uint32_t g_dlss_wide_resolves = 0;      // this frame so far
+uint32_t g_dlss_resolves_before_hud = 0;  // this frame, at its first HUD draw
+uint32_t g_dlss_scene_resolve = 0;        // learnt: 1-based index, 0 = unknown
+uint32_t g_dlss_frame = 0;
+
+bool DlssTracing() {
+  const int32_t f = REXCVAR_GET(dlss_trace_frame);
+  return f && uint32_t(f) == g_dlss_frame;
+}
+}  // namespace
+REXCVAR_DEFINE_BOOL(amped3_hide_hud, false, "GPU/D3D12",
+                    "Hide the game's HUD and text (its 2D sprite and text vertex shaders), e.g. "
+                    "for screenshots");
+REXCVAR_DEFINE_BOOL(amped3_cull_subpixel_sprites, true, "GPU/D3D12",
+                    "Skip the game's sprite draws (vertex shader CB134112C994DF08) whose whole "
+                    "quad is under a pixel: it hides a flare by shrinking it to ~0.4 px, which "
+                    "rasterized as a stray pink pixel at (527, 602)");
+REXCVAR_DEFINE_BOOL(d3d12_debug_pink_probe, false, "GPU/D3D12",
+                    "Debug (with d3d12_debug_ps_extents): each frame skip a random half of that "
+                    "shader's draws, read back the output pixel at (527, 602) and log, per draw "
+                    "index, the pink frames among the frames it was skipped in");
+REXCVAR_DEFINE_BOOL(d3d12_debug_ps_extents_skip_unmeasured, false, "GPU/D3D12",
+                    "Debug: skip the d3d12_debug_ps_extents shader's draws whose rectangle the "
+                    "CPU can't estimate");
+REXCVAR_DEFINE_BOOL(d3d12_debug_ps_extents_skip_full, false, "GPU/D3D12",
+                    "Debug: skip the full-screen draws of the d3d12_debug_ps_extents shader");
+REXCVAR_DEFINE_STRING(d3d12_debug_ps_extents, "", "GPU/D3D12",
+                      "Debug: log the screen rectangle of draws with this pixel shader hash");
+REXCVAR_DEFINE_BOOL(gpu_tile_replay_verify, false, "GPU",
+                    "gpu_tile_replay: compare what tile 2-3 draws derive with tile 1's record");
+REXCVAR_DEFINE_BOOL(gpu_tile_replay_apply, false, "GPU",
+                    "gpu_tile_replay: skip deriving the state of eligible tile 2-3 draws "
+                    "(primitive processing, pipeline, bindings) and use tile 1's");
+REXCVAR_DEFINE_BOOL(gpu_tile_replay, false, "GPU",
+                    "amped3: reuse tile 1's per-draw work for the same draws in tiles 2 and 3 of "
+                    "the game's predicated tiling (statistics only for now)");
+REXCVAR_DEFINE_BOOL(gpu_screen_extents_predict, false, "GPU",
+                    "gpu_screen_extents=4: write the predicted extents (else only the "
+                    "statistics are gathered and the whole screen is written)");
+REXCVAR_DEFINE_BOOL(gpu_screen_extents_motion, false, "GPU",
+                    "gpu_screen_extents=4: predict with each draw's last motion");
+REXCVAR_DEFINE_INT32(gpu_screen_extents_margin, 4, "GPU",
+                     "gpu_screen_extents=4: 8x8 tiles added on each side of the predicted extents");
+REXCVAR_DEFINE_INT32(gpu_screen_extents_flush, 256, "GPU",
+                     "gpu_screen_extents=3: submit the GPU work after every this many measured "
+                     "draws, so less of it is left to await when the guest needs the extents "
+                     "(0: only then)");
 
 REXCVAR_DEFINE_BOOL(gpu_lod_free_texture_fetches, true, "GPU",
                     "Pixel shaders sample textures that have a single mip level, the same "
@@ -172,6 +266,11 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/apply_gamma_table_fxaa_luma_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/fxaa_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/fxaa_extreme_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/smaa_blend_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/smaa_edges_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/smaa_weights_cs.h"
+#include "../../../thirdparty/smaa/Textures/AreaTex.h"
+#include "../../../thirdparty/smaa/Textures/SearchTex.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_downscale_cs.h"
 }  // namespace shaders
 
@@ -516,6 +615,15 @@ ID3D12RootSignature* D3D12CommandProcessor::GetRootSignature(const DxbcShader* v
       shared_memory_and_edram_ranges[2].RegisterSpace = 0;
       shared_memory_and_edram_ranges[2].OffsetInDescriptorsFromTableStart = 2;
     }
+  }
+
+  // amped3: screen extents slot.
+  {
+    auto& parameter = parameters[kRootParameter_Bindful_ScreenExtents];
+    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    parameter.Descriptor.ShaderRegister = UINT(DxbcShaderTranslator::UAVRegister::kScreenExtents);
+    parameter.Descriptor.RegisterSpace = 0;
+    parameter.ShaderVisibility = vertex_visibility;
   }
 
   // Extra parameters.
@@ -894,9 +1002,32 @@ void D3D12CommandProcessor::SetExternalPipeline(ID3D12PipelineState* pipeline) {
   }
 }
 
+void D3D12CommandProcessor::InvalidateStateAfterExternalCommands() {
+  ff_viewport_update_needed_ = true;
+  ff_scissor_update_needed_ = true;
+  ff_blend_factor_update_needed_ = true;
+  ff_stencil_ref_update_needed_ = true;
+  viewport_cache_valid_ = false;
+  current_guest_pipeline_ = nullptr;
+  current_external_pipeline_ = nullptr;
+  current_graphics_root_signature_ = nullptr;
+  current_graphics_root_up_to_date_ = 0;
+  primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+  vertex_buffers_in_sync_[0] = 0;
+  vertex_buffers_in_sync_[1] = 0;
+  if (bindless_resources_used_) {
+    deferred_command_list_.SetDescriptorHeaps(view_bindless_heap_, sampler_bindless_heap_current_);
+  } else if (view_bindful_heap_current_ || sampler_bindful_heap_current_) {
+    deferred_command_list_.SetDescriptorHeaps(view_bindful_heap_current_,
+                                              sampler_bindful_heap_current_);
+  }
+  render_target_cache_->InvalidateCommandListRenderTargets();
+}
+
 void D3D12CommandProcessor::SetExternalGraphicsRootSignature(ID3D12RootSignature* root_signature) {
   if (current_graphics_root_signature_ != root_signature) {
     current_graphics_root_signature_ = root_signature;
+    tile_replay_root_signature_ = nullptr;
     deferred_command_list_.D3DSetGraphicsRootSignature(root_signature);
   }
   // Force-invalidate because setting a non-guest root signature.
@@ -1280,6 +1411,15 @@ bool D3D12CommandProcessor::SetupContext() {
         range.OffsetInDescriptorsFromTableStart = UINT(SystemBindlessView::kUnboundedSRVsStart);
       }
     }
+    // amped3: screen extents slot.
+    {
+      auto& parameter = root_parameters_bindless[kRootParameter_Bindless_ScreenExtents];
+      parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+      parameter.Descriptor.ShaderRegister =
+          UINT(DxbcShaderTranslator::UAVRegister::kScreenExtents);
+      parameter.Descriptor.RegisterSpace = 0;
+      parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    }
     root_signature_bindless_vs_ =
         ui::d3d12::util::CreateRootSignature(provider, root_signature_bindless_desc);
     if (!root_signature_bindless_vs_) {
@@ -1355,6 +1495,49 @@ bool D3D12CommandProcessor::SetupContext() {
     REXGPU_ERROR("Failed to map the gamma ramp upload buffer");
     gamma_ramp_upload_buffer_mapping_ = nullptr;
     return false;
+  }
+
+  // amped3 (gpu_screen_extents=3): screen extents slots.
+  {
+    D3D12_RESOURCE_DESC screen_extents_buffer_desc;
+    ui::d3d12::util::FillBufferResourceDesc(screen_extents_buffer_desc,
+                                            kScreenExtentsSlots * sizeof(uint32_t) * 4,
+                                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+    if (FAILED(device->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesDefault, heap_flag_create_not_zeroed,
+            &screen_extents_buffer_desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+            IID_PPV_ARGS(&screen_extents_buffer_)))) {
+      REXGPU_ERROR("Failed to create the screen extents buffer");
+      return false;
+    }
+    screen_extents_buffer_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+    void* mapping;
+    if (FAILED(device->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesUpload, heap_flag_create_not_zeroed,
+            &screen_extents_buffer_desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            IID_PPV_ARGS(&screen_extents_zero_buffer_))) ||
+        FAILED(screen_extents_zero_buffer_->Map(0, nullptr, &mapping))) {
+      REXGPU_ERROR("Failed to create the screen extents zero buffer");
+      return false;
+    }
+    std::memset(mapping, 0, screen_extents_buffer_desc.Width);
+    screen_extents_zero_buffer_->Unmap(0, nullptr);
+    screen_extents_buffer_desc.Width *= kScreenExtentsReadbacks;
+    if (FAILED(device->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesReadback, heap_flag_create_not_zeroed,
+            &screen_extents_buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&screen_extents_readback_buffer_))) ||
+        FAILED(screen_extents_readback_buffer_->Map(0, nullptr, &mapping))) {
+      REXGPU_ERROR("Failed to create the screen extents readback buffer");
+      return false;
+    }
+    screen_extents_readback_mapping_ = static_cast<const uint32_t*>(mapping);
+    screen_extents_slots_used_ = 0;
+    screen_extents_root_slot_ = 0;
+    screen_extents_draw_.slot = UINT32_MAX;
+    screen_extents_pending_.clear();
+    screen_extents_batches_.clear();
+    screen_extents_known_.clear();
   }
 
   // Initialize compute pipelines for output with gamma ramp.
@@ -1546,6 +1729,10 @@ bool D3D12CommandProcessor::SetupContext() {
     return false;
   }
 
+  if (!SetupSmaa()) {
+    return false;
+  }
+
   // Resolve downscale compute pipeline for scaled readback resolve.
   D3D12_ROOT_PARAMETER
   resolve_downscale_root_parameters[UINT(ResolveDownscaleRootParameter::kCount)];
@@ -1605,6 +1792,11 @@ bool D3D12CommandProcessor::SetupContext() {
     resolve_downscale_pipeline_.Reset();
     resolve_downscale_root_signature_.Reset();
     REXGPU_WARN("Failed to initialize D3D12 resolve-downscale readback pipeline");
+  }
+
+  dlss_ = std::make_unique<D3D12Dlss>(*this);
+  if (!dlss_->Initialize()) {
+    dlss_.reset();
   }
 
   if (bindless_resources_used_) {
@@ -1760,6 +1952,10 @@ void D3D12CommandProcessor::ShutdownContext() {
   }
   AwaitAllQueueOperationsCompletion();
   ShutdownSubmissionThread();
+  if (dlss_) {
+    dlss_->Shutdown();
+    dlss_.reset();
+  }
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 
@@ -1816,6 +2012,18 @@ void D3D12CommandProcessor::ShutdownContext() {
 
   fxaa_extreme_pipeline_.Reset();
   fxaa_pipeline_.Reset();
+  for (auto& pipeline : smaa_pipelines_) {
+    pipeline.Reset();
+  }
+  smaa_root_signature_.Reset();
+  smaa_area_texture_.Reset();
+  smaa_search_texture_.Reset();
+  smaa_lut_upload_buffer_.Reset();
+  smaa_luts_uploaded_ = false;
+  for (auto& texture : smaa_textures_) {
+    texture.Reset();
+  }
+  smaa_textures_submission_ = 0;
   fxaa_root_signature_.Reset();
   resolve_downscale_pipeline_.Reset();
   resolve_downscale_root_signature_.Reset();
@@ -1829,6 +2037,11 @@ void D3D12CommandProcessor::ShutdownContext() {
   // Unmapping will be done implicitly by the destruction.
   gamma_ramp_upload_buffer_mapping_ = nullptr;
   gamma_ramp_upload_buffer_.Reset();
+
+  screen_extents_readback_mapping_ = nullptr;
+  screen_extents_readback_buffer_.Reset();
+  screen_extents_zero_buffer_.Reset();
+  screen_extents_buffer_.Reset();
   gamma_ramp_buffer_.Reset();
 
   texture_cache_.reset();
@@ -2023,8 +2236,146 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
   gamma_ramp_pwl_up_to_date_ = false;
 }
 
+namespace {
+// amped3 pink probe (d3d12_debug_pink_probe): the draws of the
+// d3d12_debug_ps_extents shader skipped in the frame being drawn, by index.
+constexpr uint32_t kPinkProbeIndices = 512, kPinkProbeSlots = 16;
+uint64_t g_pink_skip[kPinkProbeIndices / 64] = {};
+uint32_t g_pink_draws = 0;
+struct PinkProbeSlot {
+  uint64_t submission = 0;
+  uint64_t skip[kPinkProbeIndices / 64];
+  uint32_t draws;
+};
+PinkProbeSlot g_pink_slots[kPinkProbeSlots];
+uint32_t g_pink_skipped_frames[kPinkProbeIndices], g_pink_skipped_pink[kPinkProbeIndices];
+// Frames in which the draw index existed and wasn't skipped, and pink ones.
+uint32_t g_pink_drawn_frames[kPinkProbeIndices], g_pink_drawn_pink[kPinkProbeIndices];
+// Pink frames by the shader's draw count.
+std::map<uint32_t, std::pair<uint32_t, uint32_t>> g_pink_by_draws;
+uint32_t g_pink_frames = 0, g_pink_pink = 0, g_pink_max_draws = 0;
+Microsoft::WRL::ComPtr<ID3D12Resource> g_pink_buffer;
+const uint32_t* g_pink_mapping = nullptr;
+}  // namespace
+
+void D3D12CommandProcessor::Amped3PinkProbe(ID3D12Resource* output, uint32_t width,
+                                            uint32_t height) {
+  if (!g_pink_buffer) {
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = 512 * kPinkProbeSlots;
+    desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    void* mapping;
+    if (FAILED(GetD3D12Provider().GetDevice()->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesReadback, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g_pink_buffer))) ||
+        FAILED(g_pink_buffer->Map(0, nullptr, &mapping))) {
+      g_pink_buffer.Reset();
+      return;
+    }
+    g_pink_mapping = static_cast<const uint32_t*>(mapping);
+  }
+  // Results of finished frames.
+  for (uint32_t i = 0; i < kPinkProbeSlots; ++i) {
+    PinkProbeSlot& slot = g_pink_slots[i];
+    if (!slot.submission || slot.submission > submission_completed_) {
+      continue;
+    }
+    slot.submission = 0;
+    const uint32_t v = g_pink_mapping[i * 128];
+    const uint32_t r = (v & 1023) >> 2, g = ((v >> 10) & 1023) >> 2, b = ((v >> 20) & 1023) >> 2;
+    const bool pink = r > 190 && g < 160 && b > 140 && r > g + 60 && b > g + 30;
+    auto& by_draws = g_pink_by_draws[slot.draws];
+    ++by_draws.first;
+    by_draws.second += pink;
+    // Gameplay frames only (menus have few of these draws and real pink).
+    if (slot.draws < 8) {
+      continue;
+    }
+    ++g_pink_frames;
+    g_pink_pink += pink;
+    g_pink_max_draws = std::max(g_pink_max_draws, slot.draws);
+    for (uint32_t j = 0; j < std::min(slot.draws, kPinkProbeIndices); ++j) {
+      if ((slot.skip[j >> 6] >> (j & 63)) & 1) {
+        ++g_pink_skipped_frames[j];
+        g_pink_skipped_pink[j] += pink;
+      } else {
+        ++g_pink_drawn_frames[j];
+        g_pink_drawn_pink[j] += pink;
+      }
+    }
+    if (g_pink_frames % 600 == 0) {
+      // Candidates: indices never pink while skipped, ordered by how often
+      // they were skipped.
+      std::string line;
+      for (uint32_t j = 0; j < std::min(g_pink_max_draws, kPinkProbeIndices); ++j) {
+        if (g_pink_skipped_frames[j] >= 8) {
+          // Pink rate while skipped vs while drawn.
+          line += fmt::format(" {}:{:.0f}/{:.0f}%", j,
+                              100.0 * g_pink_skipped_pink[j] / g_pink_skipped_frames[j],
+                              g_pink_drawn_frames[j]
+                                  ? 100.0 * g_pink_drawn_pink[j] / g_pink_drawn_frames[j]
+                                  : 0.0);
+        }
+      }
+      std::string draws_line;
+      for (const auto& [draws, counts] : g_pink_by_draws) {
+        if (counts.first >= 20) {
+          draws_line += fmt::format(" {}:{}/{}", draws, counts.second, counts.first);
+        }
+      }
+      REXGPU_INFO("pink_probe: pink frames by draw count (draws:pink/frames):{}", draws_line);
+      REXGPU_INFO("pink_probe: {} frames, {} pink ({:.0f}%), up to {} draws/frame, last pixel "
+                  "{},{},{}; pink % skipped/drawn by index:{}",
+                  g_pink_frames, g_pink_pink, 100.0 * g_pink_pink / g_pink_frames,
+                  g_pink_max_draws, r, g, b, line);
+    }
+  }
+  // This frame's pixel, then the next frame's random skips.
+  uint32_t free_slot = UINT32_MAX;
+  for (uint32_t i = 0; i < kPinkProbeSlots; ++i) {
+    if (!g_pink_slots[i].submission) {
+      free_slot = i;
+      break;
+    }
+  }
+  if (free_slot != UINT32_MAX) {
+    PinkProbeSlot& slot = g_pink_slots[free_slot];
+    std::memcpy(slot.skip, g_pink_skip, sizeof(g_pink_skip));
+    slot.draws = g_pink_draws;
+    slot.submission = submission_current_;
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+    dst.pResource = g_pink_buffer.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Offset = free_slot * 512;
+    dst.PlacedFootprint.Footprint = {ui::d3d12::D3D12Presenter::kGuestOutputFormat, 1, 1, 1, 256};
+    src.pResource = output;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    const uint32_t x = 527 * width / 1280, y = 602 * height / 720;
+    D3D12_BOX box = {x, y, 0, x + 1, y + 1, 1};
+    PushTransitionBarrier(output, ui::d3d12::D3D12Presenter::kGuestOutputInternalState,
+                          D3D12_RESOURCE_STATE_COPY_SOURCE);
+    SubmitBarriers();
+    deferred_command_list_.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+    PushTransitionBarrier(output, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                          ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
+  }
+  static uint64_t seed = 0x9E3779B97F4A7C15ull;
+  for (uint64_t& word : g_pink_skip) {
+    seed ^= seed << 13;
+    seed ^= seed >> 7;
+    seed ^= seed << 17;
+    word = free_slot != UINT32_MAX ? seed : 0;
+  }
+  g_pink_draws = 0;
+}
+
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
+  // The guest frontbuffer size (DLSS tells the scene's render target by it).
+  rex::perf::RecordGuestFrontbuffer(frontbuffer_width, frontbuffer_height);
   rex::graphics::amped3_make_valid_timing = REXCVAR_GET(d3d12_draw_timing);
   if (REXCVAR_GET(d3d12_debug_prim_stats)) {
     static uint32_t prim_swaps = 0;
@@ -2163,6 +2514,30 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     REXGPU_ERROR("IssueSwap: presenter is null");
     return;
   }
+  // A pre-rendered video on a screen wider or taller than 16:9 is shown
+  // letterboxed, never stretched: present_letterbox turned on while one plays
+  // (only when that changes), then back to the player's setting. (Not a
+  // Presenter member: the game is built against the stock SDK's layout.)
+  {
+    static bool video_shown = false;
+    static bool letterbox_setting = true;
+    // A video's frames don't all draw it (decoding lags now and then): it has
+    // ended after 30 frames without.
+    static int frames_without_video = 0;
+    frames_without_video = video_frame_ ? 0 : frames_without_video + 1;
+    const bool video = video_frame_ || (video_shown && frames_without_video < 30);
+    video_frame_ = video;
+    if (video != video_shown) {
+      if (video) letterbox_setting = REXCVAR_GET(present_letterbox);
+      video_shown = video;
+      const bool ok = rex::cvar::SetFlagByName("present_letterbox",
+                                               video_shown || letterbox_setting ? "true" : "false");
+      REXGPU_INFO("Video {}: present_letterbox {}{}", video_shown ? "starts" : "ends",
+                  REXCVAR_GET(present_letterbox), ok ? "" : " (not set)");
+    }
+  }
+  presenter_video_frame_ = video_frame_;
+  video_frame_ = false;
 
   // In case the swap command is the only one in the frame.
   if (!BeginSubmission(true)) {
@@ -2298,9 +2673,17 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
+  if (presenter_video_frame_) {
+    // A pre-rendered video: 16:9 whatever the window (letterboxed, see above).
+    display_width = 16;
+    display_height = 9;
+  }
 
+  // Frame generation's presents wait for vsync: never on the thread that feeds
+  // the GPU.
+  static const bool frame_generation = rex::cvar::GetFlagByName("frame_generation") == "true";
   const bool tail_on_submission_thread =
-      REXCVAR_GET(d3d12_present_on_submission_thread) && UseSubmissionThread();
+      REXCVAR_GET(d3d12_present_on_submission_thread) && UseSubmissionThread() && !frame_generation;
   if (tail_on_submission_thread != presenter_tail_on_submission_thread_) {
     if (tail_on_submission_thread) {
       presenter->SetGuestOutputRefreshTailRunner(
@@ -2319,8 +2702,10 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         ID3D12Device* device = provider.GetDevice();
 
         SwapPostEffect swap_post_effect = GetActualSwapPostEffect();
+        bool use_smaa = swap_post_effect == SwapPostEffect::kSmaa && smaa_root_signature_;
+        // (SMAA reads the same gamma-applied source texture as FXAA.)
         bool use_fxaa = swap_post_effect == SwapPostEffect::kFxaa ||
-                        swap_post_effect == SwapPostEffect::kFxaaExtreme;
+                        swap_post_effect == SwapPostEffect::kFxaaExtreme || use_smaa;
         if (use_fxaa) {
           // Make sure the texture of the correct size is available for FXAA.
           if (fxaa_source_texture_) {
@@ -2494,6 +2879,31 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         uint32_t group_count_y = (guest_output_height + 7) / 8;
         deferred_command_list_.D3DDispatch(group_count_x, group_count_y, 1);
 
+        // amped3: SMAA instead of FXAA.
+        if (use_smaa) {
+          PushTransitionBarrier(apply_gamma_dest, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                apply_gamma_dest_initial_state);
+          PushTransitionBarrier(guest_output_resource,
+                                ui::d3d12::D3D12Presenter::kGuestOutputInternalState,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+          bool smaa_applied =
+              ApplySmaa(guest_output_resource, guest_output_width, guest_output_height);
+          PushTransitionBarrier(guest_output_resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
+          if (!smaa_applied) {
+            PushTransitionBarrier(apply_gamma_dest, apply_gamma_dest_initial_state,
+                                  D3D12_RESOURCE_STATE_COPY_SOURCE);
+            PushTransitionBarrier(guest_output_resource,
+                                  ui::d3d12::D3D12Presenter::kGuestOutputInternalState,
+                                  D3D12_RESOURCE_STATE_COPY_DEST);
+            SubmitBarriers();
+            deferred_command_list_.D3DCopyResource(guest_output_resource, apply_gamma_dest);
+            PushTransitionBarrier(apply_gamma_dest, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                  apply_gamma_dest_initial_state);
+            PushTransitionBarrier(guest_output_resource, D3D12_RESOURCE_STATE_COPY_DEST,
+                                  ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
+          }
+        } else
         // Apply FXAA.
         if (use_fxaa) {
           // Destination and source.
@@ -2569,6 +2979,9 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                                 apply_gamma_dest_initial_state);
         }
 
+        if (REXCVAR_GET(d3d12_debug_pink_probe)) {
+          Amped3PinkProbe(guest_output_resource, guest_output_width, guest_output_height);
+        }
         // Need to submit all the commands before giving the image back to the
         // presenter so it can submit its own commands for displaying it to the
         // queue.
@@ -2580,6 +2993,283 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // End the frame even if did not present for any reason (the image refresher
   // was not called), to prevent leaking per-frame resources.
   EndSubmission(true);
+
+  if (dlss_) {
+    dlss_->EndFrame();
+  }
+  // The scene's resolve: the last single-sampled frontbuffer-wide color 0
+  // resolve before the frame's final one (the frontbuffer copy).
+  if (g_dlss_wide_resolves >= 2) {
+    g_dlss_scene_resolve = g_dlss_wide_resolves - 1;
+  }
+  g_dlss_wide_resolves = 0;
+  g_dlss_resolves_before_hud = 0;
+  ++g_dlss_frame;
+  if (REXCVAR_GET(dlss_log) && ++g_dlss_stats.frames % 60 == 0) {
+    REXGPU_INFO("DLSS draws (60 frames): fb width {}, wide-target draws {}, narrow {}, scene {}, HUD {}, "
+                "hand-offs {}, wants scene {}, scene resolve #{}, frame {}",
+                g_dlss_stats.fb_width, g_dlss_stats.wide, g_dlss_stats.narrow, g_dlss_stats.scene,
+                g_dlss_stats.hud, g_dlss_stats.taken, dlss_ ? int(dlss_->WantsScene()) : -1,
+                g_dlss_scene_resolve, g_dlss_frame);
+    g_dlss_stats = {g_dlss_stats.frames};
+  }
+}
+
+bool D3D12CommandProcessor::SetupSmaa() {
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  D3D12_ROOT_PARAMETER parameters[UINT(SmaaRootParameter::kCount)];
+  D3D12_DESCRIPTOR_RANGE ranges[4];
+  {
+    auto& parameter = parameters[UINT(SmaaRootParameter::kConstants)];
+    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameter.Constants.ShaderRegister = 0;
+    parameter.Constants.RegisterSpace = 0;
+    parameter.Constants.Num32BitValues = 2;
+    parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  }
+  for (uint32_t i = 0; i < 4; ++i) {
+    D3D12_DESCRIPTOR_RANGE& range = ranges[i];
+    range.RangeType = i < 3 ? D3D12_DESCRIPTOR_RANGE_TYPE_SRV : D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+    range.NumDescriptors = 1;
+    range.BaseShaderRegister = i < 3 ? i : 0;
+    range.RegisterSpace = 0;
+    range.OffsetInDescriptorsFromTableStart = 0;
+    auto& parameter = parameters[UINT(SmaaRootParameter::kSource0) + i];
+    parameter.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameter.DescriptorTable.NumDescriptorRanges = 1;
+    parameter.DescriptorTable.pDescriptorRanges = &range;
+    parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  }
+  D3D12_STATIC_SAMPLER_DESC samplers[2] = {};
+  for (uint32_t i = 0; i < 2; ++i) {
+    D3D12_STATIC_SAMPLER_DESC& sampler = samplers[i];
+    sampler.Filter =
+        i ? D3D12_FILTER_MIN_MAG_MIP_POINT : D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.MaxAnisotropy = 1;
+    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+    sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_OPAQUE_BLACK;
+    sampler.ShaderRegister = i;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  }
+  D3D12_ROOT_SIGNATURE_DESC desc;
+  desc.NumParameters = UINT(SmaaRootParameter::kCount);
+  desc.pParameters = parameters;
+  desc.NumStaticSamplers = 2;
+  desc.pStaticSamplers = samplers;
+  desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+  *(smaa_root_signature_.ReleaseAndGetAddressOf()) =
+      ui::d3d12::util::CreateRootSignature(provider, desc);
+  if (!smaa_root_signature_) {
+    // Optional: FXAA is used instead.
+    REXGPU_ERROR("Failed to create the SMAA root signature");
+    return true;
+  }
+  const std::pair<const void*, size_t> shaders_bytecode[3] = {
+      {shaders::smaa_edges_cs, sizeof(shaders::smaa_edges_cs)},
+      {shaders::smaa_weights_cs, sizeof(shaders::smaa_weights_cs)},
+      {shaders::smaa_blend_cs, sizeof(shaders::smaa_blend_cs)},
+  };
+  for (uint32_t i = 0; i < 3; ++i) {
+    *(smaa_pipelines_[i].ReleaseAndGetAddressOf()) = ui::d3d12::util::CreateComputePipeline(
+        device, shaders_bytecode[i].first, shaders_bytecode[i].second, smaa_root_signature_.Get());
+    if (!smaa_pipelines_[i]) {
+      REXGPU_ERROR("Failed to create the SMAA compute pipelines");
+      smaa_root_signature_.Reset();
+      return true;
+    }
+  }
+  // Lookup textures and their upload buffer (rows aligned to 256 bytes).
+  struct Lut {
+    Microsoft::WRL::ComPtr<ID3D12Resource>* texture;
+    DXGI_FORMAT format;
+    uint32_t width, height, pitch;
+    const unsigned char* bytes;
+  } luts[2] = {
+      {&smaa_area_texture_, DXGI_FORMAT_R8G8_UNORM, AREATEX_WIDTH, AREATEX_HEIGHT, AREATEX_PITCH,
+       shaders::areaTexBytes},
+      {&smaa_search_texture_, DXGI_FORMAT_R8_UNORM, SEARCHTEX_WIDTH, SEARCHTEX_HEIGHT,
+       SEARCHTEX_PITCH, shaders::searchTexBytes},
+  };
+  uint32_t upload_size = 0;
+  for (const Lut& lut : luts) {
+    upload_size += rex::align(lut.pitch, uint32_t(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT)) * lut.height;
+    upload_size = rex::align(upload_size, uint32_t(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT));
+  }
+  D3D12_RESOURCE_DESC buffer_desc;
+  ui::d3d12::util::FillBufferResourceDesc(buffer_desc, upload_size, D3D12_RESOURCE_FLAG_NONE);
+  uint8_t* mapping;
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesUpload, provider.GetHeapFlagCreateNotZeroed(),
+          &buffer_desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+          IID_PPV_ARGS(&smaa_lut_upload_buffer_))) ||
+      FAILED(smaa_lut_upload_buffer_->Map(0, nullptr, reinterpret_cast<void**>(&mapping)))) {
+    REXGPU_ERROR("Failed to create the SMAA lookup texture upload buffer");
+    smaa_root_signature_.Reset();
+    return true;
+  }
+  uint32_t offset = 0;
+  for (const Lut& lut : luts) {
+    D3D12_RESOURCE_DESC texture_desc = {};
+    texture_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    texture_desc.Width = lut.width;
+    texture_desc.Height = lut.height;
+    texture_desc.DepthOrArraySize = 1;
+    texture_desc.MipLevels = 1;
+    texture_desc.Format = lut.format;
+    texture_desc.SampleDesc.Count = 1;
+    if (FAILED(device->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesDefault, provider.GetHeapFlagCreateNotZeroed(),
+            &texture_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(lut.texture->ReleaseAndGetAddressOf())))) {
+      REXGPU_ERROR("Failed to create an SMAA lookup texture");
+      smaa_root_signature_.Reset();
+      return true;
+    }
+    uint32_t row_pitch = rex::align(lut.pitch, uint32_t(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT));
+    for (uint32_t y = 0; y < lut.height; ++y) {
+      std::memcpy(mapping + offset + y * row_pitch, lut.bytes + y * lut.pitch, lut.pitch);
+    }
+    offset = rex::align(offset + row_pitch * lut.height,
+                        uint32_t(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT));
+  }
+  smaa_lut_upload_buffer_->Unmap(0, nullptr);
+  smaa_luts_uploaded_ = false;
+  return true;
+}
+
+bool D3D12CommandProcessor::ApplySmaa(ID3D12Resource* destination, uint32_t width,
+                                      uint32_t height) {
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  if (!smaa_luts_uploaded_) {
+    uint32_t offset = 0;
+    ID3D12Resource* textures[2] = {smaa_area_texture_.Get(), smaa_search_texture_.Get()};
+    for (ID3D12Resource* texture : textures) {
+      D3D12_RESOURCE_DESC texture_desc = texture->GetDesc();
+      D3D12_TEXTURE_COPY_LOCATION dest, source;
+      dest.pResource = texture;
+      dest.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      dest.SubresourceIndex = 0;
+      source.pResource = smaa_lut_upload_buffer_.Get();
+      source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+      source.PlacedFootprint.Offset = offset;
+      source.PlacedFootprint.Footprint.Format = texture_desc.Format;
+      source.PlacedFootprint.Footprint.Width = uint32_t(texture_desc.Width);
+      source.PlacedFootprint.Footprint.Height = texture_desc.Height;
+      source.PlacedFootprint.Footprint.Depth = 1;
+      uint32_t pitch = uint32_t(texture_desc.Width) *
+                       (texture_desc.Format == DXGI_FORMAT_R8G8_UNORM ? 2 : 1);
+      source.PlacedFootprint.Footprint.RowPitch =
+          rex::align(pitch, uint32_t(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT));
+      deferred_command_list_.CopyTexture(dest, source);
+      offset = rex::align(offset + source.PlacedFootprint.Footprint.RowPitch * texture_desc.Height,
+                          uint32_t(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT));
+      PushTransitionBarrier(texture, D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+    smaa_luts_uploaded_ = true;
+  }
+  // Edges and weights textures of the output size.
+  for (auto& texture : smaa_textures_) {
+    if (texture) {
+      D3D12_RESOURCE_DESC desc = texture->GetDesc();
+      if (desc.Width != width || desc.Height != height) {
+        if (submission_completed_ < smaa_textures_submission_) {
+          texture->AddRef();
+          resources_for_deletion_.emplace_back(smaa_textures_submission_, texture.Get());
+        }
+        texture.Reset();
+      }
+    }
+    if (!texture) {
+      D3D12_RESOURCE_DESC desc = {};
+      desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+      desc.Width = width;
+      desc.Height = height;
+      desc.DepthOrArraySize = 1;
+      desc.MipLevels = 1;
+      desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      desc.SampleDesc.Count = 1;
+      desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+      if (FAILED(device->CreateCommittedResource(
+              &ui::d3d12::util::kHeapPropertiesDefault, provider.GetHeapFlagCreateNotZeroed(),
+              &desc, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+              IID_PPV_ARGS(texture.ReleaseAndGetAddressOf())))) {
+        REXGPU_ERROR("Failed to create an SMAA texture");
+        return false;
+      }
+    }
+  }
+  smaa_textures_submission_ = submission_current_;
+  // Per pass: three sources and the destination.
+  ui::d3d12::util::DescriptorCpuGpuHandlePair descriptors[12];
+  if (!RequestOneUseSingleViewDescriptors(12, descriptors)) {
+    return false;
+  }
+  auto srv = [&](ID3D12Resource* resource, DXGI_FORMAT format,
+                 const ui::d3d12::util::DescriptorCpuGpuHandlePair& handle) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC desc = {};
+    desc.Format = format;
+    desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    desc.Texture2D.MipLevels = 1;
+    device->CreateShaderResourceView(resource, &desc, handle.first);
+  };
+  auto uav = [&](ID3D12Resource* resource, DXGI_FORMAT format,
+                 const ui::d3d12::util::DescriptorCpuGpuHandlePair& handle) {
+    D3D12_UNORDERED_ACCESS_VIEW_DESC desc = {};
+    desc.Format = format;
+    desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    device->CreateUnorderedAccessView(resource, nullptr, &desc, handle.first);
+  };
+  ID3D12Resource* color = fxaa_source_texture_.Get();
+  ID3D12Resource* edges = smaa_textures_[0].Get();
+  ID3D12Resource* weights = smaa_textures_[1].Get();
+  const DXGI_FORMAT kRgba8 = DXGI_FORMAT_R8G8B8A8_UNORM;
+  // Edges: color -> edges.
+  srv(color, kFxaaSourceTextureFormat, descriptors[0]);
+  srv(color, kFxaaSourceTextureFormat, descriptors[1]);
+  srv(color, kFxaaSourceTextureFormat, descriptors[2]);
+  uav(edges, kRgba8, descriptors[3]);
+  // Weights: edges, AreaTex, SearchTex -> weights.
+  srv(edges, kRgba8, descriptors[4]);
+  srv(smaa_area_texture_.Get(), DXGI_FORMAT_R8G8_UNORM, descriptors[5]);
+  srv(smaa_search_texture_.Get(), DXGI_FORMAT_R8_UNORM, descriptors[6]);
+  uav(weights, kRgba8, descriptors[7]);
+  // Blend: color, weights -> destination.
+  srv(color, kFxaaSourceTextureFormat, descriptors[8]);
+  srv(weights, kRgba8, descriptors[9]);
+  srv(weights, kRgba8, descriptors[10]);
+  uav(destination, ui::d3d12::D3D12Presenter::kGuestOutputFormat, descriptors[11]);
+
+  deferred_command_list_.D3DSetComputeRootSignature(smaa_root_signature_.Get());
+  uint32_t constants[2] = {width, height};
+  deferred_command_list_.D3DSetComputeRoot32BitConstants(UINT(SmaaRootParameter::kConstants), 2,
+                                                         constants, 0);
+  uint32_t groups_x = (width + 7) / 8, groups_y = (height + 7) / 8;
+  ID3D12Resource* pass_targets[2] = {edges, weights};
+  for (uint32_t pass = 0; pass < 3; ++pass) {
+    if (pass < 2) {
+      PushTransitionBarrier(pass_targets[pass], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+    for (uint32_t i = 0; i < 4; ++i) {
+      deferred_command_list_.D3DSetComputeRootDescriptorTable(
+          UINT(SmaaRootParameter::kSource0) + i, descriptors[pass * 4 + i].second);
+    }
+    SetExternalPipeline(smaa_pipelines_[pass].Get());
+    SubmitBarriers();
+    deferred_command_list_.D3DDispatch(groups_x, groups_y, 1);
+    if (pass < 2) {
+      PushTransitionBarrier(pass_targets[pass], D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    }
+  }
+  return true;
 }
 
 void D3D12CommandProcessor::OnPrimaryBufferEnd() {
@@ -2587,6 +3277,761 @@ void D3D12CommandProcessor::OnPrimaryBufferEnd() {
       CanEndSubmissionImmediately()) {
     EndSubmission(false);
   }
+}
+
+void D3D12CommandProcessor::Amped3OnTileChange(uint32_t new_tile) {
+  if (!REXCVAR_GET(gpu_tile_replay)) {
+    return;
+  }
+  const RegisterFile& regs = *register_file_;
+  tile_replay_cursor_ = 0;
+  tile_replay_divergent_.clear();
+  tile_replay_divergent_constants_.clear();
+  std::memset(tile_replay_divergent_float_, 0, sizeof(tile_replay_divergent_float_));
+  tile_replay_divergent_fetch_ = 0;
+  tile_replay_disabled_ = false;
+  if (new_tile == 1) {
+    tile_replay_start_registers_.assign(regs.values, regs.values + RegisterFile::kRegisterCount);
+    tile_replay_start_shaders_[0] = active_vertex_shader();
+    tile_replay_start_shaders_[1] = active_pixel_shader();
+    tile_replay_addresses_.clear();
+    tile_replay_watch_values_.clear();
+    tile_replay_watch_hashes_.clear();
+    tile_replay_srv_keys_.clear();
+    // This frame's watch set.
+    if (tile_replay_watch_position_.empty()) {
+      tile_replay_watch_position_.assign(RegisterFile::kRegisterCount, -1);
+    }
+    for (uint32_t index : tile_replay_watch_) {
+      tile_replay_watch_position_[index] = -1;
+    }
+    tile_replay_watch_ = tile_replay_watch_next_;
+    for (size_t i = 0; i < tile_replay_watch_.size(); ++i) {
+      tile_replay_watch_position_[tile_replay_watch_[i]] = int8_t(i);
+    }
+    std::memcpy(tile_replay_watch_float_, tile_replay_watch_float_next_,
+                sizeof(tile_replay_watch_float_));
+    tile_replay_watch_fetch_ = tile_replay_watch_fetch_next_;
+    if (!(++tile_replay_stats_[7] % 300)) {
+      const uint64_t* s = tile_replay_stats_;
+      uint64_t later = std::max(s[0] + s[1] + s[2] + s[3] + s[4] + s[5], uint64_t(1));
+      std::vector<std::pair<uint64_t, uint32_t>> blocking;
+      for (auto& b : tile_replay_blocking_registers_) {
+        blocking.emplace_back(b.second, b.first);
+      }
+      std::sort(blocking.rbegin(), blocking.rend());
+      std::string top;
+      for (size_t i = 0; i < blocking.size() && i < 8; ++i) {
+        top += fmt::format(" {:04X}{}:{}", blocking[i].second & 0xFFFF,
+                           (blocking[i].second >> 31) ? "(watched)" : "", blocking[i].first);
+      }
+      REXGPU_INFO(
+          "gpu_tile_replay: 300 frames: tile 1 draws {}/frame; tiles 2-3 draws {}/frame, "
+          "eligible {:.1f}%, replayed {}/frame; not: no tile 1 draw {:.1f}%, registers {:.1f}%, "
+          "constants {:.1f}%, too much differing {:.1f}%, shaders {:.1f}%; fell back: render "
+          "targets {}, textures {}; watching {} registers, blocking:{}",
+          s[6] / 300, later / 300, 100.0 * s[0] / later, tile_replay_replayed_ / 300,
+          100.0 * s[1] / later, 100.0 * s[2] / later, 100.0 * s[3] / later, 100.0 * s[4] / later,
+          100.0 * s[5] / later, tile_replay_fallbacks_[0], tile_replay_fallbacks_[1],
+          tile_replay_watch_.size(), top);
+      std::memset(tile_replay_stats_, 0, sizeof(tile_replay_stats_));
+      tile_replay_blocking_registers_.clear();
+      tile_replay_replayed_ = 0;
+      std::memset(tile_replay_fallbacks_, 0, sizeof(tile_replay_fallbacks_));
+    }
+    return;
+  }
+  if (new_tile < 2 || tile_replay_start_registers_.empty()) {
+    return;
+  }
+  // Registers that legitimately differ between the tiles or don't affect
+  // drawing: everything below the context registers (control, coherency,
+  // counters), the window offset and scissor (derived again for each draw),
+  // the resolve destination (copies always run normally), event initiators
+  // and the index buffer registers (set by each indexed draw packet).
+  auto per_tile = [](uint32_t index) {
+    return index < 0x2000 || index == XE_GPU_REG_PA_SC_WINDOW_OFFSET ||
+           index == XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL ||
+           index == XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR || index == XE_GPU_REG_RB_COPY_DEST_BASE ||
+           index == XE_GPU_REG_VGT_EVENT_INITIATOR || index == XE_GPU_REG_VGT_DMA_BASE ||
+           index == XE_GPU_REG_VGT_DMA_SIZE;
+  };
+  const uint32_t* start = tile_replay_start_registers_.data();
+  for (uint32_t i = 0x2000; i < RegisterFile::kRegisterCount; ++i) {
+    if (regs.values[i] == start[i] || per_tile(i)) {
+      continue;
+    }
+    if (i >= XE_GPU_REG_SHADER_CONSTANT_000_X && i < XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) {
+      uint32_t constant = (i - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
+      tile_replay_divergent_float_[constant >> 6] |= uint64_t(1) << (constant & 63);
+      tile_replay_divergent_constants_.emplace_back(i, regs.values[i]);
+    } else if (i >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
+               i < XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 32 * 6) {
+      tile_replay_divergent_fetch_ |= uint32_t(1)
+                                      << ((i - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 6);
+      tile_replay_divergent_constants_.emplace_back(i, regs.values[i]);
+    } else {
+      tile_replay_divergent_.emplace_back(i, regs.values[i]);
+    }
+  }
+  if (new_tile == 2) {
+    // Watch them in the next frame's tile 1.
+    tile_replay_watch_next_.clear();
+    for (const std::pair<uint32_t, uint32_t>& divergent : tile_replay_divergent_) {
+      if (tile_replay_watch_next_.size() < 32) {
+        tile_replay_watch_next_.push_back(divergent.first);
+      }
+    }
+    std::memcpy(tile_replay_watch_float_next_, tile_replay_divergent_float_,
+                sizeof(tile_replay_watch_float_next_));
+    tile_replay_watch_fetch_next_ = tile_replay_divergent_fetch_;
+  }
+  // Watched ones are compared with tile 1 draw by draw; the rest must be
+  // written again before a draw that depends on them.
+  tile_replay_divergent_.erase(
+      std::remove_if(tile_replay_divergent_.begin(), tile_replay_divergent_.end(),
+                     [this](const std::pair<uint32_t, uint32_t>& divergent) {
+                       return tile_replay_watch_position_[divergent.first] >= 0;
+                     }),
+      tile_replay_divergent_.end());
+  for (uint32_t i = 0; i < 8; ++i) {
+    tile_replay_divergent_float_[i] &= ~tile_replay_watch_float_[i];
+  }
+  tile_replay_divergent_fetch_ &= ~tile_replay_watch_fetch_;
+  tile_replay_divergent_constants_.erase(
+      std::remove_if(tile_replay_divergent_constants_.begin(),
+                     tile_replay_divergent_constants_.end(),
+                     [this](const std::pair<uint32_t, uint32_t>& divergent) {
+                       uint32_t i = divergent.first;
+                       if (i < XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) {
+                         uint32_t c = (i - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
+                         return ((tile_replay_watch_float_[c >> 6] >> (c & 63)) & 1) != 0;
+                       }
+                       return ((tile_replay_watch_fetch_ >>
+                                ((i - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 6)) &
+                               1) != 0;
+                     }),
+      tile_replay_divergent_constants_.end());
+  tile_replay_disabled_ = tile_replay_divergent_.size() > 64;
+  const Shader* shaders[2] = {active_vertex_shader(), active_pixel_shader()};
+  for (uint32_t i = 0; i < 2; ++i) {
+    tile_replay_shader_divergent_[i] = shaders[i] != tile_replay_start_shaders_[i];
+    tile_replay_divergent_shaders_[i] = shaders[i];
+  }
+}
+
+uint64_t D3D12CommandProcessor::TileReplayWatchedConstantsHash(const Shader* vertex_shader,
+                                                               const Shader* pixel_shader,
+                                                               uint32_t used_fetch_mask) const {
+  const RegisterFile& regs = *register_file_;
+  // (Multiply-xor: these are a few registers per draw, compared exactly once.)
+  uint64_t hash = 0;
+  auto mix = [&hash](const uint32_t* values, uint32_t count) {
+    for (uint32_t i = 0; i < count; ++i) {
+      hash = (hash ^ values[i]) * 0x9E3779B97F4A7C15ull;
+      hash ^= hash >> 29;
+    }
+  };
+  for (uint32_t stage = 0; stage < 2; ++stage) {
+    const Shader* shader = stage ? pixel_shader : vertex_shader;
+    if (!shader) {
+      continue;
+    }
+    const uint64_t* used = shader->constant_register_map().float_bitmap;
+    for (uint32_t i = 0; i < 4; ++i) {
+      uint64_t bits = used[i] & tile_replay_watch_float_[stage * 4 + i];
+      uint32_t j;
+      while (rex::bit_scan_forward(bits, &j)) {
+        bits &= bits - 1;
+        uint32_t constant = stage * 256 + i * 64 + j;
+        mix(&regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X + constant * 4], 4);
+      }
+    }
+  }
+  uint32_t fetch = used_fetch_mask & tile_replay_watch_fetch_;
+  uint32_t j;
+  while (rex::bit_scan_forward(fetch, &j)) {
+    fetch &= fetch - 1;
+    mix(&regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + j * 6], 6);
+  }
+  return hash;
+}
+
+bool D3D12CommandProcessor::TileReplayBindings(const TileReplayRecord& record,
+                                               const D3D12Shader* vertex_shader,
+                                               const D3D12Shader* pixel_shader) {
+  // The textures must be the same as tile 1's (bindless descriptor indices).
+  const D3D12TextureCache::TextureSRVKey* keys = tile_replay_srv_keys_.data() + record.srv_keys_start;
+  if ((record.srv_key_counts[0] &&
+       !texture_cache_->AreActiveTextureSRVKeysUpToDate(
+           keys, vertex_shader->GetTextureBindingsAfterTranslation().data(),
+           record.srv_key_counts[0])) ||
+      (record.srv_key_counts[1] &&
+       !texture_cache_->AreActiveTextureSRVKeysUpToDate(
+           keys + record.srv_key_counts[0], pixel_shader->GetTextureBindingsAfterTranslation().data(),
+           record.srv_key_counts[1]))) {
+    return false;
+  }
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  if (current_graphics_root_signature_ != record.root_signature) {
+    current_graphics_root_signature_ = record.root_signature;
+    current_graphics_root_up_to_date_ = 0;
+    deferred_command_list_.D3DSetGraphicsRootSignature(record.root_signature);
+  }
+  if (tile_replay_root_signature_ != current_graphics_root_signature_) {
+    tile_replay_root_signature_ = current_graphics_root_signature_;
+    std::memset(tile_replay_root_addresses_, 0, sizeof(tile_replay_root_addresses_));
+  }
+  // System constants: this tile's (the viewport differs).
+  if (!cbuffer_binding_system_.up_to_date) {
+    uint8_t* system_constants = constant_buffer_pool_->Request(
+        frame_current_, sizeof(system_constants_), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT,
+        nullptr, nullptr, &cbuffer_binding_system_.address);
+    if (system_constants == nullptr) {
+      return false;
+    }
+    std::memcpy(system_constants, &system_constants_, sizeof(system_constants_));
+    cbuffer_binding_system_.up_to_date = true;
+    current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_SystemConstants);
+  }
+  if (!(current_graphics_root_up_to_date_ & (1u << kRootParameter_Bindless_SystemConstants))) {
+    deferred_command_list_.D3DSetGraphicsRootConstantBufferView(
+        kRootParameter_Bindless_SystemConstants, cbuffer_binding_system_.address);
+    current_graphics_root_up_to_date_ |= 1u << kRootParameter_Bindless_SystemConstants;
+  }
+  // Tile 1's constant buffers (the same data, uploaded in this frame). The
+  // regular path's own bindings aren't in these root parameters anymore.
+  static const uint32_t kParameters[6] = {
+      kRootParameter_Bindless_FetchConstants,         kRootParameter_Bindless_FloatConstantsVertex,
+      kRootParameter_Bindless_FloatConstantsPixel,    kRootParameter_Bindless_BoolLoopConstants,
+      kRootParameter_Bindless_DescriptorIndicesPixel, kRootParameter_Bindless_DescriptorIndicesVertex,
+  };
+  for (uint32_t i = 0; i < 6; ++i) {
+    uint32_t bit = 1u << kParameters[i];
+    if ((current_graphics_root_up_to_date_ & bit) ||
+        tile_replay_root_addresses_[i] != record.constant_buffers[i]) {
+      deferred_command_list_.D3DSetGraphicsRootConstantBufferView(kParameters[i],
+                                                                  record.constant_buffers[i]);
+      tile_replay_root_addresses_[i] = record.constant_buffers[i];
+      current_graphics_root_up_to_date_ &= ~bit;
+    }
+  }
+  // As UpdateBindings: shared memory as an SRV, the heaps, the extents slot.
+  if (!current_shared_memory_binding_is_uav_.has_value() ||
+      current_shared_memory_binding_is_uav_.value()) {
+    current_shared_memory_binding_is_uav_ = false;
+    current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_SharedMemory);
+  }
+  if (!(current_graphics_root_up_to_date_ & (1u << kRootParameter_Bindless_SharedMemory))) {
+    deferred_command_list_.D3DSetGraphicsRootDescriptorTable(
+        kRootParameter_Bindless_SharedMemory,
+        provider.OffsetViewDescriptor(
+            view_bindless_heap_gpu_start_,
+            uint32_t(SystemBindlessView::kSharedMemoryRawSRVAndNullRawUAVStart)));
+    current_graphics_root_up_to_date_ |= 1u << kRootParameter_Bindless_SharedMemory;
+  }
+  if (!(current_graphics_root_up_to_date_ & (1u << kRootParameter_Bindless_SamplerHeap))) {
+    deferred_command_list_.D3DSetGraphicsRootDescriptorTable(kRootParameter_Bindless_SamplerHeap,
+                                                             sampler_bindless_heap_gpu_start_);
+    current_graphics_root_up_to_date_ |= 1u << kRootParameter_Bindless_SamplerHeap;
+  }
+  if (!(current_graphics_root_up_to_date_ & (1u << kRootParameter_Bindless_ViewHeap))) {
+    deferred_command_list_.D3DSetGraphicsRootDescriptorTable(kRootParameter_Bindless_ViewHeap,
+                                                             view_bindless_heap_gpu_start_);
+    current_graphics_root_up_to_date_ |= 1u << kRootParameter_Bindless_ViewHeap;
+  }
+  if (!(current_graphics_root_up_to_date_ & (1u << kRootParameter_Bindless_ScreenExtents))) {
+    deferred_command_list_.D3DSetGraphicsRootUnorderedAccessView(
+        kRootParameter_Bindless_ScreenExtents,
+        screen_extents_buffer_->GetGPUVirtualAddress() + uint64_t(screen_extents_root_slot_) * 16);
+    current_graphics_root_up_to_date_ |= 1u << kRootParameter_Bindless_ScreenExtents;
+  }
+  return true;
+}
+
+
+bool D3D12CommandProcessor::TileReplayEligible(const Shader* vertex_shader,
+                                               const Shader* pixel_shader,
+                                               uint32_t used_texture_mask) {
+  const RegisterFile& regs = *register_file_;
+  tile_replay_current_ = -1;
+  if (amped3_tile_ < 1 || tile_replay_start_registers_.empty()) {
+    return false;
+  }
+  uint32_t used_fetch_mask = used_texture_mask;
+  const Shader::ConstantRegisterMap& vertex_map = vertex_shader->constant_register_map();
+  for (uint32_t i = 0; i < rex::countof(vertex_map.vertex_fetch_bitmap); ++i) {
+    uint32_t bits = vertex_map.vertex_fetch_bitmap[i];
+    uint32_t j;
+    while (rex::bit_scan_forward(bits, &j)) {
+      bits &= ~(uint32_t(1) << j);
+      used_fetch_mask |= uint32_t(1) << ((i * 32 + j) / 3);
+    }
+  }
+  if (amped3_tile_ == 1) {
+    uint32_t record = uint32_t(tile_replay_addresses_.size());
+    tile_replay_addresses_.push_back(amped3_draw_address_);
+    for (uint32_t index : tile_replay_watch_) {
+      tile_replay_watch_values_.push_back(regs.values[index]);
+    }
+    tile_replay_watch_hashes_.push_back(
+        TileReplayWatchedConstantsHash(vertex_shader, pixel_shader, used_fetch_mask));
+    if (tile_replay_records_.size() <= record) {
+      tile_replay_records_.resize(record + 1);
+    }
+    tile_replay_records_[record].valid = false;
+    tile_replay_current_ = int32_t(record);
+    ++tile_replay_stats_[6];
+    return false;
+  }
+  if (tile_replay_disabled_) {
+    ++tile_replay_stats_[4];
+    return false;
+  }
+  // The same draw as tile 1's at this position (or a few further, if this
+  // tile skipped some).
+  uint32_t record = tile_replay_cursor_;
+  while (record < tile_replay_addresses_.size() && record < tile_replay_cursor_ + 8 &&
+         tile_replay_addresses_[record] != amped3_draw_address_) {
+    ++record;
+  }
+  if (record >= tile_replay_addresses_.size() ||
+      tile_replay_addresses_[record] != amped3_draw_address_) {
+    ++tile_replay_stats_[1];
+    return false;
+  }
+  tile_replay_cursor_ = record + 1;
+  const Shader* active_shaders[2] = {active_vertex_shader(), active_pixel_shader()};
+  for (uint32_t i = 0; i < 2; ++i) {
+    if (tile_replay_shader_divergent_[i] &&
+        active_shaders[i] != tile_replay_divergent_shaders_[i]) {
+      tile_replay_shader_divergent_[i] = false;
+    }
+  }
+  if (tile_replay_shader_divergent_[0] || (pixel_shader && tile_replay_shader_divergent_[1])) {
+    ++tile_replay_stats_[5];
+    return false;
+  }
+  // Watched registers: as at the same draw in tile 1.
+  const uint32_t* watch_values = tile_replay_watch_values_.data() + size_t(record) * tile_replay_watch_.size();
+  for (size_t i = 0; i < tile_replay_watch_.size(); ++i) {
+    if (regs.values[tile_replay_watch_[i]] != watch_values[i]) {
+      ++tile_replay_stats_[2];
+      ++tile_replay_blocking_registers_[tile_replay_watch_[i] | (uint32_t(1) << 31)];
+      return false;
+    }
+  }
+  // Others: written again since the tile's start.
+  tile_replay_divergent_.erase(
+      std::remove_if(tile_replay_divergent_.begin(), tile_replay_divergent_.end(),
+                     [&regs](const std::pair<uint32_t, uint32_t>& divergent) {
+                       return regs.values[divergent.first] != divergent.second;
+                     }),
+      tile_replay_divergent_.end());
+  if (!tile_replay_divergent_.empty()) {
+    ++tile_replay_stats_[2];
+    ++tile_replay_blocking_registers_[tile_replay_divergent_.front().first];
+    return false;
+  }
+  // Unwatched constants this draw uses: written again since the tile's start.
+  bool uses_divergent = (used_fetch_mask & tile_replay_divergent_fetch_) != 0;
+  for (uint32_t i = 0; i < 4 && !uses_divergent; ++i) {
+    uses_divergent = (vertex_map.float_bitmap[i] & tile_replay_divergent_float_[i]) ||
+                     (pixel_shader && (pixel_shader->constant_register_map().float_bitmap[i] &
+                                       tile_replay_divergent_float_[4 + i]));
+  }
+  if (uses_divergent) {
+    std::memset(tile_replay_divergent_float_, 0, sizeof(tile_replay_divergent_float_));
+    tile_replay_divergent_fetch_ = 0;
+    tile_replay_divergent_constants_.erase(
+        std::remove_if(tile_replay_divergent_constants_.begin(),
+                       tile_replay_divergent_constants_.end(),
+                       [&regs](const std::pair<uint32_t, uint32_t>& divergent) {
+                         return regs.values[divergent.first] != divergent.second;
+                       }),
+        tile_replay_divergent_constants_.end());
+    for (const std::pair<uint32_t, uint32_t>& divergent : tile_replay_divergent_constants_) {
+      uint32_t i = divergent.first;
+      if (i < XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) {
+        uint32_t c = (i - XE_GPU_REG_SHADER_CONSTANT_000_X) >> 2;
+        tile_replay_divergent_float_[c >> 6] |= uint64_t(1) << (c & 63);
+      } else {
+        tile_replay_divergent_fetch_ |= uint32_t(1)
+                                        << ((i - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 6);
+      }
+    }
+    uses_divergent = (used_fetch_mask & tile_replay_divergent_fetch_) != 0;
+    for (uint32_t i = 0; i < 4 && !uses_divergent; ++i) {
+      uses_divergent = (vertex_map.float_bitmap[i] & tile_replay_divergent_float_[i]) ||
+                       (pixel_shader && (pixel_shader->constant_register_map().float_bitmap[i] &
+                                         tile_replay_divergent_float_[4 + i]));
+    }
+    if (uses_divergent) {
+      ++tile_replay_stats_[3];
+      return false;
+    }
+  }
+  // Watched constants this draw uses: as at the same draw in tile 1.
+  if (TileReplayWatchedConstantsHash(vertex_shader, pixel_shader, used_fetch_mask) !=
+      tile_replay_watch_hashes_[record]) {
+    ++tile_replay_stats_[3];
+    return false;
+  }
+  ++tile_replay_stats_[0];
+  if (tile_replay_records_[record].valid) {
+    tile_replay_current_ = int32_t(record);
+  }
+  return true;
+}
+
+void D3D12CommandProcessor::TileReplayHashes(const D3D12Shader* vertex_shader,
+                                             const D3D12Shader* pixel_shader,
+                                             uint64_t hashes_out[6]) const {
+  const RegisterFile& regs = *register_file_;
+  // Float constants the shaders use.
+  for (uint32_t stage = 0; stage < 2; ++stage) {
+    const D3D12Shader* shader = stage ? pixel_shader : vertex_shader;
+    uint64_t hash = 0;
+    if (shader) {
+      const uint64_t* bitmap = shader->constant_register_map().float_bitmap;
+      uint32_t base = stage ? XE_GPU_REG_SHADER_CONSTANT_256_X : XE_GPU_REG_SHADER_CONSTANT_000_X;
+      for (uint32_t i = 0; i < 256; ++i) {
+        if ((bitmap[i >> 6] >> (i & 63)) & 1) {
+          hash = XXH3_64bits_withSeed(&regs.values[base + i * 4], sizeof(uint32_t) * 4, hash);
+        }
+      }
+    }
+    hashes_out[stage] = hash;
+  }
+  hashes_out[2] = XXH3_64bits(&regs.values[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0],
+                              sizeof(uint32_t) * 32 * 6);
+  hashes_out[3] = XXH3_64bits(&regs.values[XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031],
+                              sizeof(uint32_t) * (8 + 32));
+  // System constants other than the viewport-derived ones.
+  DxbcShaderTranslator::SystemConstants system = system_constants_;
+  std::memset(system.ndc_scale, 0, sizeof(system.ndc_scale));
+  std::memset(system.ndc_offset, 0, sizeof(system.ndc_offset));
+  std::memset(system.point_screen_diameter_to_ndc_radius, 0,
+              sizeof(system.point_screen_diameter_to_ndc_radius));
+  hashes_out[4] = XXH3_64bits(&system, sizeof(system));
+  // Texture and sampler bindings.
+  uint64_t hash = 0;
+  if (vertex_shader) {
+    size_t count = vertex_shader->GetTextureBindingsAfterTranslation().size();
+    hash = XXH3_64bits_withSeed(current_texture_srv_keys_vertex_.data(),
+                                sizeof(D3D12TextureCache::TextureSRVKey) * count, hash);
+    count = vertex_shader->GetSamplerBindingsAfterTranslation().size();
+    hash = XXH3_64bits_withSeed(current_sampler_bindless_indices_vertex_.data(),
+                                sizeof(uint32_t) * count, hash);
+  }
+  if (pixel_shader) {
+    size_t count = pixel_shader->GetTextureBindingsAfterTranslation().size();
+    hash = XXH3_64bits_withSeed(current_texture_srv_keys_pixel_.data(),
+                                sizeof(D3D12TextureCache::TextureSRVKey) * count, hash);
+    count = pixel_shader->GetSamplerBindingsAfterTranslation().size();
+    hash = XXH3_64bits_withSeed(current_sampler_bindless_indices_pixel_.data(),
+                                sizeof(uint32_t) * count, hash);
+  }
+  hashes_out[5] = hash;
+}
+
+void D3D12CommandProcessor::Amped3RecordScreenExtents(uint32_t address) {
+  if (screen_extents_draw_.slot == UINT32_MAX) {
+    ++screen_extents_stats_[3];
+    return;
+  }
+  ScreenExtentsDraw& draw = screen_extents_draw_;
+  draw.address = address;
+  if (REXCVAR_GET(gpu_screen_extents) == 4) {
+    // Identity: the draw's inputs, and which occurrence of them this is.
+    uint32_t& occurrence = screen_extents_occurrences_[draw.key];
+    draw.key = (draw.key ^ occurrence++) * 0x9E3779B97F4A7C15ull;
+    auto known = screen_extents_known_.find(draw.key);
+    if (known != screen_extents_known_.end()) {
+      const ScreenExtentsKnown& k = known->second;
+      for (uint32_t i = 0; i < 4; ++i) {
+        draw.predicted[0][i] = k.tiles[i];
+        draw.predicted[1][i] = k.tiles[i];
+        if (k.prev_resolve != UINT32_MAX && k.resolve > k.prev_resolve) {
+          // Motion per resolve, carried on to this one.
+          draw.predicted[1][i] +=
+              (int32_t(k.tiles[i]) - int32_t(k.prev_tiles[i])) *
+              int32_t(screen_extents_resolves_ + 1 - k.resolve) /
+              int32_t(k.resolve - k.prev_resolve);
+        }
+      }
+      if (REXCVAR_GET(gpu_screen_extents_predict)) {
+        const int32_t margin = std::max(REXCVAR_GET(gpu_screen_extents_margin), 0);
+        const int32_t tile_max = (xenos::kTexture2DCubeMaxWidthHeight - 1) >> 3;
+        const int32_t* p = draw.predicted[REXCVAR_GET(gpu_screen_extents_motion) ? 1 : 0];
+        auto clamp = [tile_max](int32_t v) { return uint16_t(std::min(std::max(v, 0), tile_max)); };
+        uint16_t extents[6] = {
+            clamp(p[0] - margin), clamp(p[1] + margin), clamp(p[2] - margin),
+            clamp(p[3] + margin), 0, 1,
+        };
+        memory::copy_and_swap_16_unaligned(memory_->TranslatePhysical(address), extents,
+                                           rex::countof(extents));
+      }
+    } else {
+      draw.predicted[0][0] = 1;
+      draw.predicted[0][1] = 0;
+    }
+    screen_extents_pending_.push_back(draw);
+    draw.slot = UINT32_MAX;
+    return;
+  }
+  screen_extents_pending_.push_back(draw);
+  draw.slot = UINT32_MAX;
+  int32_t flush = REXCVAR_GET(gpu_screen_extents_flush);
+  if (flush > 0 && screen_extents_pending_.size() % uint32_t(flush) == 0 && submission_open_) {
+    EndSubmission(false);
+  }
+}
+
+bool D3D12CommandProcessor::ScreenExtentsFromSlot(const ScreenExtentsDraw& draw,
+                                                  const uint32_t* slot,
+                                                  uint16_t tiles_out[4]) const {
+  if (!slot[0]) {
+    // No vertex.
+    return false;
+  }
+  // 1/4096 from -4, rounded down - minimums inverted, maximums one step up.
+  float ndc[4] = {
+      float(0x10000 - slot[0]) * (1.0f / 4096.0f) - 4.0f,
+      float(slot[2] + 1) * (1.0f / 4096.0f) - 4.0f,
+      float(0x10000 - slot[1]) * (1.0f / 4096.0f) - 4.0f,
+      float(slot[3] + 1) * (1.0f / 4096.0f) - 4.0f,
+  };
+  auto to_tiles = [](float value, bool max) {
+    float clamped = std::min(std::max(max ? std::ceil(value) : std::floor(value), 0.0f),
+                             float(xenos::kTexture2DCubeMaxWidthHeight - 1));
+    return uint16_t(uint32_t(clamped) >> 3);
+  };
+  for (uint32_t i = 0; i < 2; ++i) {
+    float a = ndc[i * 2] * draw.scale[i] + draw.offset[i];
+    float b = ndc[i * 2 + 1] * draw.scale[i] + draw.offset[i];
+    tiles_out[i * 2] = to_tiles(std::min(a, b), false);
+    tiles_out[i * 2 + 1] = to_tiles(std::max(a, b), true);
+  }
+  return true;
+}
+
+void D3D12CommandProcessor::ScreenExtentsProcessBatches(bool await_oldest) {
+  if (screen_extents_batches_.empty()) {
+    return;
+  }
+  CheckSubmissionFence(await_oldest ? screen_extents_batches_.front().submission : 0);
+  while (!screen_extents_batches_.empty() &&
+         screen_extents_batches_.front().submission <= submission_completed_) {
+    ScreenExtentsBatch& batch = screen_extents_batches_.front();
+    const uint32_t* region =
+        screen_extents_readback_mapping_ + size_t(batch.region) * kScreenExtentsSlots * 4;
+    for (const ScreenExtentsDraw& draw : batch.draws) {
+      uint16_t tiles[4];
+      if (!ScreenExtentsFromSlot(draw, region + draw.slot * 4, tiles)) {
+        screen_extents_known_.erase(draw.key);
+        continue;
+      }
+      // The tiles (horizontal bands of 32 8x8 tiles: rows 0-255, 256-511,
+      // 512-) a vertical tile range covers, as bits 0-2.
+      auto bands = [](int32_t min_y, int32_t max_y) -> uint32_t {
+        auto band = [](int32_t y) { return std::min(std::max(y, 0) / 32, 2); };
+        if (max_y < 0 || min_y > max_y) {
+          return 0;
+        }
+        uint32_t first = band(min_y), last = band(max_y);
+        return ((2u << last) - 1) & ~((1u << first) - 1);
+      };
+      uint32_t covered = bands(tiles[2], tiles[3]);
+      if (draw.predicted[0][0] <= draw.predicted[0][1]) {
+        ++screen_extents_predicted_;
+        screen_extents_ideal_skips_ += rex::bit_count(~covered & 0b110u);
+        for (uint32_t v = 0; v < 2; ++v) {
+          for (uint32_t m = 0; m < rex::countof(kScreenExtentsMargins); ++m) {
+            int32_t margin = kScreenExtentsMargins[m];
+            uint32_t predicted = bands(draw.predicted[v][2] - margin, draw.predicted[v][3] + margin);
+            screen_extents_skips_[v][m] += rex::bit_count(~predicted & 0b110u);
+            screen_extents_wrong_[v][m] += (covered & ~predicted & 0b110u) != 0;
+          }
+        }
+      }
+      // (New entries are zeroed; resolve numbers start at 1.)
+      ScreenExtentsKnown& known = screen_extents_known_[draw.key];
+      if (!known.resolve) {
+        known.prev_resolve = UINT32_MAX;
+      } else {
+        std::memcpy(known.prev_tiles, known.tiles, sizeof(known.prev_tiles));
+        known.prev_resolve = known.resolve;
+      }
+      std::memcpy(known.tiles, tiles, sizeof(tiles));
+      known.resolve = batch.resolve;
+      ++screen_extents_stats_[1];
+    }
+    screen_extents_batches_.pop_front();
+  }
+}
+
+void D3D12CommandProcessor::Amped3ResolveScreenExtents() {
+  uint32_t slots = screen_extents_slots_used_;
+  if (!slots) {
+    return;
+  }
+  // The next measured draw zeroes the slots again.
+  screen_extents_slots_used_ = 0;
+  screen_extents_draw_.slot = UINT32_MAX;
+  screen_extents_occurrences_.clear();
+  if (screen_extents_pending_.empty() || !BeginSubmission(true)) {
+    screen_extents_pending_.clear();
+    return;
+  }
+  bool predict_mode = REXCVAR_GET(gpu_screen_extents) == 4;
+  uint32_t region = 0;
+  if (predict_mode) {
+    // Measurements for the next frames: read back without waiting.
+    if (screen_extents_batches_.size() >= kScreenExtentsReadbacks) {
+      ScreenExtentsProcessBatches(true);
+    }
+    region = screen_extents_next_region_;
+    screen_extents_next_region_ = (region + 1) % kScreenExtentsReadbacks;
+  }
+  PushTransitionBarrier(screen_extents_buffer_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+  SubmitBarriers();
+  deferred_command_list_.D3DCopyBufferRegion(
+      screen_extents_readback_buffer_.Get(),
+      uint64_t(region) * kScreenExtentsSlots * sizeof(uint32_t) * 4, screen_extents_buffer_.Get(),
+      0, slots * sizeof(uint32_t) * 4);
+  PushTransitionBarrier(screen_extents_buffer_.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  SubmitBarriers();
+  screen_extents_stats_[0] += screen_extents_pending_.size();
+  ++screen_extents_resolves_;
+  if (predict_mode) {
+    ScreenExtentsBatch batch;
+    batch.submission = submission_current_;
+    batch.region = region;
+    batch.resolve = screen_extents_resolves_;
+    batch.draws.swap(screen_extents_pending_);
+    screen_extents_batches_.push_back(std::move(batch));
+    ScreenExtentsProcessBatches(false);
+    if (!(screen_extents_resolves_ % 600)) {
+      for (auto it = screen_extents_known_.begin(); it != screen_extents_known_.end();) {
+        if (screen_extents_resolves_ - it->second.resolve > 60) {
+          it = screen_extents_known_.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+  } else {
+    auto wait_start = std::chrono::steady_clock::now();
+    if (!AwaitAllQueueOperationsCompletion()) {
+      screen_extents_pending_.clear();
+      return;
+    }
+    screen_extents_stats_[2] += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                             std::chrono::steady_clock::now() - wait_start)
+                                             .count());
+    for (const ScreenExtentsDraw& draw : screen_extents_pending_) {
+      uint16_t tiles[4];
+      if (!ScreenExtentsFromSlot(draw, screen_extents_readback_mapping_ + draw.slot * 4, tiles)) {
+        continue;
+      }
+      uint16_t extents[6] = {tiles[0], tiles[1], tiles[2], tiles[3], 0, 1};
+      memory::copy_and_swap_16_unaligned(memory_->TranslatePhysical(draw.address), extents,
+                                         rex::countof(extents));
+      ++screen_extents_stats_[1];
+    }
+    screen_extents_pending_.clear();
+  }
+  if (!(screen_extents_resolves_ % 300)) {
+    REXGPU_INFO(
+        "gpu_screen_extents: 300 resolves: {} measured draws, {} measurements used, {} "
+        "unmeasured, {} us average wait, {} known draws",
+        screen_extents_stats_[0], screen_extents_stats_[1], screen_extents_stats_[3],
+        screen_extents_stats_[2] / 300, screen_extents_known_.size());
+    if (screen_extents_predicted_) {
+      std::string line;
+      for (uint32_t v = 0; v < 2; ++v) {
+        line += v ? " | with motion:" : " | as is:";
+        for (uint32_t m = 0; m < rex::countof(kScreenExtentsMargins); ++m) {
+          line += fmt::format(" m{} {:.1f}%/{:.2f}%", kScreenExtentsMargins[m],
+                              100.0 * screen_extents_skips_[v][m] /
+                                  std::max(screen_extents_ideal_skips_, uint64_t(1)),
+                              100.0 * screen_extents_wrong_[v][m] / screen_extents_predicted_);
+        }
+      }
+      REXGPU_INFO(
+          "gpu_screen_extents: {} predicted draws ({}/frame), ideal tile 2/3 skips {}/frame; "
+          "margin: kept skips / draws missing from a tile{}",
+          screen_extents_predicted_, screen_extents_predicted_ / 300,
+          screen_extents_ideal_skips_ / 300, line);
+    }
+    std::memset(screen_extents_stats_, 0, sizeof(screen_extents_stats_));
+    std::memset(screen_extents_skips_, 0, sizeof(screen_extents_skips_));
+    std::memset(screen_extents_wrong_, 0, sizeof(screen_extents_wrong_));
+    screen_extents_ideal_skips_ = 0;
+    screen_extents_predicted_ = 0;
+  }
+}
+
+// The game's sprite vertex shader: position = (c0..c3) * (vertex xyz, 1) over a
+// 4-vertex quad in vertex fetch constant 95 (stride 8 dwords, xyz first).
+bool D3D12CommandProcessor::Amped3IsSubpixelSprite(const Shader& vertex_shader) {
+  if (vertex_shader.ucode_data_hash() != 0xCB134112C994DF08ull) {
+    return false;
+  }
+  const RegisterFile& regs = *register_file_;
+  const auto& bindings = vertex_shader.vertex_bindings();
+  if (bindings.size() != 1 || bindings[0].stride_words < 3) {
+    return false;
+  }
+  xenos::xe_gpu_vertex_fetch_t vf = regs.GetVertexFetch(bindings[0].fetch_constant);
+  const uint32_t stride = bindings[0].stride_words;
+  if (vf.type != xenos::FetchConstantType::kVertex || vf.size < stride * 4) {
+    if (REXCVAR_GET(d3d12_debug_pink_probe)) {
+      static int logs = 0;
+      if (logs++ < 10) {
+        REXGPU_INFO("subpixel sprite check: fetch type {} size {} stride {}", uint32_t(vf.type),
+                    uint32_t(vf.size), stride);
+      }
+    }
+    return false;
+  }
+  const uint32_t* data = memory_->TranslatePhysical<const uint32_t*>(vf.address << 2);
+  const float x_scale = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE);
+  const float y_scale = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE);
+  float x_min = FLT_MAX, x_max = -FLT_MAX, y_min = FLT_MAX, y_max = -FLT_MAX;
+  for (uint32_t v = 0; v < vf.size / stride; ++v) {
+    float in[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    for (uint32_t k = 0; k < 3; ++k) {
+      uint32_t word = xenos::GpuSwap(data[v * stride + k], vf.endian);
+      std::memcpy(&in[k], &word, sizeof(float));
+    }
+    float out[4];
+    for (uint32_t row = 0; row < 4; ++row) {
+      out[row] = 0.0f;
+      for (uint32_t k = 0; k < 4; ++k) {
+        out[row] += in[k] * regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + 4 * row + k);
+      }
+    }
+    if (!(out[3] > 0.0f)) {
+      return false;  // Clipped or degenerate: leave it to the GPU.
+    }
+    const float x = out[0] / out[3] * x_scale, y = out[1] / out[3] * y_scale;
+    x_min = std::min(x_min, x);
+    x_max = std::max(x_max, x);
+    y_min = std::min(y_min, y);
+    y_max = std::max(y_max, y);
+  }
+  if (REXCVAR_GET(d3d12_debug_pink_probe)) {
+    static int logs = 0;
+    if (x_max - x_min < 2.0f && y_max - y_min < 2.0f && logs++ < 40) {
+      REXGPU_INFO("subpixel sprite check: {:.3f}-{:.3f} x {:.3f}-{:.3f} ({} vertices)", x_min,
+                  x_max, y_min, y_max, vf.size / stride);
+    }
+  }
+  return x_max - x_min < 1.0f && y_max - y_min < 1.0f;
 }
 
 bool D3D12CommandProcessor::Amped3ScreenExtents(float extents_out[4]) {
@@ -2689,6 +4134,44 @@ uint32_t D3D12CommandProcessor::ComputeLodFreeFetchMask(const D3D12Shader& pixel
 }
 
 
+// --ui_scale: a UI sprite's extent on screen (NDC min x, max x, min y, max y)
+// from its vertex buffer's positions (the first attribute, float3) through
+// its matrix (c0, c1, c3); the vertices read, 0 if it can't tell.
+int D3D12CommandProcessor::UiSpriteExtents(const Shader& vertex_shader, float extents[4]) {
+  extents[0] = extents[2] = 1e9f;
+  extents[1] = extents[3] = -1e9f;
+  const auto& bindings = vertex_shader.vertex_bindings();
+  if (bindings.empty() || bindings[0].attributes.empty()) return 0;
+  const auto& binding = bindings[0];
+  const auto& attr = binding.attributes[0].fetch_instr.attributes;
+  if (attr.data_format != xenos::VertexFormat::k_32_32_32_FLOAT &&
+      attr.data_format != xenos::VertexFormat::k_32_32_32_32_FLOAT) {
+    return 0;
+  }
+  const auto& regs = *register_file_;
+  xenos::xe_gpu_vertex_fetch_t vf = regs.GetVertexFetch(binding.fetch_constant);
+  if (!binding.stride_words) return 0;
+  const uint32_t count = std::min(uint32_t(vf.size) / binding.stride_words, 4096u);
+  const uint32_t* data = memory_->TranslatePhysical<const uint32_t*>(vf.address << 2);
+  auto c = [&](uint32_t i) { return regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + i); };
+  for (uint32_t v = 0; v < count; ++v) {
+    float p[3];
+    for (uint32_t k = 0; k < 3; ++k) {
+      const uint32_t word = xenos::GpuSwap(data[v * binding.stride_words + attr.offset + k], vf.endian);
+      std::memcpy(&p[k], &word, 4);
+    }
+    const float w = c(12) * p[0] + c(13) * p[1] + c(14) * p[2] + c(15);
+    if (w <= 0.0f) continue;
+    const float x = (c(0) * p[0] + c(1) * p[1] + c(2) * p[2] + c(3)) / w;
+    const float y = (c(4) * p[0] + c(5) * p[1] + c(6) * p[2] + c(7)) / w;
+    extents[0] = std::min(extents[0], x);
+    extents[1] = std::max(extents[1], x);
+    extents[2] = std::min(extents[2], y);
+    extents[3] = std::max(extents[3], y);
+  }
+  return int(count);
+}
+
 bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
                                       IndexBufferInfo* index_buffer_info,
                                       bool major_mode_explicit) {
@@ -2704,6 +4187,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   ID3D12Device* device = GetD3D12Provider().GetDevice();
   const RegisterFile& regs = *register_file_;
   ++issued_draw_count_;
+  screen_extents_draw_.slot = UINT32_MAX;
+  tile_replay_current_ = -1;
 
   xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
   if (edram_mode == xenos::EdramMode::kCopy) {
@@ -2772,8 +4257,310 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       return true;
     }
   }
+  if (REXCVAR_GET(amped3_cull_subpixel_sprites) && Amped3IsSubpixelSprite(*vertex_shader)) {
+    return true;
+  }
+  if (REXCVAR_GET(amped3_hide_hud)) {
+    const uint64_t vs_hash = vertex_shader->ucode_data_hash();
+    if (vs_hash == 0xCB134112C994DF08ull || vs_hash == 0x50BC47DED5DB7325ull) {
+      return true;
+    }
+  }
+  // DLSS (see D3D12Dlss): the scene draws - depth test on and not always
+  // passing, into the frontbuffer-wide render target - and the first HUD draw
+  // after them, where the scene is handed over: for Amped 3, the first draw
+  // with its HUD vertex shaders (sprites and text).
+  ultrawide_draw_ = false;
+  ui_scale_draw_ = false;
+  // --ui_scale: the UI on the frame (its three vertex shaders: sprites, text,
+  // and shapes/outlined text placed by their vertices) shrinks or grows about the
+  // frame's centre, so a layout made of several draws keeps its shape. Full-screen
+  // layers (menu backgrounds, fades: covering the whole frame, from their
+  // vertices) keep their size.
+  if (std::abs(REXCVAR_GET(ui_scale) - 1.0) > 0.001 && is_rasterization_done && !video_frame_ &&
+      !presenter_video_frame_) {
+    const uint64_t vs = vertex_shader->ucode_data_hash();
+    const uint32_t frontbuffer_width = rex::perf::GetRenderInfo().frontbuffer_width;
+    static const auto log_start = std::chrono::steady_clock::now();
+    if (REXCVAR_GET(ultrawide_pin_log) > 0 && frontbuffer_width &&
+        std::chrono::steady_clock::now() - log_start > std::chrono::seconds(REXCVAR_GET(ui_scale_log_after)) &&
+        regs.Get<reg::RB_SURFACE_INFO>().surface_pitch >= frontbuffer_width) {
+      auto c = [&](uint32_t i) { return regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + i); };
+      float ext[4];
+      const int verts = UiSpriteExtents(*vertex_shader, ext);
+      REXGPU_INFO("ui_scale_log: vs {:016X} ps {:016X} c0 {:.3f} {:.3f} {:.3f} {:.3f} c1 {:.3f} {:.3f} {:.3f} {:.3f} c3 {:.3f} {:.3f} {:.3f} {:.3f} prim {} count {} verts {} ext {:.2f} {:.2f} {:.2f} {:.2f}",
+                  vs, pixel_shader ? pixel_shader->ucode_data_hash() : 0, c(0), c(1), c(2), c(3), c(4), c(5), c(6),
+                  c(7), c(12), c(13), c(14), c(15), uint32_t(primitive_type), index_count, verts, ext[0], ext[1], ext[2], ext[3]);
+      rex::cvar::SetFlagByName("ultrawide_pin_log", std::to_string(REXCVAR_GET(ultrawide_pin_log) - 1));
+    }
+    if ((vs == 0xCB134112C994DF08ull || vs == 0x50BC47DED5DB7325ull || vs == 0x4607896AFDF26D1Bull) &&
+        frontbuffer_width && regs.Get<reg::RB_SURFACE_INFO>().surface_pitch >= frontbuffer_width) {
+      float e[4];
+      const bool full_screen =
+          UiSpriteExtents(*vertex_shader, e) && e[0] <= -0.95f && e[1] >= 0.95f && e[2] <= -0.95f && e[3] >= 0.95f;
+      ui_scale_draw_ = !full_screen;
+    }
+  }
+  if ((REXCVAR_GET(ultrawide_squeeze) != 1.0 || REXCVAR_GET(tall_squeeze) != 1.0) && is_rasterization_done) {
+    const uint32_t frontbuffer_width = rex::perf::GetRenderInfo().frontbuffer_width;
+    const uint64_t vs_hash = vertex_shader->ucode_data_hash();
+    // (4607...: text and the HUD's numbers, e.g. the score and the radio's.)
+    const bool ui_shader = vs_hash == 0xCB134112C994DF08ull || vs_hash == 0x50BC47DED5DB7325ull ||
+                           vs_hash == 0x4607896AFDF26D1Bull;
+    // Amped 3's pre-rendered videos (attract, intro, title background): kept
+    // 16:9, with bars (squeezing their quads doesn't work: they're drawn in
+    // more than one pass).
+    // (6EAD12...: the title screen's moving background.)
+    const bool video_shader = vs_hash == 0xDA562C2172F5F825ull || vs_hash == 0x6EAD12298B35F2F8ull;
+    const reg::RB_DEPTHCONTROL depth_control = draw_util::GetNormalizedDepthControl(regs);
+    const bool scene_geometry = depth_control.z_enable && depth_control.zfunc != xenos::CompareFunction::kAlways;
+    // A frame showing a video is presented letterboxed instead, unsqueezed.
+    if (video_shader) video_frame_ = true;
+    // (Also while the last frame was one: the title screen draws its UI
+    // before its moving background.)
+    ultrawide_draw_ = !video_frame_ && !presenter_video_frame_ && frontbuffer_width &&
+                      regs.Get<reg::RB_SURFACE_INFO>().surface_pitch >= frontbuffer_width &&
+                      (scene_geometry || ui_shader);
+    // The UI sprite's extents across the 16:9 frame (-1..1), from its
+    // vertices: the UI vertex shaders place it with a 4x4 matrix in c0-c3,
+    // and text sets its glyphs' positions in the vertices.
+    float e[4];
+    ultrawide_ui_draw_ = ultrawide_draw_ && ui_shader;
+    const bool have_extents = ultrawide_draw_ && ui_shader && UiSpriteExtents(*vertex_shader, e) && e[0] <= e[1];
+    // UI parked beside the 16:9 frame (the radio popup and others while
+    // hidden, or before they slide in) is off a 16:9 screen; squeezed, it
+    // would show in the wider screen's sides.
+    if (have_extents && (e[1] <= -0.999f || e[0] >= 0.999f)) {
+      ultrawide_draw_ = false;
+      return true;
+    }
+    // The HUD at the screen's edges while riding (the game sets the flag):
+    // a sprite whose middle lands in the left / right third of the frame
+    // (c0.w, the matrix's origin, if its vertices can't be read).
+    ultrawide_pin_ = 0.0f;
+    if (ultrawide_draw_ && ui_shader && REXCVAR_GET(ultrawide_hud_pin)) {
+      const float x = have_extents ? 0.5f * (e[0] + e[1]) : regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + 3);
+      ultrawide_pin_ = x < -1.0f / 3.0f ? -1.0f : x > 1.0f / 3.0f ? 1.0f : 0.0f;
+    }
+    if (REXCVAR_GET(ultrawide_pin_log) > 0 && frontbuffer_width &&
+        regs.Get<reg::RB_SURFACE_INFO>().surface_pitch >= frontbuffer_width) {
+      auto c = [&](uint32_t i) { return regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + i); };
+      REXGPU_INFO("ultrawide_pin_log: vs {:016X} ps {:016X} squeezed {} depth {} c0 {:.3f} {:.3f} {:.3f} {:.3f} c1 {:.3f} {:.3f} {:.3f} {:.3f} pin {}",
+                  vs_hash, pixel_shader ? pixel_shader->ucode_data_hash() : 0, ultrawide_draw_, scene_geometry,
+                  c(0), c(1), c(2), c(3), c(4), c(5), c(6), c(7), ultrawide_pin_);
+      rex::cvar::SetFlagByName("ultrawide_pin_log", std::to_string(REXCVAR_GET(ultrawide_pin_log) - 1));
+    }
+  }
+  bool dlss_take_scene = false;
+  dlss_scene_draw_ = false;
+  if (dlss_ && is_rasterization_done) {
+    const reg::RB_DEPTHCONTROL depth_control = draw_util::GetNormalizedDepthControl(regs);
+    const uint32_t frontbuffer_width = rex::perf::GetRenderInfo().frontbuffer_width;
+    const uint64_t vs_hash = vertex_shader->ucode_data_hash();
+    const bool hud_shader = vs_hash == 0xCB134112C994DF08ull || vs_hash == 0x50BC47DED5DB7325ull;
+    g_dlss_stats.fb_width = frontbuffer_width;
+    if (DlssTracing()) {
+      const auto rb_color_info = regs.Get<reg::RB_COLOR_INFO>();
+      REXGPU_INFO("trace draw: pitch {} vs {:016X} ps {:016X} z {} func {} zwrite {} color base {} fmt {} "
+                  "mask {:X} blend {:08X}",
+                  regs.Get<reg::RB_SURFACE_INFO>().surface_pitch, vs_hash,
+                  pixel_shader ? pixel_shader->ucode_data_hash() : 0, int(depth_control.z_enable),
+                  int(depth_control.zfunc), int(depth_control.z_write_enable), rb_color_info.color_base,
+                  int(rb_color_info.color_format), regs[XE_GPU_REG_RB_COLOR_MASK],
+                  regs[XE_GPU_REG_RB_BLENDCONTROL0]);
+    }
+    if (frontbuffer_width && regs.Get<reg::RB_SURFACE_INFO>().surface_pitch >= frontbuffer_width) {
+      ++g_dlss_stats.wide;
+    } else {
+      ++g_dlss_stats.narrow;
+    }
+    const uint32_t pitch = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
+    // Amped 3 draws the 3D scene into its tiled surface (3 columns, pitch 480;
+    // pitch 1280 once joined by --gpu_tile_collapse).
+    const bool scene_surface = frontbuffer_width && pitch * 3 >= frontbuffer_width;
+    if (scene_surface) {
+      if (depth_control.z_enable && depth_control.zfunc != xenos::CompareFunction::kAlways && !hud_shader) {
+        ++g_dlss_stats.scene;
+        float camera_constants[16];
+        for (uint32_t i = 0; i < 16; ++i) {
+          camera_constants[i] = regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + i);
+        }
+        // The object: its vertex shader, indices and first vertex buffer.
+        uint64_t object = vs_hash ^ (uint64_t(index_count) << 32);
+        object = object * 0x9E3779B97F4A7C15ull ^
+                 (index_buffer_info ? uint64_t(index_buffer_info->guest_base) : 0);
+        object = object * 0x9E3779B97F4A7C15ull ^ regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0];
+        object = object * 0x9E3779B97F4A7C15ull ^ regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_1];
+        dlss_->OnSceneDraw(camera_constants, object);
+        dlss_scene_draw_ = true;
+      } else if (hud_shader) {
+        // Only Amped 3's HUD shaders: its sky, fog and other full-screen 3D
+        // passes also test depth with "always" and come before the scene ends.
+        ++g_dlss_stats.hud;
+        dlss_take_scene = REXCVAR_GET(dlss_handoff) == "hud" && dlss_->WantsScene();
+        g_dlss_stats.taken += dlss_take_scene;
+      }
+    }
+  }
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   bool memexport_used = memexport_used_vertex || memexport_used_pixel;
+  // amped3 debug (--d3d12_debug_ps_extents=<pixel shader hash>): the screen
+  // rectangle of that shader's draws (the CPU-run vertex shader), to find a
+  // stray one-pixel draw.
+  if (!REXCVAR_GET(d3d12_debug_ps_extents).empty() && pixel_shader &&
+      fmt::format("{:016X}", pixel_shader->ucode_data_hash()) ==
+          REXCVAR_GET(d3d12_debug_ps_extents)) {
+    static int logs = 0;
+    // pink_skip.txt (next to the exe, re-read every 2 s): skip the draws of
+    // this shader with these indices in the frame (bisecting a stray pixel).
+    {
+      static uint64_t last_check = 0;
+      static uint32_t skip_lo = UINT32_MAX, skip_hi = 0;
+      static uint32_t frame_index = 0, last_frame = 0;
+      uint64_t now = GetTickCount64();
+      if (now - last_check > 2000) {
+        last_check = now;
+        skip_lo = UINT32_MAX;
+        skip_hi = 0;
+        if (std::FILE* f = std::fopen("pink_skip.txt", "r")) {
+          unsigned lo, hi;
+          if (std::fscanf(f, "%u %u", &lo, &hi) == 2) {
+            skip_lo = lo;
+            skip_hi = hi;
+          }
+          std::fclose(f);
+        }
+      }
+      uint32_t frame = uint32_t(GetCurrentFrame());
+      if (frame != last_frame) {
+        last_frame = frame;
+        frame_index = 0;
+      }
+      uint32_t index = frame_index++;
+      if (index >= skip_lo && index < skip_hi) {
+        return true;
+      }
+      if (REXCVAR_GET(d3d12_debug_pink_probe)) {
+        const uint32_t probe_index = g_pink_draws++;
+        // The draws that make the pink pixel (indices 19-35): what they are.
+        static int detail_logs = 0;
+        if (detail_logs < 40 && g_pink_pink > 200) {
+          ++detail_logs;
+          auto initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+          auto vtx_cntl = regs.Get<reg::PA_SU_VTX_CNTL>();
+          std::string verts;
+          for (const auto& binding : vertex_shader->vertex_bindings()) {
+            xenos::xe_gpu_vertex_fetch_t vf = regs.GetVertexFetch(binding.fetch_constant);
+            verts += fmt::format(" [fetch {} stride {} size {} endian {}:", binding.fetch_constant,
+                                 binding.stride_words, uint32_t(vf.size), uint32_t(vf.endian));
+            const uint32_t* data = memory_->TranslatePhysical<const uint32_t*>(vf.address << 2);
+            for (uint32_t w = 0; w < std::min(binding.stride_words * 4, uint32_t(vf.size)); ++w) {
+              uint32_t v = xenos::GpuSwap(data[w], vf.endian);
+              float f;
+              std::memcpy(&f, &v, 4);
+              verts += fmt::format(" {:g}", f);
+            }
+            verts += "]";
+          }
+          {
+            xenos::xe_gpu_texture_fetch_t tf = regs.GetTextureFetch(0);
+            verts += fmt::format(" [tf0 dim {} fmt {} {}x{} base {:08X} mip {:08X} levels {}-{} "
+                                 "clamp {} {} filter {} {} mip_filter {} swizzle {:03X} "
+                                 "lod_bias {} exp_adjust {}]",
+                                 uint32_t(tf.dimension), uint32_t(tf.format),
+                                 uint32_t(tf.size_2d.width) + 1, uint32_t(tf.size_2d.height) + 1,
+                                 uint32_t(tf.base_address) << 12, uint32_t(tf.mip_address) << 12,
+                                 uint32_t(tf.mip_min_level), uint32_t(tf.mip_max_level),
+                                 uint32_t(tf.clamp_x), uint32_t(tf.clamp_y),
+                                 uint32_t(tf.min_filter), uint32_t(tf.mag_filter),
+                                 uint32_t(tf.mip_filter), uint32_t(tf.swizzle),
+                                 int32_t(tf.lod_bias), int32_t(tf.exp_adjust));
+          }
+          for (uint32_t c : {0u, 1u, 2u, 3u, 4u, 5u, 8u}) {
+            verts += fmt::format(" c{}=", c);
+            for (uint32_t k = 0; k < 4; ++k) {
+              verts += fmt::format("{}{:g}", k ? "," : "",
+                                   regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + 4 * c + k));
+            }
+          }
+          REXGPU_INFO("pink_probe draw {}: prim {} source {} indices {} pix_center {} "
+                      "vte {:08X} scale {:g} {:g} offset {:g} {:g} window offset {:08X} "
+                      "scissor {:08X} {:08X} vs {:016X}{}",
+                      probe_index, uint32_t(primitive_type), uint32_t(initiator.source_select),
+                      index_count, uint32_t(vtx_cntl.pix_center), regs[XE_GPU_REG_PA_CL_VTE_CNTL],
+                      regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE),
+                      regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE),
+                      regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET),
+                      regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET),
+                      regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET], regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL],
+                      regs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR], vertex_shader->ucode_data_hash(),
+                      verts);
+          if (detail_logs == 1) {
+            REXGPU_INFO("pink_probe: vertex shader:\n{}", vertex_shader->ucode_disassembly());
+          }
+        }
+        if (probe_index < kPinkProbeIndices && ((g_pink_skip[probe_index >> 6] >> (probe_index & 63)) & 1)) {
+          return true;
+        }
+      }
+    }
+    float e[4];
+    bool measured = Amped3ScreenExtents(e);
+    if (!measured && REXCVAR_GET(d3d12_debug_ps_extents_skip_unmeasured)) {
+      static int unmeasured_logs = 0;
+      if (unmeasured_logs++ < 20) {
+        REXGPU_INFO("ps_extents: unmeasured draw prim {} indices {} vs {:016X} skipped",
+                    uint32_t(primitive_type), index_count, vertex_shader->ucode_data_hash());
+      }
+      return true;
+    }
+    if (measured) {
+      // Near the pink pixel at (527, 602): always (rate-limited per spot).
+      if (e[0] <= 530 && e[1] >= 524 && e[2] <= 605 && e[3] >= 599 && e[1] - e[0] < 1000) {
+        static int near_logs = 0;
+        if (near_logs++ < 200) {
+          REXGPU_INFO("ps_extents NEAR: prim {} indices {} x {:.3f}-{:.3f} y {:.3f}-{:.3f} vs {:016X}",
+                      uint32_t(primitive_type), index_count, e[0], e[1], e[2], e[3],
+                      vertex_shader->ucode_data_hash());
+        }
+      }
+      if (logs < 3000) {
+      ++logs;
+      REXGPU_INFO("ps_extents: prim {} indices {} x {:.2f}-{:.2f} y {:.2f}-{:.2f} vs {:016X}",
+                  uint32_t(primitive_type), index_count, e[0], e[1], e[2], e[3],
+                  vertex_shader->ucode_data_hash());
+      }
+      static bool disassembly_logged = false;
+      if (!disassembly_logged) {
+        disassembly_logged = true;
+        REXGPU_INFO("ps_extents: pixel shader:\n{}\nvertex shader:\n{}",
+                    pixel_shader->ucode_disassembly(), vertex_shader->ucode_disassembly());
+      }
+      if (e[1] - e[0] > 1000 && REXCVAR_GET(d3d12_debug_ps_extents_skip_full)) {
+        return true;
+      }
+      if (e[1] - e[0] > 1000) {
+        // The full-screen one: its textures.
+        uint32_t mask = pixel_shader->GetUsedTextureMaskAfterTranslation();
+        uint32_t i;
+        while (rex::bit_scan_forward(mask, &i)) {
+          mask &= mask - 1;
+          xenos::xe_gpu_texture_fetch_t f = regs.GetTextureFetch(i);
+          REXGPU_INFO("ps_extents:   fetch {} dim {} format {} size {}x{} base {:08X} endian {} "
+                      "swizzle {:03X} clamp {} {} filter {} {}",
+                      i, uint32_t(f.dimension), uint32_t(f.format), uint32_t(f.size_2d.width) + 1,
+                      uint32_t(f.size_2d.height) + 1, uint32_t(f.base_address) << 12, uint32_t(f.endianness),
+                      uint32_t(f.swizzle), uint32_t(f.clamp_x), uint32_t(f.clamp_y),
+                      uint32_t(f.min_filter), uint32_t(f.mag_filter));
+        }
+      }
+    }
+  }
+  if (REXCVAR_GET(gpu_tile_replay) && amped3_tile_) {
+    TileReplayEligible(vertex_shader, pixel_shader,
+                       vertex_shader->GetUsedTextureMaskAfterTranslation() |
+                           (pixel_shader ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0));
+  }
 
   if (!BeginSubmission(true)) {
     return false;
@@ -2787,10 +4574,34 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     return true;
   }
 
+  // amped3 tile replay: this tile 2-3 draw derives the same as tile 1's at the
+  // same packet (gpu_tile_replay_verify), so take what that derived.
+  const TileReplayRecord* replay = nullptr;
+  if (tile_replay_current_ >= 0 && amped3_tile_ >= 2 && REXCVAR_GET(gpu_tile_replay_apply) &&
+      !memexport_used && !active_occlusion_query_.valid && bindless_resources_used_ &&
+      tile_replay_records_[tile_replay_current_].sampler_heap_generation ==
+          tile_replay_sampler_heap_generation_) {
+    replay = &tile_replay_records_[tile_replay_current_];
+  }
+
   DrawTimingMark(kDrawTimingSetup);
   // Process primitives.
   PrimitiveProcessor::ProcessingResult primitive_processing_result;
-  if (!primitive_processor_->Process(primitive_processing_result)) {
+  if (replay) {
+    primitive_processing_result = replay->primitive;
+    if (primitive_processing_result.index_buffer_type ==
+        PrimitiveProcessor::ProcessedIndexBufferType::kGuestDMA) {
+      uint32_t index_size = primitive_processing_result.host_index_format ==
+                                    xenos::IndexFormat::kInt16
+                                ? sizeof(uint16_t)
+                                : sizeof(uint32_t);
+      if (!shared_memory_->RequestRange(primitive_processing_result.guest_index_base,
+                                        primitive_processing_result.host_draw_vertex_count *
+                                            index_size)) {
+        return false;
+      }
+    }
+  } else if (!primitive_processor_->Process(primitive_processing_result)) {
     return false;
   }
   DrawTimingMark(kDrawTimingProcess);
@@ -2801,7 +4612,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
 
   reg::RB_DEPTHCONTROL normalized_depth_control = draw_util::GetNormalizedDepthControl(regs);
 
-  // Shader modifications.
+  // Shader modifications (not needed when replaying).
+  DxbcShaderTranslator::Modification vertex_shader_modification(0);
+  DxbcShaderTranslator::Modification pixel_shader_modification(0);
+  bool measure_screen_extents = false;
+  auto compute_shader_modifications = [&]() {
   uint32_t ps_param_gen_pos = UINT32_MAX;
   uint32_t interpolator_mask =
       pixel_shader ? (vertex_shader->writes_interpolators() &
@@ -2809,16 +4624,38 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                                                              regs.Get<reg::SQ_CONTEXT_MISC>(),
                                                              ps_param_gen_pos))
                    : 0;
-  DxbcShaderTranslator::Modification vertex_shader_modification =
+  vertex_shader_modification =
       pipeline_cache_->GetCurrentVertexShaderModification(
           *vertex_shader, primitive_processing_result.host_vertex_shader_type, interpolator_mask);
-  DxbcShaderTranslator::Modification pixel_shader_modification =
+  // amped3 (gpu_screen_extents=3): measure the screen extents of the draws in
+  // the first tile's pass. Only for triangles drawn directly from the guest
+  // vertex shader's positions (no point sprites, rectangles or tessellation).
+  if (amped3_extents_pass_ && screen_extents_slots_used_ < kScreenExtentsSlots &&
+      REXCVAR_GET(gpu_screen_extents) >= 3 &&
+      primitive_processing_result.host_vertex_shader_type ==
+          Shader::HostVertexShaderType::kVertex) {
+    switch (primitive_type) {
+      case xenos::PrimitiveType::kTriangleList:
+      case xenos::PrimitiveType::kTriangleFan:
+      case xenos::PrimitiveType::kTriangleStrip:
+        measure_screen_extents = true;
+        vertex_shader_modification.vertex.screen_extents = 1;
+        break;
+      default:
+        break;
+    }
+  }
+  pixel_shader_modification =
       pixel_shader
           ? pipeline_cache_->GetCurrentPixelShaderModification(
                 *pixel_shader, interpolator_mask, ps_param_gen_pos, normalized_depth_control)
           : DxbcShaderTranslator::Modification(0);
   if (pixel_shader && REXCVAR_GET(gpu_lod_free_texture_fetches)) {
     pixel_shader_modification.pixel.lod_free_fetch_mask = GetLodFreeFetchMask(*pixel_shader);
+  }
+  };
+  if (!replay) {
+    compute_shader_modifications();
   }
 
   // Set up the render targets - this may perform dispatches and draws.
@@ -2860,6 +4697,18 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     render_target_cache_->SetDrawOverwrittenColorRenderTargets(draw_overwritten_color_rts);
   }
   SetGpuProfilePass(rex::perf::GpuPass::kRenderTargets);
+  if (dlss_take_scene) {
+    const rex::perf::RenderInfo render_info = rex::perf::GetRenderInfo();
+    uint32_t scene_width = render_info.frontbuffer_width * texture_cache_->draw_resolution_scale_x();
+    uint32_t scene_height =
+        render_info.frontbuffer_height * texture_cache_->draw_resolution_scale_y();
+    render_target_cache_->RequestSceneCallback(
+        [this, scene_width, scene_height](ID3D12Resource* color, ID3D12Resource* depth,
+                                          D3D12_CPU_DESCRIPTOR_HANDLE depth_srv) {
+          (void)depth;
+          return dlss_->ProcessScene(color, depth_srv, scene_width, scene_height);
+        });
+  }
   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
                                     normalized_color_mask, *vertex_shader)) {
     return false;
@@ -2869,13 +4718,6 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   // Create the pipeline (for this, need the actually used render target formats
   // from the render target cache), translating the shaders - doing this now to
   // obtain the used textures.
-  D3D12Shader::D3D12Translation* vertex_shader_translation =
-      static_cast<D3D12Shader::D3D12Translation*>(
-          vertex_shader->GetOrCreateTranslation(vertex_shader_modification.value));
-  D3D12Shader::D3D12Translation* pixel_shader_translation =
-      pixel_shader ? static_cast<D3D12Shader::D3D12Translation*>(
-                         pixel_shader->GetOrCreateTranslation(pixel_shader_modification.value))
-                   : nullptr;
   uint32_t bound_depth_and_color_render_target_bits;
   uint32_t bound_depth_and_color_render_target_formats[1 + xenos::kMaxColorRenderTargets];
   bool host_render_targets_used =
@@ -2887,18 +4729,102 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   } else {
     bound_depth_and_color_render_target_bits = 0;
   }
+  if (replay && (replay->render_target_bits != bound_depth_and_color_render_target_bits ||
+                 std::memcmp(replay->render_target_formats,
+                             bound_depth_and_color_render_target_formats,
+                             sizeof(replay->render_target_formats)))) {
+    // Different render targets than in tile 1: derive normally from here.
+    ++tile_replay_fallbacks_[0];
+    replay = nullptr;
+    compute_shader_modifications();
+  }
+  D3D12Shader::D3D12Translation* vertex_shader_translation;
+  D3D12Shader::D3D12Translation* pixel_shader_translation;
   void* pipeline_handle;
   ID3D12RootSignature* root_signature;
-  if (!pipeline_cache_->ConfigurePipeline(
-          vertex_shader_translation, pixel_shader_translation, primitive_processing_result,
-          normalized_depth_control, normalized_color_mask, bound_depth_and_color_render_target_bits,
-          bound_depth_and_color_render_target_formats, &pipeline_handle, &root_signature)) {
-    return false;
+  if (replay) {
+    vertex_shader_translation = static_cast<D3D12Shader::D3D12Translation*>(
+        const_cast<void*>(replay->vertex_translation));
+    pixel_shader_translation = static_cast<D3D12Shader::D3D12Translation*>(
+        const_cast<void*>(replay->pixel_translation));
+    pipeline_handle = replay->pipeline_handle;
+    root_signature = replay->root_signature;
+  } else {
+    vertex_shader_translation = static_cast<D3D12Shader::D3D12Translation*>(
+        vertex_shader->GetOrCreateTranslation(vertex_shader_modification.value));
+    pixel_shader_translation =
+        pixel_shader ? static_cast<D3D12Shader::D3D12Translation*>(
+                           pixel_shader->GetOrCreateTranslation(pixel_shader_modification.value))
+                     : nullptr;
+    if (!pipeline_cache_->ConfigurePipeline(
+            vertex_shader_translation, pixel_shader_translation, primitive_processing_result,
+            normalized_depth_control, normalized_color_mask,
+            bound_depth_and_color_render_target_bits, bound_depth_and_color_render_target_formats,
+            &pipeline_handle, &root_signature)) {
+      return false;
+    }
   }
   DrawTimingMark(kDrawTimingPipeline);
   if (REXCVAR_GET(async_shader_compilation) &&
       pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
     return true;
+  }
+
+  if (measure_screen_extents) {
+    if (!screen_extents_slots_used_) {
+      PushTransitionBarrier(screen_extents_buffer_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_COPY_DEST);
+      SubmitBarriers();
+      deferred_command_list_.D3DCopyBufferRegion(screen_extents_buffer_.Get(), 0,
+                                                 screen_extents_zero_buffer_.Get(), 0,
+                                                 kScreenExtentsSlots * sizeof(uint32_t) * 4);
+      PushTransitionBarrier(screen_extents_buffer_.Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      SubmitBarriers();
+    }
+    screen_extents_draw_.slot = screen_extents_slots_used_++;
+    {
+      // gpu_screen_extents=4: the draw's identity across frames.
+      uint64_t key = uint64_t(reinterpret_cast<uintptr_t>(vertex_shader));
+      key = key * 0x100000001B3ull ^ uint64_t(reinterpret_cast<uintptr_t>(pixel_shader));
+      key = key * 0x100000001B3ull ^ regs[XE_GPU_REG_VGT_DMA_BASE];
+      key = key * 0x100000001B3ull ^ regs[XE_GPU_REG_VGT_DMA_SIZE];
+      key = key * 0x100000001B3ull ^ index_count;
+      const Shader::ConstantRegisterMap& extents_constant_map =
+          vertex_shader->constant_register_map();
+      for (uint32_t i = 0; i < rex::countof(extents_constant_map.vertex_fetch_bitmap); ++i) {
+        uint32_t j;
+        if (rex::bit_scan_forward(extents_constant_map.vertex_fetch_bitmap[i], &j)) {
+          key = key * 0x100000001B3ull ^ regs.GetVertexFetch(i * 32 + j).address;
+          break;
+        }
+      }
+      screen_extents_draw_.key = key;
+    }
+    // Guest X/W and Y/W to pixels, as DrawExtentEstimator::
+    // Amped3EstimateScreenExtents.
+    auto pa_cl_vte_cntl = regs.Get<reg::PA_CL_VTE_CNTL>();
+    screen_extents_draw_.scale[0] =
+        pa_cl_vte_cntl.vport_x_scale_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE) : 1.0f;
+    screen_extents_draw_.scale[1] =
+        pa_cl_vte_cntl.vport_y_scale_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE) : 1.0f;
+    screen_extents_draw_.offset[0] = pa_cl_vte_cntl.vport_x_offset_ena
+                                         ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET)
+                                         : 0.0f;
+    screen_extents_draw_.offset[1] = pa_cl_vte_cntl.vport_y_offset_ena
+                                         ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET)
+                                         : 0.0f;
+    if (regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable) {
+      auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+      screen_extents_draw_.offset[0] += float(pa_sc_window_offset.window_x_offset);
+      screen_extents_draw_.offset[1] += float(pa_sc_window_offset.window_y_offset);
+    }
+    if (screen_extents_root_slot_ != screen_extents_draw_.slot) {
+      screen_extents_root_slot_ = screen_extents_draw_.slot;
+      current_graphics_root_up_to_date_ &=
+          ~(1u << (bindless_resources_used_ ? kRootParameter_Bindless_ScreenExtents
+                                            : kRootParameter_Bindful_ScreenExtents));
+    }
   }
 
   // Direct resolve data (D3D12TextureCache) that the vertex fetches and the
@@ -2995,6 +4921,47 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   scissor.extent[0] *= draw_resolution_scale_x;
   scissor.extent[1] *= draw_resolution_scale_y;
 
+  // Squeezed HUD is clipped to the 16:9 frame's columns while riding, as a
+  // 16:9 screen clips it: HUD sliding in from beside the frame would show in
+  // the wider screen's sides (menus aren't: their art running past the
+  // frame looks better than cut). The squeeze scales host clip space about
+  // the viewport's centre, so the frame's edges land at k * (+-ndc_scale +
+  // ndc_offset). HUD pinned to the screen's edges isn't clipped.
+  if (ultrawide_draw_ && ultrawide_ui_draw_ && ultrawide_pin_ == 0.0f && REXCVAR_GET(ultrawide_hud_clip) &&
+      viewport_info.xy_extent[0]) {
+    const float k = float(REXCVAR_GET(ultrawide_squeeze));
+    auto column = [&](float edge) {
+      const float ndc = k * (edge * viewport_info.ndc_scale[0] + viewport_info.ndc_offset[0]);
+      return float(viewport_info.xy_offset[0]) + (ndc + 1.0f) * 0.5f * float(viewport_info.xy_extent[0]);
+    };
+    const float a = column(-1.0f), b = column(1.0f);
+    const uint32_t lo = uint32_t(std::max(0.0f, std::floor(std::min(a, b))));
+    const uint32_t hi = uint32_t(std::max(0.0f, std::ceil(std::max(a, b))));
+    const uint32_t start = std::max(scissor.offset[0], lo);
+    const uint32_t end = std::min(scissor.offset[0] + scissor.extent[0], hi);
+    scissor.offset[0] = start;
+    scissor.extent[0] = end > start ? end - start : 0;
+  }
+
+  // Rendering the scene below the output resolution (--scene_render_percent):
+  // the scene's draws - on the scene surface, before its resolve - go into the
+  // top-left part; passes that use the pixel position stay consistent.
+  if (REXCVAR_GET(scene_render_percent) < 100 && g_dlss_scene_resolve &&
+      g_dlss_wide_resolves < g_dlss_scene_resolve) {
+    const uint32_t frontbuffer_width = rex::perf::GetRenderInfo().frontbuffer_width;
+    if (frontbuffer_width && regs.Get<reg::RB_SURFACE_INFO>().surface_pitch * 3 >= frontbuffer_width) {
+      const float f = REXCVAR_GET(scene_render_percent) / 100.0f;
+      for (uint32_t i = 0; i < 2; ++i) {
+        const uint32_t end = viewport_info.xy_offset[i] + viewport_info.xy_extent[i];
+        viewport_info.xy_offset[i] = uint32_t(viewport_info.xy_offset[i] * f);
+        viewport_info.xy_extent[i] = uint32_t(std::ceil(end * f)) - viewport_info.xy_offset[i];
+        const uint32_t scissor_end = scissor.offset[i] + scissor.extent[i];
+        scissor.offset[i] = uint32_t(scissor.offset[i] * f);
+        scissor.extent[i] = uint32_t(std::ceil(scissor_end * f)) - scissor.offset[i];
+      }
+    }
+  }
+
   // Update viewport, scissor, blend factor and stencil reference.
   UpdateFixedFunctionState(viewport_info, scissor, primitive_polygonal, normalized_depth_control);
   DrawTimingMark(kDrawTimingViewport);
@@ -3008,7 +4975,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   DrawTimingMark(kDrawTimingSysConst);
 
   // Update constant buffers, descriptors and root parameters.
-  if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used)) {
+  if (replay && !TileReplayBindings(*replay, vertex_shader, pixel_shader)) {
+    ++tile_replay_fallbacks_[1];
+    replay = nullptr;
+  }
+  if (replay) {
+    ++tile_replay_replayed_;
+  } else if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used)) {
     return false;
   }
   DrawTimingMark(kDrawTimingBindings);
@@ -3282,6 +5255,94 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
   }
 
+  if (tile_replay_current_ >= 0 && !memexport_used && !replay) {
+    TileReplayRecord rec;
+    rec.valid = true;
+    rec.pipeline_handle = pipeline_handle;
+    rec.root_signature = root_signature;
+    rec.vertex_translation = vertex_shader_translation;
+    rec.pixel_translation = pixel_shader_translation;
+    rec.primitive = primitive_processing_result;
+    rec.topology = primitive_topology;
+    rec.normalized_depth_control = normalized_depth_control.value;
+    rec.normalized_color_mask = normalized_color_mask;
+    rec.used_texture_mask = used_texture_mask;
+    rec.render_target_bits = bound_depth_and_color_render_target_bits;
+    std::memcpy(rec.render_target_formats, bound_depth_and_color_render_target_formats,
+                sizeof(rec.render_target_formats));
+    std::memset(rec.hashes, 0, sizeof(rec.hashes));
+    rec.constant_buffers[0] = cbuffer_binding_fetch_.address;
+    rec.constant_buffers[1] = cbuffer_binding_float_vertex_.address;
+    rec.constant_buffers[2] = cbuffer_binding_float_pixel_.address;
+    rec.constant_buffers[3] = cbuffer_binding_bool_loop_.address;
+    rec.constant_buffers[4] = cbuffer_binding_descriptor_indices_pixel_.address;
+    rec.constant_buffers[5] = cbuffer_binding_descriptor_indices_vertex_.address;
+    rec.sampler_heap_generation = tile_replay_sampler_heap_generation_;
+    rec.srv_keys_start = uint32_t(tile_replay_srv_keys_.size());
+    rec.srv_key_counts[0] = uint32_t(vertex_shader->GetTextureBindingsAfterTranslation().size());
+    rec.srv_key_counts[1] =
+        pixel_shader ? uint32_t(pixel_shader->GetTextureBindingsAfterTranslation().size()) : 0;
+    if (amped3_tile_ == 1) {
+      tile_replay_srv_keys_.insert(tile_replay_srv_keys_.end(),
+                                   current_texture_srv_keys_vertex_.begin(),
+                                   current_texture_srv_keys_vertex_.begin() + rec.srv_key_counts[0]);
+      tile_replay_srv_keys_.insert(tile_replay_srv_keys_.end(),
+                                   current_texture_srv_keys_pixel_.begin(),
+                                   current_texture_srv_keys_pixel_.begin() + rec.srv_key_counts[1]);
+    }
+    if (REXCVAR_GET(gpu_tile_replay_verify)) {
+      TileReplayHashes(vertex_shader, pixel_shader, rec.hashes);
+    }
+    if (amped3_tile_ == 1) {
+      tile_replay_records_[tile_replay_current_] = rec;
+    } else if (REXCVAR_GET(gpu_tile_replay_verify)) {
+      const TileReplayRecord& t1 = tile_replay_records_[tile_replay_current_];
+      const PrimitiveProcessor::ProcessingResult& a = t1.primitive;
+      const PrimitiveProcessor::ProcessingResult& b = rec.primitive;
+      bool mismatch[16] = {
+          t1.pipeline_handle != rec.pipeline_handle || t1.root_signature != rec.root_signature,
+          t1.vertex_translation != rec.vertex_translation ||
+              t1.pixel_translation != rec.pixel_translation,
+          a.host_primitive_type != b.host_primitive_type ||
+              a.host_vertex_shader_type != b.host_vertex_shader_type ||
+              a.host_draw_vertex_count != b.host_draw_vertex_count ||
+              a.index_buffer_type != b.index_buffer_type ||
+              a.guest_index_base != b.guest_index_base ||
+              a.host_index_format != b.host_index_format ||
+              a.host_shader_index_endian != b.host_shader_index_endian ||
+              a.line_loop_closing_index != b.line_loop_closing_index ||
+              a.host_index_buffer_handle != b.host_index_buffer_handle ||
+              t1.topology != rec.topology,
+          t1.normalized_depth_control != rec.normalized_depth_control ||
+              t1.normalized_color_mask != rec.normalized_color_mask,
+          t1.used_texture_mask != rec.used_texture_mask,
+          t1.render_target_bits != rec.render_target_bits ||
+              std::memcmp(t1.render_target_formats, rec.render_target_formats,
+                          sizeof(rec.render_target_formats)) != 0,
+          t1.hashes[0] != rec.hashes[0] || t1.hashes[1] != rec.hashes[1],
+          t1.hashes[2] != rec.hashes[2],
+          t1.hashes[3] != rec.hashes[3],
+          t1.hashes[4] != rec.hashes[4],
+          t1.hashes[5] != rec.hashes[5],
+      };
+      ++tile_replay_verified_;
+      for (uint32_t i = 0; i < 16; ++i) {
+        tile_replay_mismatches_[i] += mismatch[i];
+      }
+      if (!(tile_replay_verified_ % 100000)) {
+        const uint64_t* m = tile_replay_mismatches_;
+        REXGPU_INFO(
+            "gpu_tile_replay_verify: {} draws: mismatches: pipeline {}, translations {}, "
+            "primitive/index {}, depth/color state {}, textures used {}, render targets {}, "
+            "float constants {}, fetch constants {}, bool/loop {}, system constants {}, "
+            "texture/sampler bindings {}",
+            tile_replay_verified_, m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9],
+            m[10]);
+      }
+    }
+  }
+  tile_replay_current_ = -1;
+
   DrawTimingMark(kDrawTimingTail);
   return true;
 }
@@ -3436,6 +5497,38 @@ bool D3D12CommandProcessor::IssueCopy() {
   SetGpuProfilePass(rex::perf::GpuPass::kResolve);
   if (rex::perf::IsGpuProfiling()) {
     rex::perf::GetGpuProfileStats().resolves.fetch_add(1, std::memory_order_relaxed);
+  }
+  // DLSS: Amped 3 copies the 3D scene out of its tiled surface (resolves of
+  // color 0, color 1 and depth, several times a frame) and composites the copy
+  // into the frontbuffer target, which is copied out last; the scene is handed
+  // over at the last color 0 resolve before that (its index learnt last frame;
+  // only tile 1, collapsed to the full width, counts).
+  if (DlssTracing()) {
+    const RegisterFile& tregs = *register_file_;
+    REXGPU_INFO("trace resolve: pitch {} src {} color base {} depth base {} dest {:08X} dest pitch {}",
+                tregs.Get<reg::RB_SURFACE_INFO>().surface_pitch,
+                tregs.Get<reg::RB_COPY_CONTROL>().copy_src_select, tregs.Get<reg::RB_COLOR_INFO>().color_base,
+                tregs.Get<reg::RB_DEPTH_INFO>().depth_base, tregs[XE_GPU_REG_RB_COPY_DEST_BASE],
+                tregs.Get<reg::RB_COPY_DEST_PITCH>().copy_dest_pitch);
+  }
+  {
+    const RegisterFile& regs = *register_file_;
+    const uint32_t frontbuffer_width = rex::perf::GetRenderInfo().frontbuffer_width;
+    if (frontbuffer_width && regs.Get<reg::RB_COPY_CONTROL>().copy_src_select == 0 &&
+        render_target_cache_->SceneColorTargetFits(frontbuffer_width) &&
+        ++g_dlss_wide_resolves == g_dlss_scene_resolve) {
+      if (dlss_ && REXCVAR_GET(dlss_handoff) == "resolve" && dlss_->WantsScene()) {
+        const rex::perf::RenderInfo render_info = rex::perf::GetRenderInfo();
+        const uint32_t scene_width = render_info.frontbuffer_width * texture_cache_->draw_resolution_scale_x();
+        const uint32_t scene_height = render_info.frontbuffer_height * texture_cache_->draw_resolution_scale_y();
+        render_target_cache_->HandOverScene(
+            [this, scene_width, scene_height](ID3D12Resource* color, ID3D12Resource* depth,
+                                              D3D12_CPU_DESCRIPTOR_HANDLE depth_srv) {
+              (void)depth;
+              return dlss_->ProcessScene(color, depth_srv, scene_width, scene_height);
+            });
+      }
+    }
   }
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
   if (readback_mode == ReadbackResolveMode::kDisabled) {
@@ -3887,6 +5980,7 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     current_guest_pipeline_ = nullptr;
     current_external_pipeline_ = nullptr;
     current_graphics_root_signature_ = nullptr;
+    tile_replay_root_signature_ = nullptr;
     current_graphics_root_up_to_date_ = 0;
     if (bindless_resources_used_) {
       deferred_command_list_.SetDescriptorHeaps(view_bindless_heap_,
@@ -4025,6 +6119,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
         }
       }
       deferred_command_list_.SwapCommandStream(job.command_stream);
+      deferred_command_list_.SwapExternalCallbacks(job.external_callbacks);
       {
         std::lock_guard lock(submission_mutex_);
         submission_jobs_.push_back(std::move(job));
@@ -4207,8 +6302,10 @@ void D3D12CommandProcessor::SubmissionThreadMain() {
     job.command_allocator->Reset();
     command_list_->Reset(job.command_allocator, nullptr);
     list.SwapCommandStream(job.command_stream);
+    list.SwapExternalCallbacks(job.external_callbacks);
     list.Execute(command_list_, command_list_1_);
     list.SwapCommandStream(job.command_stream);
+    list.SwapExternalCallbacks(job.external_callbacks);
     command_list_->Close();
     ID3D12CommandList* execute_command_lists[] = {command_list_};
     direct_queue->ExecuteCommandLists(1, execute_command_lists);
@@ -4535,11 +6632,38 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   }
 
   // Conversion to Direct3D 12 normalized device coordinates.
+  // With DLSS, the scene draws (classified in IssueDraw) are shifted by the
+  // frame's sub-pixel jitter - like a jittered projection, as the offset is
+  // multiplied by W.
+  float ndc_jitter[3] = {};
+  if (dlss_ && dlss_scene_draw_ && (dlss_->jitter_x() != 0.0f || dlss_->jitter_y() != 0.0f) &&
+      viewport_info.xy_extent[0] && viewport_info.xy_extent[1]) {
+    ndc_jitter[0] = 2.0f * dlss_->jitter_x() / float(viewport_info.xy_extent[0]);
+    ndc_jitter[1] = -2.0f * dlss_->jitter_y() / float(viewport_info.xy_extent[1]);
+  }
+  // Ultrawide experiment: every draw squeezed horizontally about the centre,
+  // so a frame stretched to a wider window keeps its proportions (3D shows a
+  // wider view; 2D keeps its shape).
+  // Only the draws IssueDraw picked (ultrawide_draw_): off-screen passes and
+  // full-screen copies keep their own layout.
+  const float squeeze = ultrawide_draw_ ? float(REXCVAR_GET(ultrawide_squeeze)) : 1.0f;
+  // The same for screens taller than 16:9 (16:10: the Steam Deck), vertically.
+  const float squeeze_y = ultrawide_draw_ ? float(REXCVAR_GET(tall_squeeze)) : 1.0f;
   for (uint32_t i = 0; i < 3; ++i) {
-    dirty |= system_constants_.ndc_scale[i] != viewport_info.ndc_scale[i];
-    dirty |= system_constants_.ndc_offset[i] != viewport_info.ndc_offset[i];
-    system_constants_.ndc_scale[i] = viewport_info.ndc_scale[i];
-    system_constants_.ndc_offset[i] = viewport_info.ndc_offset[i];
+    const float k = i == 0 && squeeze > 0.0f ? squeeze : i == 1 && squeeze_y > 0.0f ? squeeze_y : 1.0f;
+    // --ui_scale first: about the guest viewport's centre (the frame's,
+    // where guest clip space 0 lands: ndc_offset, which also carries the
+    // predicated tile's window offset), then the squeeze.
+    const float u = ui_scale_draw_ && i < 2 ? std::clamp(float(REXCVAR_GET(ui_scale)), 0.5f, 1.3f) : 1.0f;
+    const float ui_offset = viewport_info.ndc_offset[i];
+    const float ndc_scale = viewport_info.ndc_scale[i] * u * k;
+    // A pinned sprite moves out by the bar the squeeze leaves on its side.
+    const float pin = i == 0 ? ultrawide_pin_ * (1.0f - k) : 0.0f;
+    const float ndc_offset = (ui_offset + ndc_jitter[i]) * k + pin;
+    dirty |= system_constants_.ndc_scale[i] != ndc_scale;
+    dirty |= system_constants_.ndc_offset[i] != ndc_offset;
+    system_constants_.ndc_scale[i] = ndc_scale;
+    system_constants_.ndc_offset[i] = ndc_offset;
   }
 
   // Point size.
@@ -4778,6 +6902,7 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
   // Set the new root signature.
   if (current_graphics_root_signature_ != root_signature) {
     current_graphics_root_signature_ = root_signature;
+    tile_replay_root_signature_ = nullptr;
     if (!bindless_resources_used_) {
       GetRootBindfulExtraParameterIndices(vertex_shader, pixel_shader,
                                           current_graphics_root_bindful_extras_);
@@ -5060,6 +7185,7 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
           // The only thing the heap is used for now is texture cache samplers -
           // invalidate all of them.
           texture_cache_bindless_sampler_map_.clear();
+          ++tile_replay_sampler_heap_generation_;
           deferred_command_list_.SetDescriptorHeaps(view_bindless_heap_,
                                                     sampler_bindless_heap_current_);
           current_graphics_root_up_to_date_ &= ~(1u << kRootParameter_Bindless_SamplerHeap);
@@ -5413,6 +7539,15 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     deferred_command_list_.D3DSetGraphicsRootDescriptorTable(
         root_parameter_shared_memory_and_bindful_edram, gpu_handle_shared_memory_and_bindful_edram);
     current_graphics_root_up_to_date_ |= 1u << root_parameter_shared_memory_and_bindful_edram;
+  }
+  uint32_t root_parameter_screen_extents = bindless_resources_used_
+                                               ? kRootParameter_Bindless_ScreenExtents
+                                               : kRootParameter_Bindful_ScreenExtents;
+  if (!(current_graphics_root_up_to_date_ & (1u << root_parameter_screen_extents))) {
+    deferred_command_list_.D3DSetGraphicsRootUnorderedAccessView(
+        root_parameter_screen_extents, screen_extents_buffer_->GetGPUVirtualAddress() +
+                                           uint64_t(screen_extents_root_slot_) * 16);
+    current_graphics_root_up_to_date_ |= 1u << root_parameter_screen_extents;
   }
   if (bindless_resources_used_) {
     if (!(current_graphics_root_up_to_date_ &

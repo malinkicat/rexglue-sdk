@@ -12,6 +12,7 @@
 #pragma once
 
 #include <array>
+#include <chrono>
 #include <atomic>
 #include <mutex>
 
@@ -304,6 +305,9 @@ class XmaContext {
   // samples are still being assembled, so they land one decode after the frame
   // they describe.
   bool carry_valid_ = false;
+  // A frame running past the end of the current buffer with no next buffer
+  // queued: since when (the end of a stream never gets one; see Decode).
+  std::chrono::steady_clock::time_point input_stall_since_{};
   uint8_t pending_output_limit_ = 0;
   uint8_t pending_start_skip_ = 0;
 };

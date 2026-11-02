@@ -14,11 +14,13 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <memory>
 #include <unordered_map>
 #include <vector>
 
 #include <rex/assert.h>
+#include <rex/graphics/pipeline/texture/replacement.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/shared_memory.h>
@@ -84,6 +86,13 @@ class TextureCache {
     return global_critical_region_.Acquire();
   }
 
+  // Initializes DDS texture dumping beside the executable.
+  void InitTextureReplacement(const std::filesystem::path& textures_dir);
+  // Makes the texture replacement once texture_dump_enabled or
+  // texture_replace_enabled is on (nothing while both are off).
+  void EnsureTextureReplacement();
+  // Tracks the pages written by resolves (always above 1x).
+  void EnableResolvedPageTracking();
 
   virtual void ClearCache();
 
@@ -108,6 +117,11 @@ class TextureCache {
   }
 
   static uint32_t GuestToHostSwizzle(uint32_t guest_swizzle, uint32_t host_format_swizzle);
+  // The host swizzle for a texture made from a replacement image (RGBA8 in
+  // the colours the game shows): a fetch swizzle that only reorders the
+  // colour components of an RGBA-like format reads the image in its own
+  // order; anything else is applied like GuestToHostSwizzle.
+  static uint32_t ReplacementHostSwizzle(uint32_t guest_swizzle, uint32_t host_format_swizzle);
 
   void TextureFetchConstantWritten(uint32_t index) { TextureFetchConstantsWritten(index, index); }
   void TextureFetchConstantsWritten(uint32_t first_index, uint32_t last_index) {
@@ -201,6 +215,10 @@ class TextureCache {
     uint32_t scaled_resolve : 1;  // 97
     // Least important in ==, so placed last.
     uint32_t is_valid : 1;  // 98
+    // Non-zero for a texture replaced from disk: bits of the guest content
+    // hash, so different content at the same address with replacements of the
+    // same size don't share a texture.
+    uint32_t replacement_id : 28;  // 126
 
     TextureKey() { MakeInvalid(); }
     TextureKey(const TextureKey& key) { std::memcpy(this, &key, sizeof(*this)); }
@@ -246,6 +264,10 @@ class TextureCache {
     uint32_t GetGuestBaseSize() const { return guest_layout().base.level_data_extent_bytes; }
     uint32_t GetGuestMipsSize() const { return guest_layout().mips_total_extent_bytes; }
 
+    void OverrideGuestLayout(const texture_util::TextureGuestLayout& layout) {
+      guest_layout_ = layout;
+    }
+
     // For 3D-as-2D wrappers: the host texture is 2D, but guest memory tiling
     // may still need to be interpreted as 3D.
     bool force_load_3d_tiling() const { return force_load_3d_tiling_; }
@@ -276,6 +298,11 @@ class TextureCache {
     void MarkAsUsed();
 
     void LogAction(const char* action) const;
+
+    uint64_t replacement_content_hash_ = 0;
+    // The fetch swizzle of the binding that last asked for this texture's
+    // data (dumps are written in the colours that binding shows).
+    uint32_t last_guest_swizzle_ = 0x688;  // XYZW
 
    protected:
     // If track_usage is false, the texture won't be added to the LRU list.
@@ -527,6 +554,12 @@ class TextureCache {
   // the host than its unsigned version (for example, if it's a fixed-point
   // texture emulated with a larger host pixel format).
   virtual bool IsSignedVersionSeparateForFormat(TextureKey /*key*/) const { return false; }
+  // The OS's budget of local (dedicated) video memory for this process and
+  // how much of it the process uses, in bytes; false if unknown. Sizes the
+  // memory limits while a texture pack is used.
+  virtual bool QueryLocalVideoMemory(uint64_t& /*budget_out*/, uint64_t& /*usage_out*/) {
+    return false;
+  }
   // Parameters like whether the texture is tiled and its dimensions are checked
   // externally, the implementation should take only format-related parameters
   // such as the format itself and the signedness into account.
@@ -566,6 +599,18 @@ class TextureCache {
   // into the texture object.
   virtual bool LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                      bool load_mips) = 0;
+
+  virtual bool LoadTextureDataFromReplacementImpl(
+      Texture& texture, const TextureReplacementData& data) {
+    return false;
+  }
+  // On a loading thread: the decoded replacement put into upload memory the
+  // way LoadTextureDataFromReplacementImpl will copy it from (null = it uses
+  // the pixels instead).
+  virtual std::shared_ptr<void> PrepareReplacementUploadImpl(const TextureReplacementData& data) {
+    (void)data;
+    return nullptr;
+  }
 
   // Converts a texture fetch constant to a texture key, normalizing and
   // validating the values, or creating an invalid key, and also gets the
@@ -610,6 +655,9 @@ class TextureCache {
   // Checks if there are any pages that contain scaled resolve data within the
   // range.
   bool IsRangeScaledResolved(uint32_t start_unscaled, uint32_t length_unscaled);
+  // Whether any page of the range was last written by a resolve (at any draw
+  // resolution scale), not by the CPU since.
+  bool IsRangeResolved(uint32_t start_unscaled, uint32_t length_unscaled);
   // Global shared memory invalidation callback for invalidating scaled resolved
   // texture data.
   static void ScaledResolveGlobalWatchCallbackThunk(
@@ -658,6 +706,39 @@ class TextureCache {
   // Bit vector with bits reset on fetch constant writes to avoid parsing fetch
   // constants again and again.
   uint32_t texture_bindings_in_sync_ = 0;
+  // The fetch swizzle of the binding FindOrCreateTexture is looking a texture
+  // up for (a replacement's original is decoded in the colours it shows).
+  uint32_t replacement_lookup_swizzle_ = 0x688;  // XYZW
+
+  void InvalidateHashCache(uint32_t base_page) {
+    base_page_hash_cache_.erase(base_page);
+  }
+
+  std::unique_ptr<TextureReplacement> replacement_;
+  // The soft and hard memory limits (MB) for the textures in use now - see
+  // GetMemoryLimits.
+  void GetMemoryLimits(uint32_t& soft_mb_out, uint32_t& hard_mb_out);
+  // Limits for a texture pack from the video memory budget (MB, 0 = not
+  // worked out yet).
+  uint32_t pack_limit_soft_mb_ = 0;
+  uint32_t pack_limit_hard_mb_ = 0;
+  // Content hashes of the textures at a base page, for finding replacements
+  // without hashing the whole texture again on every lookup. The memory may be
+  // reused for another texture without a watch noticing (the old texture may
+  // be gone), so a sampled fingerprint of the content is checked each time.
+  struct CachedContentHash {
+    uint32_t size;
+    uint64_t fingerprint;
+    // The layout the hash was made with (the hash skips its padding).
+    uint64_t layout;
+    uint64_t hash;
+  };
+  std::unordered_map<uint32_t, CachedContentHash> base_page_hash_cache_;
+  // The key each lookup's original key resolved to (the replacement's, or
+  // its own when there's none), while that texture exists and its memory
+  // hasn't been written: saves fingerprinting the guest data on every
+  // lookup (~100k a second in Amped 3's busy scenes).
+  std::unordered_map<TextureKey, TextureKey, TextureKey::Hasher> replacement_memo_;
 };
 
 }  // namespace rex::graphics

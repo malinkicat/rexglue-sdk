@@ -158,6 +158,10 @@ class DxbcShaderTranslator : public ShaderTranslator {
       // uint32_t 1.
       // Pipeline stage and input configuration.
       Shader::HostVertexShaderType host_vertex_shader_type : Shader::kHostVertexShaderTypeBitCount;
+      // amped3 (gpu_screen_extents=3): accumulate the bounding box of the
+      // guest X/W and Y/W of the vertices in the first 16 bytes of the
+      // xe_screen_extents UAV (see CompleteVertexOrDomainShader).
+      uint32_t screen_extents : 1;
     } vertex;
     struct PixelShaderModification {
       // uint32_t 0.
@@ -511,6 +515,8 @@ class DxbcShaderTranslator : public ShaderTranslator {
   enum class UAVRegister {
     kSharedMemory,
     kEdram,
+    // amped3: screen extent accumulation (a root descriptor).
+    kScreenExtents,
   };
 
   uint64_t GetDefaultVertexShaderModification(
@@ -1161,6 +1167,7 @@ class DxbcShaderTranslator : public ShaderTranslator {
   uint32_t uav_count_;
   uint32_t uav_index_shared_memory_;
   uint32_t uav_index_edram_;
+  uint32_t uav_index_screen_extents_;
 
   std::vector<SamplerBinding> sampler_bindings_;
 };

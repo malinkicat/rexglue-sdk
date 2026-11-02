@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <utility>
 
 #include <rex/assert.h>
@@ -277,6 +278,15 @@ GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
 namespace rex {
 namespace ui {
 
+// A guest output frame not yet painted, and when the last one came (steady
+// clock ns): with the UI drawn, the UI thread presents on new guest frames
+// only while they keep coming (not on every UI tick, which repeats frames).
+// Not Presenter members: code built against the stock SDK's Presenter layout
+// shares these objects, so the class must keep that layout (one presenter).
+static std::atomic<bool> g_guest_output_unpainted{false};
+static std::atomic<int64_t> g_guest_output_last_ns{0};
+
+
 void Presenter::FatalErrorHostGpuLossCallback([[maybe_unused]] bool is_responsible,
                                               [[maybe_unused]] bool statically_from_ui_thread) {
   rex::FatalError("Graphics device lost (probably due to an internal error)");
@@ -483,7 +493,23 @@ void Presenter::PaintFromUIThread(bool force_paint) {
       // doesn't limit the frame rate.
       WaitForUITickFromUIThread();
 
-      paint_result = PaintAndPresent(draw_ui);
+      // With the UI drawn while the guest keeps making frames, present only
+      // new guest frames: presenting on every UI tick showed frames again and
+      // put the new ones on the tick grid (a 9 ms frame shown for 14 ms at a
+      // 141 Hz tick), and the extra presents slowed the guest. When the guest
+      // stops (loading, paused), the UI is presented on ticks as before.
+      static const bool frame_generation = rex::cvar::GetFlagByName("frame_generation") == "true";
+      const bool new_guest_frame = g_guest_output_unpainted.exchange(false, std::memory_order_acq_rel);
+      const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch())
+                                 .count();
+      const bool guest_live =
+          now_ns - g_guest_output_last_ns.load(std::memory_order_relaxed) < 100'000'000;
+      if (draw_ui && !force_paint && !frame_generation && !new_guest_frame && guest_live) {
+        request_repaint_at_tick = true;
+      } else {
+        paint_result = PaintAndPresent(draw_ui);
+      }
       if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
         // Request another PaintFromUIThread which will try to recover from the
         // outdated connection in the next frame (not immediately, so the
@@ -619,6 +645,12 @@ bool Presenter::RefreshGuestOutput(
       // currently not accessible to the host presentation.
       guest_output_mailbox_writable_ = (3 - last_acquired - guest_output_mailbox_writable_) % 3;
     }
+
+    g_guest_output_last_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    std::chrono::steady_clock::now().time_since_epoch())
+                                    .count(),
+                                std::memory_order_relaxed);
+    g_guest_output_unpainted.store(true, std::memory_order_release);
 
     // Trigger the presentation on the host.
     PaintResult paint_result = PaintResult::kNotPresented;
@@ -1346,7 +1378,11 @@ Presenter::PaintMode Presenter::GetDesiredPaintModeFromUIThread(bool is_paintabl
     // lifecycle.
     return PaintMode::kNone;
   }
-  if (!REXCVAR_GET(host_present_from_non_ui_thread)) {
+  // Frame generation presents twice per frame with vsync: on the UI thread, so
+  // the thread making the guest output never waits for the display (on the
+  // Deck: 1% low 29 -> 40 at 45 shown as 90).
+  static const bool frame_generation = rex::cvar::GetFlagByName("frame_generation") == "true";
+  if (!REXCVAR_GET(host_present_from_non_ui_thread) || frame_generation) {
     return PaintMode::kUIThreadOnRequest;
   }
   if (surface_paint_connection_has_implicit_vsync_) {
@@ -1643,8 +1679,14 @@ void Presenter::WaitForUITickFromUIThread() {
 
 void Presenter::ForceUIThreadPaintTick() {
 #if REX_PLATFORM_WIN32
-  std::scoped_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
-  dxgi_ui_tick_force_requested_ = true;
+  {
+    std::scoped_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
+    dxgi_ui_tick_force_requested_ = true;
+  }
+  // Wake a UI thread waiting for the tick: without this, a new guest frame
+  // waited for the next vertical blank, so frames with the UI shown landed on
+  // the refresh grid (a 9 ms frame shown after 14 ms at 141 Hz).
+  dxgi_ui_tick_signal_condition_.notify_all();
 #endif  // XE_PLATFORM
 }
 

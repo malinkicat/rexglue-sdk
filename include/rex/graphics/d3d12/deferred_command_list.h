@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <utility>
 #include <vector>
@@ -52,6 +53,8 @@ struct DefaultInitAllocator : std::allocator<T> {
   }
 };
 using DeferredCommandStream = std::vector<uintmax_t, DefaultInitAllocator<uintmax_t>>;
+// Code run by ExternalCallback commands, travelling with their stream.
+using DeferredExternalCallbacks = std::vector<std::function<void(ID3D12GraphicsCommandList*)>>;
 
 class DeferredCommandList {
  public:
@@ -63,6 +66,7 @@ class DeferredCommandList {
   // Exchanges the recorded commands with `stream` (handing them to another
   // list, e.g. for executing on another thread).
   void SwapCommandStream(DeferredCommandStream& stream) { command_stream_.swap(stream); }
+  void SwapExternalCallbacks(DeferredExternalCallbacks& callbacks) { external_callbacks_.swap(callbacks); }
 
   D3D12_RECT* ClearDepthStencilViewAllocatedRects(D3D12_CPU_DESCRIPTOR_HANDLE depth_stencil_view,
                                                   D3D12_CLEAR_FLAGS clear_flags, FLOAT depth,
@@ -471,6 +475,16 @@ class DeferredCommandList {
 
   void EndDebugMarker() { WriteCommand(Command::kEndDebugMarker, 0); }
 
+  // Runs code that needs the real command list (third-party SDKs such as
+  // NVIDIA NGX) when the deferred commands are executed. Such code can change
+  // any command list state, so the caller must set again what it relies on
+  // afterwards (descriptor heaps, root signatures, pipeline).
+  void ExternalCallback(std::function<void(ID3D12GraphicsCommandList*)> callback) {
+    *reinterpret_cast<size_t*>(WriteCommand(Command::kExternalCallback, sizeof(size_t))) =
+        external_callbacks_.size();
+    external_callbacks_.push_back(std::move(callback));
+  }
+
   void InsertDebugMarker(const char* label_name) {
     size_t label_len = std::strlen(label_name);
     uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
@@ -535,6 +549,7 @@ class DeferredCommandList {
     kBeginDebugMarker,
     kEndDebugMarker,
     kInsertDebugMarker,
+    kExternalCallback,
   };
 
   struct CommandHeader {
@@ -693,6 +708,7 @@ class DeferredCommandList {
 
   // uintmax_t to ensure uint64_t and pointer alignment of all structures.
   DeferredCommandStream command_stream_;
+  DeferredExternalCallbacks external_callbacks_;
 };
 
 }  // namespace rex::graphics::d3d12

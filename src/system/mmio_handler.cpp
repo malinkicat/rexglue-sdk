@@ -16,6 +16,10 @@
 #include <rex/assert.h>
 #include <rex/exception_handler.h>
 #include <rex/logging.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <rex/memory.h>
 #include <rex/platform.h>
 #include <rex/system/mmio_handler.h>
@@ -417,8 +421,22 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
     // The address is not found within any range, so either a write watch or an
     // actual access violation.
     if (access_violation_callback_) {
-      return access_violation_callback_(std::move(lock), access_violation_callback_context_,
-                                        fault_host_address, is_write);
+      const bool handled = access_violation_callback_(std::move(lock), access_violation_callback_context_,
+                                                      fault_host_address, is_write);
+      if (!handled) {
+        // Where it happened, for the linker map (an unhandled guest access is
+        // usually a recompiled function's bug).
+#ifdef _WIN32
+        HMODULE module = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(ex->pc()), &module);
+        REXSYS_ERROR("  ... at host pc 0x{:016X} (module base 0x{:016X})", uint64_t(ex->pc()),
+                     uint64_t(reinterpret_cast<uintptr_t>(module)));
+#else
+        REXSYS_ERROR("  ... at host pc 0x{:016X}", uint64_t(ex->pc()));
+#endif
+      }
+      return handled;
     }
     return false;
   }

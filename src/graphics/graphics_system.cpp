@@ -12,9 +12,11 @@
 #include <rex/graphics/graphics_system.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdint>
 #include <functional>
+#include <immintrin.h>
 #include <memory>
 #include <mutex>
 #include <utility>
@@ -41,10 +43,14 @@
 #include <windows.h>
 #endif
 
-REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none, fxaa, fxaa_extreme")
-    .allowed({"none", "fxaa", "fxaa_extreme"})
+REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU",
+                      "Swap post effect: none, fxaa, fxaa_extreme, smaa")
+    .allowed({"none", "fxaa", "fxaa_extreme", "smaa"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_INT32(vblank_spin_us, 2000, "GPU",
+                     "Wake this many microseconds before each guest vblank and spin to it "
+                     "(frames that flip on vblanks are only as even as the vblanks)");
 REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU",
                     "Store shaders persistently and load them when loading games to avoid "
                     "runtime spikes and freezes when playing the game not for the first time.");
@@ -64,11 +70,21 @@ rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
   if (lowered == "fxaa_extreme" || lowered == "extreme") {
     return rex::graphics::CommandProcessor::SwapPostEffect::kFxaaExtreme;
   }
+  if (lowered == "smaa") {
+    return rex::graphics::CommandProcessor::SwapPostEffect::kSmaa;
+  }
   return rex::graphics::CommandProcessor::SwapPostEffect::kNone;
 }
 }  // namespace
 
 namespace rex::graphics {
+
+// Guest tick counts of the last and next guest vblank (command_processor.cpp).
+extern std::atomic<uint64_t> g_last_vblank_tick, g_next_vblank_tick, g_vblank_mark_tick,
+    g_vblank_done_tick;
+
+// The running graphics system (for ReXSetSwapPostEffect).
+GraphicsSystem* g_live_graphics_system = nullptr;
 
 // Nvidia Optimus/AMD PowerXpress support.
 // These exports force the process to trigger the discrete GPU in multi-GPU
@@ -84,7 +100,9 @@ __declspec(dllexport) uint32_t AmdPowerXpressRequestHighPerformance = 1;
 
 GraphicsSystem::GraphicsSystem() : vsync_worker_running_(false) {}
 
-GraphicsSystem::~GraphicsSystem() = default;
+GraphicsSystem::~GraphicsSystem() {
+  if (g_live_graphics_system == this) g_live_graphics_system = nullptr;
+}
 
 X_STATUS GraphicsSystem::SetupPresentation(ui::WindowedAppContext* app_context) {
   if (presenter_) {
@@ -146,6 +164,7 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
     return X_STATUS_UNSUCCESSFUL;
   }
   command_processor_->SetDesiredSwapPostEffect(ParseSwapPostEffect(REXCVAR_GET(swap_post_effect)));
+  g_live_graphics_system = this;
 
   // Register GPU MMIO handlers
   // GPU registers are at 0x7FC80000-0x7FCFFFFF
@@ -173,19 +192,25 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
                                               CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
                                               TIMER_ALL_ACCESS);
 #endif
-        // Wake this long before a vblank and spin the rest, for timer slack.
-        const uint64_t spin_ticks = guest_tick_frequency / 2000;  // 0.5 ms
         while (vsync_worker_running_) {
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
           uint64_t interval_ticks =
               REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
           while (current_time - last_frame_time >= interval_ticks) {
+            g_last_vblank_tick.store(last_frame_time + interval_ticks, std::memory_order_relaxed);
             MarkVblank();
             last_frame_time += interval_ticks;
           }
+          g_next_vblank_tick.store(REXCVAR_GET(vsync) ? last_frame_time + interval_ticks : 0,
+                                   std::memory_order_relaxed);
           const uint64_t remaining = last_frame_time + interval_ticks - current_time;
           // Spin only for real vblanks; with vsync off they come every 1 ms and
           // spinning half of each would keep a core busy.
+          // Wake this long before a vblank and spin the rest, for timer slack.
+          // Spinning with pause, not yields: a yield on busy cores (the Deck)
+          // can hand the core away past the vblank.
+          const uint64_t spin_ticks =
+              guest_tick_frequency * uint64_t(std::max(0, REXCVAR_GET(vblank_spin_us))) / 1000000;
           const uint64_t spin = interval_ticks >= guest_tick_frequency / 200 ? spin_ticks : 0;
           if (remaining > spin) {
 #ifdef _WIN32
@@ -200,6 +225,8 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
             rex::thread::Sleep(std::chrono::microseconds(
                 (remaining - spin) * 1000000 / guest_tick_frequency));
 #endif
+          } else if (spin) {
+            _mm_pause();
           } else {
             rex::thread::MaybeYield();
           }
@@ -364,6 +391,7 @@ void GraphicsSystem::MarkVblank() {
   // SCOPE_profile_cpu_f("gpu");
 
   // Increment vblank counter (so the game sees us making progress).
+  g_vblank_mark_tick.store(chrono::Clock::QueryGuestTickCount(), std::memory_order_relaxed);
   if (command_processor_) {
     command_processor_->increment_counter();
   }
@@ -372,6 +400,7 @@ void GraphicsSystem::MarkVblank() {
   //     something wrong and the CP will block waiting for code that
   //     needs to be run in the interrupt.
   DispatchInterruptCallback(0, 2);
+  g_vblank_done_tick.store(chrono::Clock::QueryGuestTickCount(), std::memory_order_relaxed);
   VblankWakeEvent()->Set();
 }
 
@@ -431,3 +460,15 @@ bool GraphicsSystem::Restore(::rex::stream::ByteStream* stream) {
 }
 
 }  // namespace rex::graphics
+
+// The swap post effect (none, fxaa, fxaa_extreme, smaa) changed while running,
+// as a plain C export for callers built against an SDK whose headers predate
+// it (they look it up in the DLL by name).
+extern "C" __declspec(dllexport) void ReXSetSwapPostEffect(const char* name) {
+  auto* system = rex::graphics::g_live_graphics_system;
+  if (!system || !name) return;
+  REXCVAR_SET(swap_post_effect, std::string(name));
+  if (auto* command_processor = system->command_processor()) {
+    command_processor->SetDesiredSwapPostEffect(ParseSwapPostEffect(name));
+  }
+}

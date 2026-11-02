@@ -160,6 +160,7 @@ void DxbcShaderTranslator::Reset() {
   uav_count_ = 0;
   uav_index_shared_memory_ = kBindingIndexUnallocated;
   uav_index_edram_ = kBindingIndexUnallocated;
+  uav_index_screen_extents_ = kBindingIndexUnallocated;
 
   sampler_bindings_.clear();
 
@@ -946,6 +947,56 @@ void DxbcShaderTranslator::CompleteVertexOrDomainShader() {
   a_.OpEndIf();
 
   Modification shader_modification = GetDxbcShaderModification();
+
+  // amped3 (gpu_screen_extents=3): the bounding box of the guest X/W and Y/W
+  // of the vertices, for the screen extents the guest asks EVENT_WRITE_EXT
+  // for (it builds the bin masks of predicated tiling from them). Clamped to
+  // [-4, 4], or all of it for vertices on or behind the eye plane, as 1/4096
+  // fixed point from -4 - minimums inverted (0x10000 - value), so the draw's
+  // slot (4 dwords, zeroed before the draw; the root descriptor points at it)
+  // only needs atomic unsigned maximums. The slot is read first to skip the
+  // atomics that wouldn't change it.
+  if (shader_modification.vertex.screen_extents) {
+    if (uav_index_screen_extents_ == kBindingIndexUnallocated) {
+      uav_index_screen_extents_ = uav_count_++;
+    }
+    uint32_t extents_temp = PushSystemTemp();
+    uint32_t slot_temp = PushSystemTemp();
+    // extents_temp.xy = clamp(XY / W, -4, 4).
+    a_.OpDiv(dxbc::Dest::R(extents_temp, 0b0011), dxbc::Src::R(system_temp_position_),
+             dxbc::Src::R(system_temp_position_, dxbc::Src::kWWWW));
+    a_.OpMax(dxbc::Dest::R(extents_temp, 0b0011), dxbc::Src::R(extents_temp),
+             dxbc::Src::LF(-4.0f));
+    a_.OpMin(dxbc::Dest::R(extents_temp, 0b0011), dxbc::Src::R(extents_temp),
+             dxbc::Src::LF(4.0f));
+    // slot_temp.x = W > 0 (false for NaN too).
+    a_.OpLT(dxbc::Dest::R(slot_temp, 0b0001), dxbc::Src::LF(0.0f),
+            dxbc::Src::R(system_temp_position_, dxbc::Src::kWWWW));
+    // Maximums in zw, minimums in xy.
+    a_.OpMovC(dxbc::Dest::R(extents_temp, 0b1100), dxbc::Src::R(slot_temp, dxbc::Src::kXXXX),
+              dxbc::Src::R(extents_temp, 0b01000100), dxbc::Src::LF(4.0f));
+    a_.OpMovC(dxbc::Dest::R(extents_temp, 0b0011), dxbc::Src::R(slot_temp, dxbc::Src::kXXXX),
+              dxbc::Src::R(extents_temp), dxbc::Src::LF(-4.0f));
+    a_.OpMAd(dxbc::Dest::R(extents_temp), dxbc::Src::R(extents_temp), dxbc::Src::LF(4096.0f),
+             dxbc::Src::LF(16384.0f));
+    a_.OpFToU(dxbc::Dest::R(extents_temp), dxbc::Src::R(extents_temp));
+    a_.OpIAdd(dxbc::Dest::R(extents_temp, 0b0011), -dxbc::Src::R(extents_temp),
+              dxbc::Src::LU(0x10000));
+    // slot_temp = the slot's current values < this vertex's.
+    a_.OpLdRaw(dxbc::Dest::R(slot_temp), dxbc::Src::LU(0),
+               dxbc::Src::U(uav_index_screen_extents_, uint32_t(UAVRegister::kScreenExtents),
+                            dxbc::Src::kXYZW));
+    a_.OpULT(dxbc::Dest::R(slot_temp), dxbc::Src::R(slot_temp), dxbc::Src::R(extents_temp));
+    for (uint32_t i = 0; i < 4; ++i) {
+      a_.OpIf(true, dxbc::Src::R(slot_temp).Select(i));
+      a_.OpAtomicUMax(
+          dxbc::Dest::U(uav_index_screen_extents_, uint32_t(UAVRegister::kScreenExtents), 0),
+          dxbc::Src::LU(4 * i), 1, dxbc::Src::R(extents_temp).Select(i));
+      a_.OpEndIf();
+    }
+    PopSystemTemp(2);
+  }
+
   uint32_t clip_distance_next_component = 0;
   uint32_t cull_distance_next_component = shader_modification.GetVertexClipDistanceCount();
 
@@ -2320,6 +2371,10 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
   if (uav_index_edram_ != kBindingIndexUnallocated) {
     name_ptr += dxbc::AppendAlignedString(shader_object_, "xe_edram");
   }
+  uint32_t screen_extents_name_ptr = name_ptr;
+  if (uav_index_screen_extents_ != kBindingIndexUnallocated) {
+    name_ptr += dxbc::AppendAlignedString(shader_object_, "xe_screen_extents");
+  }
 
   uint32_t bindings_position_dwords = uint32_t(shader_object_.size());
 
@@ -2444,6 +2499,12 @@ void DxbcShaderTranslator::WriteResourceDefinition() {
         uav.dimension = dxbc::RdefDimension::kUAVBuffer;
         uav.sample_count = UINT32_MAX;
         uav.bind_point = uint32_t(UAVRegister::kEdram);
+      } else if (i == uav_index_screen_extents_) {
+        uav.name_ptr = screen_extents_name_ptr;
+        uav.type = dxbc::RdefInputType::kUAVRWByteAddress;
+        uav.return_type = dxbc::ResourceReturnType::kMixed;
+        uav.dimension = dxbc::RdefDimension::kUAVBuffer;
+        uav.bind_point = uint32_t(UAVRegister::kScreenExtents);
       } else {
         assert_unhandled_case(i);
       }
@@ -3249,6 +3310,11 @@ void DxbcShaderTranslator::WriteShaderCode() {
           dxbc::ResourceReturnTypeX4Token(dxbc::ResourceReturnType::kUInt),
           dxbc::Src::U(dxbc::Src::Dcl, uav_index_edram_, uint32_t(UAVRegister::kEdram),
                        uint32_t(UAVRegister::kEdram)));
+    } else if (i == uav_index_screen_extents_) {
+      shader_feature_info_.feature_flags[0] |= dxbc::kShaderFeature0_UAVsAtEveryStage;
+      ao_.OpDclUnorderedAccessViewRaw(0, dxbc::Src::U(dxbc::Src::Dcl, uav_index_screen_extents_,
+                                                      uint32_t(UAVRegister::kScreenExtents),
+                                                      uint32_t(UAVRegister::kScreenExtents)));
     } else {
       assert_unhandled_case(i);
     }

@@ -4293,7 +4293,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                   c(7), c(12), c(13), c(14), c(15), uint32_t(primitive_type), index_count, verts, ext[0], ext[1], ext[2], ext[3]);
       rex::cvar::SetFlagByName("ultrawide_pin_log", std::to_string(REXCVAR_GET(ultrawide_pin_log) - 1));
     }
-    if ((vs == 0xCB134112C994DF08ull || vs == 0x50BC47DED5DB7325ull || vs == 0x4607896AFDF26D1Bull) &&
+    if ((vs == 0xCB134112C994DF08ull || vs == 0x50BC47DED5DB7325ull || vs == 0x4607896AFDF26D1Bull ||
+         vs == 0x3A233AC80251CB6Aull) &&
         frontbuffer_width && regs.Get<reg::RB_SURFACE_INFO>().surface_pitch >= frontbuffer_width) {
       float e[4];
       const bool full_screen =
@@ -4304,9 +4305,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if ((REXCVAR_GET(ultrawide_squeeze) != 1.0 || REXCVAR_GET(tall_squeeze) != 1.0) && is_rasterization_done) {
     const uint32_t frontbuffer_width = rex::perf::GetRenderInfo().frontbuffer_width;
     const uint64_t vs_hash = vertex_shader->ucode_data_hash();
-    // (4607...: text and the HUD's numbers, e.g. the score and the radio's.)
+    // (4607...: text and the HUD's numbers, e.g. the score and the radio's.
+    // 3A23...: the score's second layer, the yellow of a banked score:
+    // unsqueezed it sat off the pink one, a second score over the first.)
     const bool ui_shader = vs_hash == 0xCB134112C994DF08ull || vs_hash == 0x50BC47DED5DB7325ull ||
-                           vs_hash == 0x4607896AFDF26D1Bull;
+                           vs_hash == 0x4607896AFDF26D1Bull || vs_hash == 0x3A233AC80251CB6Aull;
     // Amped 3's pre-rendered videos (attract, intro, title background): kept
     // 16:9, with bars (squeezing their quads doesn't work: they're drawn in
     // more than one pass).

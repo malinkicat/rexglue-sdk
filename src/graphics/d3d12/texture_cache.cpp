@@ -410,6 +410,7 @@ D3D12TextureCache::D3D12TextureCache(const RegisterFile& register_file,
       bindless_resources_used_(bindless_resources_used) {}
 
 D3D12TextureCache::~D3D12TextureCache() {
+  StopReplacement();
   shared_memory().SetBeforeRangesRequestedCallback(nullptr);
   pending_direct_resolves_.clear();
   // While the texture descriptor cache still exists (referenced by

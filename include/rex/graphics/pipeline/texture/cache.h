@@ -186,6 +186,11 @@ class TextureCache {
   }
 
  protected:
+  // A backend's destructor calls this first: the replacement's background
+  // threads call back into the backend (PrepareReplacementUploadImpl), so
+  // they're stopped before any of the backend's state goes.
+  void StopReplacement() { replacement_.reset(); }
+
   struct TextureKey {
     // Dimensions minus 1 are stored similarly to how they're stored in fetch
     // constants so fewer bits can be used, while the maximum size (8192 for 2D)

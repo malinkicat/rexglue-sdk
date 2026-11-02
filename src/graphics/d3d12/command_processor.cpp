@@ -4345,6 +4345,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       ultrawide_draw_ = false;
       return true;
     }
+    // UI covering the whole frame (the fades and flashes of a wipeout or a
+    // reset) covers the whole screen: squeezed, it darkened only the 16:9
+    // band, and the strips above and below flickered like bars.
+    if (have_extents && e[0] <= -0.95f && e[1] >= 0.95f && e[2] <= -0.95f && e[3] >= 0.95f) {
+      ultrawide_draw_ = false;
+      ultrawide_ui_draw_ = false;
+    }
     // The HUD at the screen's edges while riding (the game sets the flag):
     // a sprite whose middle lands in the left / right third of the frame
     // (c0.w, the matrix's origin, if its vertices can't be read).

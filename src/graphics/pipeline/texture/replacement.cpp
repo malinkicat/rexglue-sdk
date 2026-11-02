@@ -1704,14 +1704,16 @@ bool TextureReplacement::FindReplacementSize(uint64_t content_hash, uint32_t& wi
     if (!preload_started_) {
       StartPreload();
     }
+    // A failure (also one marked after decoding, e.g. its upload failed) wins
+    // over decoded pixels: the original texture is used.
+    if (failed_cache_.count(content_hash)) {
+      return false;
+    }
     auto cached = pixel_cache_.find(content_hash);
     if (cached != pixel_cache_.end()) {
       width = cached->second.width;
       height = cached->second.height;
       return width && height;
-    }
-    if (failed_cache_.count(content_hash)) {
-      return false;
     }
     auto size = size_cache_.find(content_hash);
     if (size != size_cache_.end()) {
@@ -2220,6 +2222,10 @@ const TextureReplacementData* TextureReplacement::FindReplacement(uint64_t conte
                   content_hash);
     }
 
+    // Known failure (also after decoding, e.g. a failed upload) - don't retry.
+    if (failed_cache_.count(content_hash)) {
+      return nullptr;
+    }
     auto cached = pixel_cache_.find(content_hash);
     if (cached != pixel_cache_.end()) {
       auto use = pixel_cache_use_.find(content_hash);

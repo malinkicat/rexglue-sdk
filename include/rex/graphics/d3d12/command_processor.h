@@ -668,6 +668,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   // and the UI's sprites on the frame-wide surface, not full-screen passes).
   bool ultrawide_draw_ = false;
   bool video_frame_ = false;  // a pre-rendered video drawn this frame (letterboxed)
+  // This frame drew the loading screens' picture shader / scene geometry (a
+  // loading screen = the picture without the scene).
+  bool picture_frame_ = false;
+  bool scene_frame_ = false;
   bool ui_scale_draw_ = false;           // --ui_scale applies to this draw
   bool presenter_video_frame_ = false;  // the frame being swapped is one
   // With --ultrawide_hud_pin, a UI sprite's side (-1 left, 1 right, 0 middle,

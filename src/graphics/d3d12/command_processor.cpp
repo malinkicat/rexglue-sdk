@@ -2524,6 +2524,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     // A video's frames don't all draw it (decoding lags now and then): it has
     // ended after 30 frames without.
     static int frames_without_video = 0;
+    if (picture_frame_ && !scene_frame_) video_frame_ = true;  // a loading screen
+    picture_frame_ = scene_frame_ = false;
     frames_without_video = video_frame_ ? 0 : frames_without_video + 1;
     const bool video = video_frame_ || (video_shown && frames_without_video < 30);
     video_frame_ = video;
@@ -4319,6 +4321,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     const bool scene_geometry = depth_control.z_enable && depth_control.zfunc != xenos::CompareFunction::kAlways;
     // A frame showing a video is presented letterboxed instead, unsqueezed.
     if (video_shader) video_frame_ = true;
+    // A loading screen (its picture, 84E84A..., in a frame without 3D) too, so
+    // it keeps 16:9 between the menus' and the story's videos instead of going
+    // from bars to stretched and back. (The game draws that shader in rides
+    // as well, with the scene.)
+    if (vs_hash == 0x84E84A34660A2FD1ull) picture_frame_ = true;
+    if (scene_geometry) scene_frame_ = true;
     // (Also while the last frame was one: the title screen draws its UI
     // before its moving background.)
     ultrawide_draw_ = !video_frame_ && !presenter_video_frame_ && frontbuffer_width &&

@@ -155,6 +155,8 @@ class TextureReplacement {
   // Whether there's a replacement for the hash, and its size - from the file's
   // header, without decoding it. The same as FindReplacement's width and
   // height when that succeeds.
+  // The replacement is a JPEG (opaque): wrong for a texture with alpha.
+  bool IsJpeg(uint64_t content_hash) const;
   bool FindReplacementSize(uint64_t content_hash, uint32_t& width, uint32_t& height) const;
   // A replacement that couldn't be used (e.g. a format the GPU upload doesn't
   // take): it isn't offered again, so the original texture is used.

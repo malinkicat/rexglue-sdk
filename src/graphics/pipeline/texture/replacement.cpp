@@ -1680,6 +1680,12 @@ void TextureReplacement::MarkFailed(uint64_t content_hash) const {
   size_cache_.erase(content_hash);
 }
 
+bool TextureReplacement::IsJpeg(uint64_t content_hash) const {
+  std::lock_guard<std::mutex> lock(cache_mutex_);
+  const auto it = replacements_.find(content_hash);
+  return it != replacements_.end() && LowerASCII(it->second.extension().string()) == ".jpg";
+}
+
 bool TextureReplacement::FindReplacementSize(uint64_t content_hash, uint32_t& width,
                                              uint32_t& height) const {
   // The program's own replacements first, also without a texture pack.

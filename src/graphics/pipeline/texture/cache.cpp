@@ -1306,8 +1306,23 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
       // Only the size here - the pixels are decoded when the texture is
       // loaded (and may have been dropped from RAM since).
       uint32_t replacement_width = 0, replacement_height = 0;
-      if (replacement_->FindReplacementSize(replacement_content_hash, replacement_width,
-                                            replacement_height)) {
+      // A JPEG (no alpha) can't stand in for a texture with alpha: its clear
+      // parts would draw black (packs made before the loading screen's
+      // "loading" label was kept as PNG). The game's own texture is used.
+      using TF = xenos::TextureFormat;
+      const bool guest_alpha = key.format == TF::k_DXT2_3 || key.format == TF::k_DXT4_5 ||
+                               key.format == TF::k_8_8_8_8 || key.format == TF::k_4_4_4_4 ||
+                               key.format == TF::k_1_5_5_5 || key.format == TF::k_2_10_10_10;
+      bool jpeg_for_alpha = false;
+      if (guest_alpha && replacement_->IsJpeg(replacement_content_hash)) {
+        jpeg_for_alpha = true;
+        static std::unordered_set<uint64_t> logged_jpeg;
+        if (logged_jpeg.size() < 64 && logged_jpeg.insert(replacement_content_hash).second) {
+          REXLOG_INFO("TextureReplacement: {:016x}.jpg not used: the texture has alpha", replacement_content_hash);
+        }
+      }
+      if (!jpeg_for_alpha && replacement_->FindReplacementSize(replacement_content_hash, replacement_width,
+                                                               replacement_height)) {
         // The key holds up to 8192 per side (bigger images are given at that
         // size already - TextureReplacement::FitReplacementSize).
         const uint32_t max_size = std::min(GetMaxHostTextureWidthHeight(key.dimension),

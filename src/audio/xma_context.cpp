@@ -673,7 +673,17 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA* 
                       (TitleSongStream(id(), music_stream) || TitleBackgroundStream(id(), music_stream)));
   const uint8_t* out = (muted ? silence.data() : raw_frame_.data()) + kOutputBytesPerBlock * raw_frame_read_offset;
   const int title_volume = std::clamp(REXCVAR_GET(title_music_volume), 0, 100);
-  if (!muted && music_stream && title_volume < 100) {
+  // The music volume for what's known to be music: the title's songs, its
+  // background music and its event music - not every large stereo stream
+  // (IsMusicStream's guess also takes the narration, Grover.xwb, streamed in
+  // 160-packet stereo buffers: music volume 0 silenced it).
+  const bool volume_applies =
+      title_volume < 100 &&
+      (TitleSongStream(id(), music_stream) || TitleBackgroundStream(id(), music_stream) ||
+       (data->IsCurrentInputBufferValid() &&
+        IsTitleEventMusicBuffer(data->GetCurrentInputBufferAddress(),
+                                data->GetCurrentInputBufferPacketCount() * kBytesPerPacket)));
+  if (!muted && volume_applies) {
     // The title's songs at --title_music_volume (16-bit big-endian PCM).
     std::array<uint8_t, kBytesPerFrameChannel * 2> scaled;
     const size_t bytes = std::min(scaled.size(), size_t(subframes_to_write) * kOutputBytesPerBlock);

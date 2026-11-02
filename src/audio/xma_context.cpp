@@ -121,7 +121,9 @@ bool IsMusicStream(uint32_t id, const XMA_CONTEXT_DATA& data) {
       song = true;
     }
     if (song && !was_song) {
-      if (MixMode() || REXCVAR_GET(xma_stream_log)) REXAPU_INFO("XmaContext {}: title song starts ({} packets)", id, current_packets);
+      // Always logged (once a song): whether your music has it silenced.
+      REXAPU_INFO("XmaContext {}: title song starts ({} packets){}", id, current_packets,
+                  UserMusicReplacingTitleMusic() ? " - silenced, your music replaces it" : "");
       TitleMusicStreamStarted();
     } else if (was_song && !song && REXCVAR_GET(xma_stream_log)) {
       REXAPU_INFO("XmaContext {}: title song ends ({} packets at {:08X})", id, current_packets, address);

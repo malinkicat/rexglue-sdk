@@ -15,6 +15,8 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <mutex>
+#include <optional>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -710,7 +712,10 @@ class TextureCache {
   // up for (a replacement's original is decoded in the colours it shows).
   uint32_t replacement_lookup_swizzle_ = 0x688;  // XYZW
 
+  // From memory watch callbacks (guest CPU threads) as well as the graphics
+  // thread's lookups: base_page_hash_cache_ is only touched under its mutex.
   void InvalidateHashCache(uint32_t base_page) {
+    std::lock_guard lock(base_page_hash_cache_mutex_);
     base_page_hash_cache_.erase(base_page);
   }
 
@@ -734,6 +739,7 @@ class TextureCache {
     uint64_t hash;
   };
   std::unordered_map<uint32_t, CachedContentHash> base_page_hash_cache_;
+  std::mutex base_page_hash_cache_mutex_;
   // The key each lookup's original key resolved to (the replacement's, or
   // its own when there's none), while that texture exists and its memory
   // hasn't been written: saves fingerprinting the guest data on every

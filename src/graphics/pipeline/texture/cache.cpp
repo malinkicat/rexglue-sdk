@@ -1268,7 +1268,13 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
           TextureReplacement::FingerprintGuestData(guest_bytes, guest_size);
       const uint64_t layout = ReplacementLayoutSignature(original_guest_layout, key.dimension,
                                                          key.format, key.tiled != 0);
-      auto cached_hash = base_page_hash_cache_.find(base_page);
+      std::optional<CachedContentHash> cached_hash;
+      {
+        std::lock_guard lock(base_page_hash_cache_mutex_);
+        if (auto it = base_page_hash_cache_.find(base_page); it != base_page_hash_cache_.end()) {
+          cached_hash = it->second;
+        }
+      }
 
       rex::perf::TextureCacheStats& stats = rex::perf::GetTextureCacheStats();
       stats.replacement_lookups.fetch_add(1, std::memory_order_relaxed);
@@ -1283,18 +1289,18 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
           lookups = l, hashes = h, hash_ns = n;
         }
       }
-      if (cached_hash != base_page_hash_cache_.end() &&
-          cached_hash->second.size == guest_size &&
-          cached_hash->second.fingerprint == fingerprint &&
-          cached_hash->second.layout == layout) {
-        replacement_content_hash = cached_hash->second.hash;
+      if (cached_hash && cached_hash->size == guest_size && cached_hash->fingerprint == fingerprint &&
+          cached_hash->layout == layout) {
+        replacement_content_hash = cached_hash->hash;
       } else {
         const auto hash_start = std::chrono::steady_clock::now();
         replacement_content_hash =
             HashReplacementBase(original_guest_layout, key.dimension, key.format, key.tiled != 0,
                                 guest_bytes, guest_size);
-        base_page_hash_cache_[base_page] = {guest_size, fingerprint, layout,
-                                            replacement_content_hash};
+        {
+          std::lock_guard lock(base_page_hash_cache_mutex_);
+          base_page_hash_cache_[base_page] = {guest_size, fingerprint, layout, replacement_content_hash};
+        }
         stats.replacement_hashes.fetch_add(1, std::memory_order_relaxed);
         stats.replacement_hash_ns.fetch_add(
             uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(

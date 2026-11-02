@@ -117,7 +117,8 @@ class Decoder {
       channels_ = uint32_t(info.channels);
       rate_ = info.sample_rate;
     } else {
-      if (vorbis_file_) std::fclose(vorbis_file_);
+      // An .ogg that stb_vorbis couldn't open is already closed by it (it was
+      // given the file to close); closing it again could crash.
       vorbis_file_ = nullptr;
       return false;
     }
@@ -197,9 +198,7 @@ std::string TrackTitle(const std::filesystem::path& path) {
           VorbisComment(comments.comment_list[i], std::strlen(comments.comment_list[i]), title, artist);
         }
         stb_vorbis_close(v);
-      } else {
-        std::fclose(f);
-      }
+      }  // else stb_vorbis has closed f already (it was given it to close)
     }
   } else if (ext == ".flac" || ext == ".FLAC") {
     struct Tags {
@@ -483,8 +482,10 @@ class Player {
 };
 
 Player& GetPlayer() {
-  static Player player;
-  return player;
+  // Never destroyed: its thread (detached) runs until the process ends, and
+  // static destruction at exit would pull its tracks and buffers away from it.
+  static Player* player = new Player;
+  return *player;
 }
 
 // --user_music as a number, kept by a change callback: it's read on the audio,

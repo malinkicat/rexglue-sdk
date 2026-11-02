@@ -530,6 +530,8 @@ uint32_t external_counter = 0;
 
 }  // namespace
 
+extern std::atomic<bool> title_owns_music;  // below
+
 bool MixMode() { return CurrentMode() == kMix; }
 
 uint32_t GetMutedVoiceCategories() {
@@ -539,6 +541,25 @@ uint32_t GetMutedVoiceCategories() {
     if (GetPlayer().Playing() && !GetPlayer().Paused()) {
       muted |= uint32_t(REXCVAR_GET(user_music_categories));
     }
+  }
+  // Another player (--user_music=system) playing: the title's music voices are
+  // muted too. Telling the title isn't enough: it only checks when its next
+  // song starts, so a song already playing (e.g. the source switched in its
+  // menus mid-song) would play on under the other player.
+  if (System()) {
+    bool external;
+    {
+      std::lock_guard<std::mutex> lock(external_mutex);
+      external = external_playing;
+    }
+    const bool mute = external && !title_owns_music;
+    static bool was_muted = false;
+    if (mute != was_muted) {
+      was_muted = mute;
+      REXLOG_INFO("user_music: the other player {} - the title's music voices {}",
+                  external ? "plays" : "stopped", mute ? "muted" : "back");
+    }
+    if (mute) muted |= uint32_t(REXCVAR_GET(user_music_categories));
   }
   // The player's own music starting or running out (checked each audio frame).
   if (Enabled()) NotifyTitleMusicChanged();

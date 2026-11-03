@@ -71,6 +71,13 @@ void SetDrawResolutionScale(uint32_t x, uint32_t y, uint32_t requested_x, uint32
   g_requested_scale_y.store(requested_y, std::memory_order_relaxed);
 }
 
+namespace {
+std::atomic<uint64_t> g_last_display_flip{0};
+}  // namespace
+
+void RecordDisplayFlip(uint64_t guest_tick) { g_last_display_flip.store(guest_tick, std::memory_order_relaxed); }
+uint64_t LastDisplayFlip() { return g_last_display_flip.load(std::memory_order_relaxed); }
+
 RenderInfo GetRenderInfo() {
   RenderInfo info;
   info.frontbuffer_width = g_frontbuffer_width.load(std::memory_order_relaxed);

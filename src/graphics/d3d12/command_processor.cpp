@@ -16,6 +16,10 @@
 #include <cfloat>
 #include <cmath>
 #include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <bit>
 #include <chrono>
 #include <map>
@@ -63,6 +67,13 @@ REXCVAR_DEFINE_BOOL(ultrawide_hud_clip, false, "GPU",
                     "With ultrawide_squeeze: the UI is clipped to the 16:9 frame, as on a 16:9 screen "
                     "(set by the game while riding: HUD sliding in stays out of the sides; menus' art "
                     "may run into them)");
+REXCVAR_DEFINE_BOOL(d3d12_gpu_done_log, false, "GPU",
+                    "Debug: gpudone.csv - when the GPU finished each frame (its closing submission's fence), "
+                    "on the steady clock (as swaptimes.csv's steady_ns and present_log.csv)");
+REXCVAR_DEFINE_INT32(d3d12_queued_frames, 3, "GPU",
+                     "How many frames the GPU may run behind the game (1-3): fewer keeps each frame "
+                     "finished sooner after it's handed over, for vsync presents that must make their refresh "
+                     "(the Steam Deck's GPU clocks just high enough to keep a full backlog)");
 REXCVAR_DEFINE_DOUBLE(tall_squeeze, 1.0, "GPU",
                       "Squeeze the scene and UI vertically by this factor (the screen's aspect / 16:9, "
                       "e.g. 0.9 for 16:10) with present_letterbox=false: a taller view instead of bars; 1 = off");
@@ -112,6 +123,47 @@ const char* const kDrawTimingNames[kDrawTimingCount] = {
 uint64_t g_draw_timing[kDrawTimingCount];
 uint64_t g_amped3_copy_tsc;
 }  // namespace
+namespace {
+// --d3d12_gpu_done_log: a thread waits for each frame's closing fence value
+// and notes when it completed.
+std::mutex g_gpu_done_mutex;
+std::condition_variable g_gpu_done_cv;
+std::deque<uint64_t> g_gpu_done_queue;
+bool g_gpu_done_started = false;
+void LogGpuDone(ID3D12Fence* fence, uint64_t value) {
+  std::lock_guard<std::mutex> lock(g_gpu_done_mutex);
+  if (!g_gpu_done_started) {
+    g_gpu_done_started = true;
+    fence->AddRef();
+    std::thread([fence] {
+      HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+      std::FILE* file = std::fopen("gpudone.csv", "w");
+      if (!file || !event) return;
+      std::fputs("fence,steady_ns\n", file);
+      for (uint64_t n = 1;; ++n) {
+        uint64_t value;
+        {
+          std::unique_lock<std::mutex> wait_lock(g_gpu_done_mutex);
+          g_gpu_done_cv.wait(wait_lock, [] { return !g_gpu_done_queue.empty(); });
+          value = g_gpu_done_queue.front();
+          g_gpu_done_queue.pop_front();
+        }
+        if (fence->GetCompletedValue() < value && SUCCEEDED(fence->SetEventOnCompletion(value, event))) {
+          WaitForSingleObject(event, 1000);
+        }
+        std::fprintf(file, "%llu,%lld\n", (unsigned long long)value,
+                     (long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                         .count());
+        if (n % 120 == 0) std::fflush(file);
+      }
+    }).detach();
+  }
+  g_gpu_done_queue.push_back(value);
+  g_gpu_done_cv.notify_one();
+}
+}  // namespace
+
 namespace rex::graphics::d3d12 {
 extern uint64_t g_amped3_upload_valid_tsc, g_amped3_upload_copy_tsc, g_amped3_upload_pages,
     g_amped3_upload_calls;
@@ -5972,8 +6024,14 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   // Check the fence - needed for all kinds of submissions (to reclaim transient
   // resources early) and specifically for frames (not to queue too many), and
   // await the availability of the current frame.
-  CheckSubmissionFence(is_opening_frame ? closed_frame_submissions_[frame_current_ % kQueueFrames]
-                                        : 0);
+  uint64_t await_submission = is_opening_frame ? closed_frame_submissions_[frame_current_ % kQueueFrames] : 0;
+  // --d3d12_queued_frames below 3: also wait for the frame that many frames ago.
+  const uint64_t queued_frames = uint64_t(std::clamp(REXCVAR_GET(d3d12_queued_frames), 1, int32_t(kQueueFrames)));
+  if (is_opening_frame && queued_frames < kQueueFrames && frame_current_ >= queued_frames) {
+    await_submission =
+        std::max(await_submission, closed_frame_submissions_[(frame_current_ - queued_frames) % kQueueFrames]);
+  }
+  CheckSubmissionFence(await_submission);
   // TODO(Triang3l): If failed to await (completed submission < awaited frame
   // submission), do something like dropping the draw command that wanted to
   // open the frame.
@@ -6195,6 +6253,7 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     frame_open_ = false;
     // Submission already closed now, so minus 1.
     closed_frame_submissions_[(frame_current_++) % kQueueFrames] = submission_current_ - 1;
+    if (REXCVAR_GET(d3d12_gpu_done_log)) LogGpuDone(submission_fence_, submission_current_ - 1);
 
     if (cache_clear_requested_ && AwaitAllQueueOperationsCompletion()) {
       cache_clear_requested_ = false;

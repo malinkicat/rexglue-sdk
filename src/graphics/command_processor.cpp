@@ -1673,7 +1673,7 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
     const uint64_t now = rex::chrono::Clock::QueryHostTickCount();
     const double freq = double(rex::chrono::Clock::QueryHostTickFrequency());
     if (!csv && (csv = std::fopen("swaptimes.csv", "w"))) {
-      std::fputs("time_s,frame_ms,since_vblank_ms,mark_ms,interrupt_done_ms\n", csv);
+      std::fputs("time_s,frame_ms,since_vblank_ms,mark_ms,interrupt_done_ms,steady_ns\n", csv);
       first = last = now;
     }
     if (csv) {
@@ -1681,10 +1681,13 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
       const uint64_t guest_now = rex::chrono::Clock::QueryGuestTickCount();
       const double guest_ms = 1000.0 / rex::chrono::Clock::guest_tick_frequency();
       const auto since = [&](uint64_t t) { return t ? (int64_t(t) - int64_t(vblank)) * guest_ms : -1.0; };
-      std::fprintf(csv, "%.5f,%.3f,%.3f,%.3f,%.3f\n", (now - first) / freq,
+      std::fprintf(csv, "%.5f,%.3f,%.3f,%.3f,%.3f,%lld\n", (now - first) / freq,
                    (now - last) * 1000.0 / freq, since(guest_now),
                    since(g_vblank_mark_tick.load(std::memory_order_relaxed)),
-                   since(g_vblank_done_tick.load(std::memory_order_relaxed)));
+                   since(g_vblank_done_tick.load(std::memory_order_relaxed)),
+                   (long long)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       std::chrono::steady_clock::now().time_since_epoch())
+                       .count());
       last = now;
       if (++n % 120 == 0) std::fflush(csv);
     }

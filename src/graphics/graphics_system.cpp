@@ -12,6 +12,8 @@
 #include <rex/graphics/graphics_system.h>
 
 #include <algorithm>
+
+#include <rex/perf/frame_rate.h>
 #include <atomic>
 #include <cctype>
 #include <cstdint>
@@ -48,6 +50,12 @@ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU",
     .allowed({"none", "fxaa", "fxaa_extreme", "smaa"})
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(vblank_lock_display, false, "GPU",
+                    "Lock the guest's vblank timer to the display's refreshes in rate and phase (needs "
+                    "--d3d12_present_vsync and --d3d12_flip_watch, which time them): the game's frames then "
+                    "reach the screen evenly instead of beating against its refresh (Proton / gamescope)");
+REXCVAR_DEFINE_INT32(vblank_lock_offset_us, 0, "GPU",
+                     "With --vblank_lock_display: where the guest vblank sits after a display refresh");
 REXCVAR_DEFINE_INT32(vblank_spin_us, 2000, "GPU",
                      "Wake this many microseconds before each guest vblank and spin to it "
                      "(frames that flip on vblanks are only as even as the vblanks)");
@@ -187,6 +195,15 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
         uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
+        const uint64_t nominal_interval_ticks = vsync_interval_ticks;
+        const int64_t nominal_ns = int64_t(1e9 / refresh_rate_hz);
+        struct {
+          uint64_t last_stamp = 0;
+          int64_t gaps[64] = {};
+          int count = 0;
+          int64_t abs_error_sum = 0;
+          uint64_t logged = 0;
+        } lock;
 #ifdef _WIN32
         HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr,
                                               CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
@@ -196,14 +213,72 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
           uint64_t interval_ticks =
               REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
-          while (current_time - last_frame_time >= interval_ticks) {
+          // (Signed: the display lock's nudge can put the last vblank a little
+          // after `now`; unsigned, that wrapped into an endless catch-up.)
+          while (int64_t(current_time - last_frame_time) >= int64_t(interval_ticks)) {
             g_last_vblank_tick.store(last_frame_time + interval_ticks, std::memory_order_relaxed);
             MarkVblank();
             last_frame_time += interval_ticks;
           }
+          // Locked to the display (--vblank_lock_display, with vsync presents
+          // timing the flips): the vblanks run at the display's measured
+          // refresh period (the median of the last 64 flip gaps, a 33 ms gap
+          // counting as two) and, once per flip, move a sixteenth of the way
+          // (at most 0.2 ms) towards its phase - after the catch-up above, so
+          // a nudge never makes two vblanks back to back. Without flips for
+          // 0.5 s: back to the guest's own rate.
+          if (REXCVAR_GET(vblank_lock_display) && REXCVAR_GET(vsync)) {
+            const uint64_t stamp = rex::perf::LastDisplayFlip();
+            const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now().time_since_epoch())
+                                       .count();
+            if (!stamp || now_ns - int64_t(stamp) > 500000000) {
+              vsync_interval_ticks = nominal_interval_ticks;
+              lock.count = 0;
+              lock.last_stamp = 0;
+            } else if (stamp != lock.last_stamp) {
+              if (lock.last_stamp) {
+                const int64_t gap = int64_t(stamp - lock.last_stamp);
+                if (gap > nominal_ns / 2) {  // (the waitable's first signals come at once)
+                  const int64_t k = (gap + nominal_ns / 2) / nominal_ns;
+                  if (k >= 1 && k <= 4) lock.gaps[lock.count++ % 64] = gap / k;
+                }
+              }
+              lock.last_stamp = stamp;
+              int64_t period_ns = nominal_ns;
+              if (lock.count >= 16) {
+                const int n = std::min(lock.count, 64);
+                int64_t sorted[64];
+                std::copy(lock.gaps, lock.gaps + n, sorted);
+                std::nth_element(sorted, sorted + n / 2, sorted + n);
+                period_ns = std::clamp(sorted[n / 2], nominal_ns * 99 / 100, nominal_ns * 101 / 100);
+                vsync_interval_ticks = uint64_t(double(period_ns) * double(guest_tick_frequency) / 1e9);
+              }
+              const uint64_t now_ticks = chrono::Clock::QueryGuestTickCount();
+              const uint64_t flip =
+                  now_ticks - uint64_t(double(now_ns - int64_t(stamp)) * double(guest_tick_frequency) / 1e9);
+              const int64_t period = int64_t(vsync_interval_ticks);
+              const int64_t offset =
+                  int64_t(guest_tick_frequency) * REXCVAR_GET(vblank_lock_offset_us) / 1000000;
+              int64_t error = (int64_t(last_frame_time) - int64_t(flip) - offset) % period;
+              if (error > period / 2) error -= period;
+              if (error < -period / 2) error += period;
+              const int64_t limit = int64_t(guest_tick_frequency) / 5000;  // 0.2 ms
+              last_frame_time -= uint64_t(std::clamp(error / 16, -limit, limit));
+              // Every 600 flips (10 s): the display's measured rate and the phase error.
+              const double us = 1e6 / double(guest_tick_frequency);
+              lock.abs_error_sum += error < 0 ? -error : error;
+              if (++lock.logged % 600 == 0) {
+                REXGPU_INFO("vblank lock: display {:.4f} Hz (median of {} gaps), phase error avg {:.0f} us",
+                            1e9 / double(period_ns), std::min(lock.count, 64), lock.abs_error_sum / 600 * us);
+                lock.abs_error_sum = 0;
+              }
+            }
+          }
           g_next_vblank_tick.store(REXCVAR_GET(vsync) ? last_frame_time + interval_ticks : 0,
                                    std::memory_order_relaxed);
-          const uint64_t remaining = last_frame_time + interval_ticks - current_time;
+          const uint64_t remaining =
+              uint64_t(std::max<int64_t>(0, int64_t(last_frame_time + interval_ticks - current_time)));
           // Spin only for real vblanks; with vsync off they come every 1 ms and
           // spinning half of each would keep a core busy.
           // Wake this long before a vblank and spin the rest, for timer slack.

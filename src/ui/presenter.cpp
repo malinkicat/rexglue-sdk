@@ -1382,7 +1382,12 @@ Presenter::PaintMode Presenter::GetDesiredPaintModeFromUIThread(bool is_paintabl
   // the thread making the guest output never waits for the display (on the
   // Deck: 1% low 29 -> 40 at 45 shown as 90).
   static const bool frame_generation = rex::cvar::GetFlagByName("frame_generation") == "true";
-  if (!REXCVAR_GET(host_present_from_non_ui_thread) || frame_generation) {
+  // Vsync presents (--d3d12_present_vsync) wait for the display too: on the
+  // submission thread a waiting present held back the game's GPU work and,
+  // through the refresh tail, the command processor (on the Deck: a 33 ms
+  // frame every 1-2 s; here 1 in 2400).
+  static const bool vsync_present = rex::cvar::GetFlagByName("d3d12_present_vsync") == "true";
+  if (!REXCVAR_GET(host_present_from_non_ui_thread) || frame_generation || vsync_present) {
     return PaintMode::kUIThreadOnRequest;
   }
   if (surface_paint_connection_has_implicit_vsync_) {

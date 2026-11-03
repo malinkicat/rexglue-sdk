@@ -40,6 +40,13 @@ struct RenderInfo {
 };
 RenderInfo GetRenderInfo();
 
+// When the display last showed one of our frames (std::chrono::steady_clock
+// nanoseconds: one clock for every module; each DLL has its own guest clock),
+// from the presenter's frame latency waitable (--d3d12_present_vsync); 0 = never.
+// The guest vblank timer locks its phase to it (--vblank_lock_display).
+void RecordDisplayFlip(uint64_t guest_tick);
+uint64_t LastDisplayFlip();
+
 // Texture cache activity, for the perf_report debug command (totals since
 // startup; the reader takes differences). Written by the GPU thread.
 struct TextureCacheStats {

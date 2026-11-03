@@ -14,7 +14,10 @@
 #include <filesystem>
 #include <string>
 #include <vector>
+#include <atomic>
 #include <climits>
+#include <mutex>
+#include <thread>
 #include <cmath>
 #include <memory>
 #include <utility>
@@ -24,6 +27,8 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/chrono/clock.h>
+#include <rex/perf/frame_rate.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
 #include <rex/ui/d3d12/d3d12_util.h>
@@ -53,10 +58,85 @@ REXCVAR_DEFINE_INT32(frame_generation_dump, 0, "UI/D3D12",
                      "Debug: save the next N frame pairs (each generated frame, then the game's frame "
                      "after it) as BMP files in fgdump next to the executable; set it mid-game (the "
                      "scripted \"set\" command) to catch motion");
+REXCVAR_DEFINE_BOOL(d3d12_present_vsync, false, "UI/D3D12",
+                    "Present with vsync (sync interval 1, queued) instead of replacing the queued frame: "
+                    "every frame is shown once, in order, even when the game's 60 Hz isn't locked to the "
+                    "display's (Proton / gamescope: replacing dropped up to a sixth of the frames)");
+REXCVAR_DEFINE_BOOL(d3d12_flip_watch, false, "UI/D3D12",
+                    "Time the display's flips of our frames (the swap chain's frame latency waitable) for "
+                    "--vblank_lock_display, with or without --d3d12_present_vsync");
+REXCVAR_DEFINE_BOOL(d3d12_present_log, false, "UI/D3D12",
+                    "Debug: present_log.csv - each present's start and duration and each display flip "
+                    "(--d3d12_flip_watch), on the steady clock that swaptimes.csv's steady_ns uses");
 REXCVAR_DEFINE_BOOL(d3d12_allow_variable_refresh_rate_and_tearing, true, "UI/D3D12",
                     "Allow variable refresh rate and tearing");
 
 namespace rex::ui::d3d12 {
+
+// --d3d12_present_vsync: the swap chain's frame latency waitable is signalled
+// as each presented frame reaches the display; a thread waits on it and notes
+// the time (rex::perf::RecordDisplayFlip) for the guest vblank timer to lock
+// to. File-scope, not presenter members (the game is built against the stock
+// SDK's class layouts).
+namespace {
+std::thread g_flip_watch;
+std::atomic<bool> g_flip_watch_run{false};
+HANDLE g_flip_waitable = nullptr;
+bool g_swap_chain_waitable = false;  // created with the waitable flag
+
+// --d3d12_present_log: "present,<start ns>,<duration ns>" / "flip,<ns>" lines.
+int64_t SteadyNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+void PresentLog(const char* kind, int64_t a, int64_t b) {
+  static std::mutex mutex;
+  static std::FILE* file = nullptr;
+  static uint64_t lines = 0;
+  std::lock_guard<std::mutex> lock(mutex);
+  if (!file && !(file = std::fopen("present_log.csv", "w"))) return;
+  std::fprintf(file, "%s,%lld,%lld\n", kind, (long long)a, (long long)b);
+  if (++lines % 120 == 0) std::fflush(file);
+}
+
+void StopFlipWatch() {
+  g_flip_watch_run.store(false);
+  if (g_flip_watch.joinable()) g_flip_watch.join();
+  if (g_flip_waitable) {
+    CloseHandle(g_flip_waitable);
+    g_flip_waitable = nullptr;
+  }
+}
+
+void StartFlipWatch(IDXGISwapChain* swap_chain) {
+  StopFlipWatch();
+  Microsoft::WRL::ComPtr<IDXGISwapChain2> swap_chain_2;
+  if (FAILED(swap_chain->QueryInterface(IID_PPV_ARGS(&swap_chain_2)))) return;
+  swap_chain_2->SetMaximumFrameLatency(2);
+  g_flip_waitable = swap_chain_2->GetFrameLatencyWaitableObject();
+  if (!g_flip_waitable) return;
+  g_flip_watch_run.store(true);
+  g_flip_watch = std::thread([handle = g_flip_waitable] {
+    while (g_flip_watch_run.load(std::memory_order_relaxed)) {
+      const DWORD r = WaitForSingleObject(handle, 100);
+      static uint64_t flips = 0, timeouts = 0;
+      if (r == WAIT_OBJECT_0) {
+        const int64_t now_ns = SteadyNs();
+        rex::perf::RecordDisplayFlip(uint64_t(now_ns));
+        if (REXCVAR_GET(d3d12_present_log)) PresentLog("flip", now_ns, 0);
+        ++flips;
+      } else {
+        ++timeouts;
+      }
+      if ((flips + timeouts) % 300 == 0) {
+        REXLOG_INFO("D3D12Presenter: flip watch: {} flips, {} timeouts (last {})", flips, timeouts, r);
+      }
+    }
+  });
+  REXLOG_INFO("D3D12Presenter: vsync presents, display flips timed for the vblank lock");
+}
+}  // namespace
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -398,7 +478,8 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
     }
     bool swap_chain_resized = SUCCEEDED(paint_context_.swap_chain->ResizeBuffers(
         0, UINT(new_swap_chain_width), UINT(new_swap_chain_height), DXGI_FORMAT_UNKNOWN,
-        paint_context_.swap_chain_allows_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0));
+        (paint_context_.swap_chain_allows_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0) |
+            (g_swap_chain_waitable ? DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT : 0)));
     if (swap_chain_resized) {
       for (uint32_t i = 0; i < PaintContext::kSwapChainBufferCount; ++i) {
         if (FAILED(paint_context_.swap_chain->GetBuffer(
@@ -449,6 +530,10 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
     frame_generation_own =
         REXCVAR_GET(frame_generation) && REXCVAR_GET(frame_generation_present) == "own";
 #endif
+    // (Only for the flip timing: the waitable also limits the queue to 2
+    // frames, and a third absorbs a frame that just misses its refresh.)
+    g_swap_chain_waitable = REXCVAR_GET(d3d12_flip_watch) && !REXCVAR_GET(frame_generation);
+    if (g_swap_chain_waitable) swap_chain_desc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
     if (REXCVAR_GET(d3d12_allow_variable_refresh_rate_and_tearing) && dxgi_supports_tearing_ &&
         !frame_generation_own) {
       // Allow tearing in borderless fullscreen to support variable refresh
@@ -540,6 +625,7 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
     paint_context_.swap_chain_height = new_swap_chain_height;
     paint_context_.swap_chain_allows_tearing =
         (swap_chain_desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
+    if (g_swap_chain_waitable) StartFlipWatch(paint_context_.swap_chain.Get());
     for (uint32_t i = 0; i < PaintContext::kSwapChainBufferCount; ++i) {
       if (FAILED(paint_context_.swap_chain->GetBuffer(
               i, IID_PPV_ARGS(&paint_context_.swap_chain_buffers[i])))) {
@@ -1051,6 +1137,7 @@ void D3D12Presenter::PaintContext::DestroySwapChain() {
   if (!swap_chain) {
     return;
   }
+  StopFlipWatch();
   AwaitSwapChainUsageCompletion();
   for (Microsoft::WRL::ComPtr<ID3D12Resource>& swap_chain_buffer_ref : swap_chain_buffers) {
     swap_chain_buffer_ref.Reset();
@@ -1724,18 +1811,23 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   // fullscreen is ever used in, the allow tearing flag must not be passed in
   // fullscreen, but DXGI fullscreen is largely unneeded with the flip
   // presentation model used in Direct3D 12).
+  const int64_t present_start_ns = SteadyNs();
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   HRESULT present_result =
-      frame_generation_own
+      frame_generation_own || REXCVAR_GET(d3d12_present_vsync)
           ? paint_context_.swap_chain->Present(1, 0)
           : paint_context_.swap_chain->Present(
                 0, DXGI_PRESENT_RESTART |
                        (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
 #else
-  HRESULT present_result = paint_context_.swap_chain->Present(
-      0, DXGI_PRESENT_RESTART |
-             (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
+  HRESULT present_result =
+      REXCVAR_GET(d3d12_present_vsync)
+          ? paint_context_.swap_chain->Present(1, 0)
+          : paint_context_.swap_chain->Present(
+                0, DXGI_PRESENT_RESTART |
+                       (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
 #endif
+  if (REXCVAR_GET(d3d12_present_log)) PresentLog("present", present_start_ns, SteadyNs() - present_start_ns);
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   // Frame generation: the swap chain's real presents per second (ours plus the
   // generated ones), once every 2 s.

@@ -67,6 +67,16 @@ REXCVAR_DEFINE_BOOL(ultrawide_hud_clip, false, "GPU",
                     "With ultrawide_squeeze: the UI is clipped to the 16:9 frame, as on a 16:9 screen "
                     "(set by the game while riding: HUD sliding in stays out of the sides; menus' art "
                     "may run into them)");
+REXCVAR_DEFINE_BOOL(ui_squeeze_by_state, true, "GPU",
+                    "With ultrawide_squeeze / tall_squeeze: also squeeze every flat draw (no depth test) that "
+                    "has a pixel shader and the frame's viewport transform, not just the listed UI shaders, so HUD "
+                    "pieces and overlays on the squeezed scene (trail-map routes, challenge meters) found nowhere "
+                    "in the list still line up");
+REXCVAR_DEFINE_STRING(debug_skip_vs, "", "GPU",
+                      "Debug: skip draws with this vertex shader hash (hex), to see what it draws");
+REXCVAR_DEFINE_BOOL(ui_census, false, "GPU",
+                    "Debug: log once per shader pair drawing on the frame-wide surface: known UI shader, depth "
+                    "test, PA_CL_VTE_CNTL, blending and sprite extents (for telling HUD draws apart by state)");
 REXCVAR_DEFINE_BOOL(d3d12_gpu_done_log, false, "GPU",
                     "Debug: gpudone.csv - when the GPU finished each frame (its closing submission's fence), "
                     "on the steady clock (as swaptimes.csv's steady_ns and present_log.csv)");
@@ -4402,9 +4412,44 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     if (scene_geometry) scene_frame_ = true;
     // (Also while the last frame was one: the title screen draws its UI
     // before its moving background.)
+    {
+      static const uint64_t skip_vs = REXCVAR_GET(debug_skip_vs).empty()
+                                          ? 0
+                                          : std::strtoull(REXCVAR_GET(debug_skip_vs).c_str(), nullptr, 16);
+      if (skip_vs && vs_hash == skip_vs) return true;
+    }
+    // --ui_census: what sets HUD draws apart from the scene's, by state.
+    if (REXCVAR_GET(ui_census) && frontbuffer_width &&
+        regs.Get<reg::RB_SURFACE_INFO>().surface_pitch >= frontbuffer_width) {
+      static std::set<uint64_t> census_seen;
+      const uint64_t key = vs_hash ^ (pixel_shader ? pixel_shader->ucode_data_hash() * 31 : 0);
+      if (census_seen.insert(key).second) {
+        float ce[4] = {0, 0, 0, 0};
+        const int cv = UiSpriteExtents(*vertex_shader, ce);
+        const reg::PA_CL_VTE_CNTL vte = regs.Get<reg::PA_CL_VTE_CNTL>();
+        const reg::RB_BLENDCONTROL blend = regs.Get<reg::RB_BLENDCONTROL>(XE_GPU_REG_RB_BLENDCONTROL0);
+        const bool blending = blend.color_srcblend != xenos::BlendFactor::kOne ||
+                              blend.color_destblend != xenos::BlendFactor::kZero;
+        REXGPU_INFO("ui_census: vs {:016X} ps {:016X} ui {} video {} z {}/{} vte {:03X} blend {} verts {} ext {:.2f} "
+                    "{:.2f} {:.2f} {:.2f}",
+                    vs_hash, pixel_shader ? pixel_shader->ucode_data_hash() : 0, int(ui_shader), int(video_shader),
+                    uint32_t(depth_control.z_enable), uint32_t(depth_control.zfunc), vte.value, int(blending), cv,
+                    ce[0], ce[1], ce[2], ce[3]);
+      }
+    }
+    // Flat draws over the frame with its viewport transform (PA_CL_VTE_CNTL
+    // 0x43F: every HUD shader's state; full-screen copies use 0x300) and a
+    // pixel shader: squeezed too, like the listed UI shaders and the scene.
+    // Only the squeeze: the sprite-position handling below stays with the
+    // listed shaders, whose vertices it can read.
+    // (Not 84E84A...: a full-screen picture - the loading screens', and a copy
+    // over the whole frame in rides; squeezing full-screen passes breaks it.)
+    const bool flat_on_frame = REXCVAR_GET(ui_squeeze_by_state) && !scene_geometry && !video_shader &&
+                               vs_hash != 0x84E84A34660A2FD1ull && pixel_shader &&
+                               regs.Get<reg::PA_CL_VTE_CNTL>().value == 0x43F;
     ultrawide_draw_ = !video_frame_ && !presenter_video_frame_ && frontbuffer_width &&
                       regs.Get<reg::RB_SURFACE_INFO>().surface_pitch >= frontbuffer_width &&
-                      (scene_geometry || ui_shader);
+                      (scene_geometry || ui_shader || flat_on_frame);
     // The UI sprite's extents across the 16:9 frame (-1..1), from its
     // vertices: the UI vertex shaders place it with a 4x4 matrix in c0-c3,
     // and text sets its glyphs' positions in the vertices.

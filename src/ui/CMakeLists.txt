@@ -57,6 +57,7 @@ if(REXGLUE_USE_D3D12)
         d3d12/d3d12_descriptor_heap_pool.cpp
         d3d12/d3d12_immediate_drawer.cpp
         d3d12/d3d12_presenter.cpp
+        d3d12/vk_interop_present.cpp
         d3d12/d3d12_provider.cpp
         d3d12/d3d12_submission_tracker.cpp
         d3d12/d3d12_upload_buffer_pool.cpp
@@ -107,6 +108,7 @@ target_include_directories(rexui PRIVATE
     ${PROJECT_BINARY_DIR}/include  # Generated macOS Vulkan path data
     ${REXGLUE_ROOT}/src  # For ui/shaders/bytecode includes
     ${REXGLUE_ROOT}/thirdparty/stb  # stb_image.h for icon decoding
+    ${REXGLUE_ROOT}/thirdparty/vulkan-headers/include  # d3d12/vk_interop_present.cpp
 )
 
 target_link_libraries(rexui PUBLIC

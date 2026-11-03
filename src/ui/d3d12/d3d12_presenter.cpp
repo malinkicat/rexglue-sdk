@@ -32,6 +32,7 @@
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+#include <rex/ui/d3d12/vk_interop_present.h>
 #include <rex/ui/surface_win.h>
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
@@ -62,6 +63,9 @@ REXCVAR_DEFINE_BOOL(d3d12_present_vsync, false, "UI/D3D12",
                     "Present with vsync (sync interval 1, queued) instead of replacing the queued frame: "
                     "every frame is shown once, in order, even when the game's 60 Hz isn't locked to the "
                     "display's (Proton / gamescope: replacing dropped up to a sixth of the frames)");
+REXCVAR_DEFINE_BOOL(d3d12_present_vulkan, false, "UI/D3D12",
+                    "Under vkd3d-proton: present through our own Vulkan swap chain (in development: for now "
+                    "only probes and logs what vkd3d's Vulkan device offers)");
 REXCVAR_DEFINE_BOOL(d3d12_flip_watch, false, "UI/D3D12",
                     "Time the display's flips of our frames (the swap chain's frame latency waitable) for "
                     "--vblank_lock_display, with or without --d3d12_present_vsync");
@@ -547,6 +551,13 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
 #if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP | WINAPI_PARTITION_GAMES)
       case Surface::kTypeIndex_Win32Hwnd: {
         HWND surface_hwnd = static_cast<const Win32HwndSurface&>(new_surface).hwnd();
+        if (REXCVAR_GET(d3d12_present_vulkan)) {
+          static bool probed = false;
+          if (!probed) {
+            probed = true;
+            vk_interop::Probe(provider_.GetDevice(), direct_queue, surface_hwnd);
+          }
+        }
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
         if (frame_generation_own) {
           frame_generation_own_ = true;

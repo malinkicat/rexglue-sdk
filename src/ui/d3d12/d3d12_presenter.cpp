@@ -85,6 +85,17 @@ namespace rex::ui::d3d12 {
 namespace {
 std::thread g_flip_watch;
 std::atomic<bool> g_flip_watch_run{false};
+// --d3d12_present_vulkan: our own Vulkan swap chain on the game window; the
+// DXGI swap chain is then made for a hidden window and only painted into.
+vk_interop::Presenter g_vk_present;
+HWND g_vk_hidden_window = nullptr;
+HWND VkHiddenWindow() {
+  if (!g_vk_hidden_window) {
+    g_vk_hidden_window = CreateWindowExW(0, L"STATIC", L"ReAmped 3 paint target", WS_POPUP, 0, 0, 16, 16, nullptr,
+                                         nullptr, GetModuleHandleW(nullptr), nullptr);
+  }
+  return g_vk_hidden_window;
+}
 HANDLE g_flip_waitable = nullptr;
 bool g_swap_chain_waitable = false;  // created with the waitable flag
 
@@ -556,6 +567,17 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
           if (!probed) {
             probed = true;
             vk_interop::Probe(provider_.GetDevice(), direct_queue, surface_hwnd);
+          }
+          g_vk_present.Shutdown();
+          if (g_vk_present.Initialize(provider_.GetDevice(), surface_hwnd) && VkHiddenWindow()) {
+            g_vk_present.SetFlipCallback([] {
+              const int64_t now_ns = SteadyNs();
+              rex::perf::RecordDisplayFlip(uint64_t(now_ns));
+              if (REXCVAR_GET(d3d12_present_log)) PresentLog("flip", now_ns, 0);
+            });
+            surface_hwnd = g_vk_hidden_window;  // the DXGI swap chain only holds the painted image
+          } else {
+            g_vk_present.Shutdown();
           }
         }
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
@@ -1823,6 +1845,15 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   // fullscreen, but DXGI fullscreen is largely unneeded with the flip
   // presentation model used in Direct3D 12).
   const int64_t present_start_ns = SteadyNs();
+  if (g_vk_present.Active()) {
+    ID3D12Resource* painted =
+        paint_context_.swap_chain_buffers[paint_context_.swap_chain->GetCurrentBackBufferIndex()].Get();
+    const bool presented = g_vk_present.Present(painted, provider_.GetDirectQueue());
+    if (REXCVAR_GET(d3d12_present_log)) PresentLog("present", present_start_ns, SteadyNs() - present_start_ns);
+    if (!presented) REXLOG_WARN("D3D12Presenter: Vulkan present failed");
+    paint_context_.present_submission_tracker.NextSubmission();
+    return PaintResult::kPresented;
+  }
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   HRESULT present_result =
       frame_generation_own || REXCVAR_GET(d3d12_present_vsync)

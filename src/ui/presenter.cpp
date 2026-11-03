@@ -1392,7 +1392,8 @@ Presenter::PaintMode Presenter::GetDesiredPaintModeFromUIThread(bool is_paintabl
   // (--present_vsync_on_ui_thread=false keeps them on it: with a long vkd3d
   // latency queue they don't wait, and the swap chain copy then queues right
   // behind our frame instead of behind the next frame's draws.)
-  static const bool vsync_present = rex::cvar::GetFlagByName("d3d12_present_vsync") == "true" &&
+  static const bool vsync_present = (rex::cvar::GetFlagByName("d3d12_present_vsync") == "true" ||
+                                     rex::cvar::GetFlagByName("d3d12_present_vulkan") == "true") &&
                                     rex::cvar::GetFlagByName("present_vsync_on_ui_thread") != "false";
   if (!REXCVAR_GET(host_present_from_non_ui_thread) || frame_generation || vsync_present) {
     return PaintMode::kUIThreadOnRequest;

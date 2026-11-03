@@ -231,6 +231,10 @@ REXCVAR_DEFINE_BOOL(d3d12_present_on_submission_thread, true, "GPU/D3D12",
                     "frame's command lists), so the command processor doesn't wait for them "
                     "at swaps");
 
+REXCVAR_DEFINE_INT32(d3d12_submit_every_draws, 0, "GPU/D3D12",
+                     "Also submit the command list every N draws (0 = off): smaller submissions let a "
+                     "compositor sharing the GPU (gamescope on the Steam Deck) run its frame in between "
+                     "instead of waiting behind a whole frame of ours and missing the refresh");
 REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -4239,6 +4243,15 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     g_draw_timing_last = __rdtsc();
   }
   g_draw_timing_draws += REXCVAR_GET(d3d12_draw_timing);
+  // --d3d12_submit_every_draws: a submission boundary every N draws.
+  {
+    static uint32_t draws_since_submit = 0;
+    const int32_t every = REXCVAR_GET(d3d12_submit_every_draws);
+    if (every > 0 && ++draws_since_submit >= uint32_t(every)) {
+      draws_since_submit = 0;
+      if (submission_open_ && CanEndSubmissionImmediately()) EndSubmission(false);
+    }
+  }
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES

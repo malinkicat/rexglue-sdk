@@ -27,6 +27,9 @@
 #include <ffx_api/ffx_upscale.h>
 #endif
 
+REXCVAR_DEFINE_BOOL(present_vsync_on_ui_thread, true, "UI/Presenter",
+                    "With --d3d12_present_vsync, present from the UI thread (a waiting present can't hold "
+                    "back the GPU work); false: in order on the submission thread");
 REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
                     "Allow presentation from non-UI thread");
 
@@ -1386,7 +1389,11 @@ Presenter::PaintMode Presenter::GetDesiredPaintModeFromUIThread(bool is_paintabl
   // submission thread a waiting present held back the game's GPU work and,
   // through the refresh tail, the command processor (on the Deck: a 33 ms
   // frame every 1-2 s; here 1 in 2400).
-  static const bool vsync_present = rex::cvar::GetFlagByName("d3d12_present_vsync") == "true";
+  // (--present_vsync_on_ui_thread=false keeps them on it: with a long vkd3d
+  // latency queue they don't wait, and the swap chain copy then queues right
+  // behind our frame instead of behind the next frame's draws.)
+  static const bool vsync_present = rex::cvar::GetFlagByName("d3d12_present_vsync") == "true" &&
+                                    rex::cvar::GetFlagByName("present_vsync_on_ui_thread") != "false";
   if (!REXCVAR_GET(host_present_from_non_ui_thread) || frame_generation || vsync_present) {
     return PaintMode::kUIThreadOnRequest;
   }

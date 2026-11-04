@@ -4443,9 +4443,12 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     // Only the squeeze: the sprite-position handling below stays with the
     // listed shaders, whose vertices it can read.
     // (Not 84E84A...: a full-screen picture - the loading screens', and a copy
-    // over the whole frame in rides; squeezing full-screen passes breaks it.)
+    // over the whole frame in rides; squeezing full-screen passes breaks it.
+    // Nor 079359...: a full-screen triangle - the trail map's terrain, squeezed
+    // into the middle rows over a stale picture, blurry at the top and bottom.)
     const bool flat_on_frame = REXCVAR_GET(ui_squeeze_by_state) && !scene_geometry && !video_shader &&
-                               vs_hash != 0x84E84A34660A2FD1ull && pixel_shader &&
+                               vs_hash != 0x84E84A34660A2FD1ull && vs_hash != 0x079359A17CDF5F6Bull &&
+                               pixel_shader &&
                                regs.Get<reg::PA_CL_VTE_CNTL>().value == 0x43F;
     ultrawide_draw_ = !video_frame_ && !presenter_video_frame_ && frontbuffer_width &&
                       regs.Get<reg::RB_SURFACE_INFO>().surface_pitch >= frontbuffer_width &&

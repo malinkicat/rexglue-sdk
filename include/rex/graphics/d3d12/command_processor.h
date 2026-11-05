@@ -678,6 +678,13 @@ class D3D12CommandProcessor : public CommandProcessor {
   // from where its matrix puts its origin): pinned to that screen edge.
   float ultrawide_pin_ = 0.0f;
   bool ultrawide_ui_draw_ = false;
+  // The scene's deferred lighting / shadow pass (a full-screen triangle, not
+  // squeezed) rebuilds each pixel's world position from its screen position
+  // and the squeezed scene's depth, with the matrix in its pixel constants
+  // c0-c3: their screen x / y columns are divided by the squeeze for it
+  // (1 = as the game wrote them). The pixel constants as last uploaded too.
+  float unsqueeze_ps_matrix_[2] = {1.0f, 1.0f};
+  float unsqueeze_ps_matrix_uploaded_[2] = {1.0f, 1.0f};
 
   // Bytes 0x0...0x3FF - 256-entry gamma ramp table with B10G10R10X2 data (read
   // as R10G10B10X2 with swizzle).

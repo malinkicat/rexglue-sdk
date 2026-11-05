@@ -72,6 +72,14 @@ REXCVAR_DEFINE_BOOL(ui_squeeze_by_state, true, "GPU",
                     "has a pixel shader and the frame's viewport transform, not just the listed UI shaders, so HUD "
                     "pieces and overlays on the squeezed scene (trail-map routes, challenge meters) found nowhere "
                     "in the list still line up");
+REXCVAR_DEFINE_BOOL(squeeze_trace, false, "GPU",
+                    "Debug: with this on, creating squeeze_trace.txt in the working folder logs every draw of "
+                    "the next frame (shaders, target, squeezed or not, the textures read)");
+REXCVAR_DEFINE_INT32(squeeze_offscreen_depth_base, 720, "GPU",
+                     "With ultrawide_squeeze / tall_squeeze: depth-tested draws into this EDRAM depth base "
+                     "(tiles) aren't squeezed: Amped 3's shadow pass (720; the scene's is 2047), drawn from the "
+                     "sun into the frame-wide surface before the scene and looked up by the sun's projection - "
+                     "squeezed, every rider's and object's shadow slid off it as the camera moved; -1 = off");
 REXCVAR_DEFINE_STRING(debug_skip_vs, "", "GPU",
                       "Debug: skip draws with this vertex shader hash (hex), to see what it draws");
 REXCVAR_DEFINE_BOOL(ui_census, false, "GPU",
@@ -274,6 +282,10 @@ uint32_t g_dlss_wide_resolves = 0;      // this frame so far
 uint32_t g_dlss_resolves_before_hud = 0;  // this frame, at its first HUD draw
 uint32_t g_dlss_scene_resolve = 0;        // learnt: 1-based index, 0 = unknown
 uint32_t g_dlss_frame = 0;
+// --squeeze_trace: squeeze_trace.txt in the working folder (checked once a
+// second) logs every draw of the next frame (ultrawide / tall squeeze debugging).
+bool g_squeeze_trace = false;
+uint32_t g_squeeze_trace_check = 0;
 
 bool DlssTracing() {
   const int32_t f = REXCVAR_GET(dlss_trace_frame);
@@ -3078,6 +3090,14 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   g_dlss_wide_resolves = 0;
   g_dlss_resolves_before_hud = 0;
   ++g_dlss_frame;
+  if (g_squeeze_trace) {
+    g_squeeze_trace = false;
+    REXGPU_INFO("squeeze trace: end");
+  }
+  if (REXCVAR_GET(squeeze_trace) && ++g_squeeze_trace_check % 60 == 0 && std::remove("squeeze_trace.txt") == 0) {
+    g_squeeze_trace = true;
+    REXGPU_INFO("squeeze trace: frame {}", g_dlss_frame);
+  }
   if (REXCVAR_GET(dlss_log) && ++g_dlss_stats.frames % 60 == 0) {
     REXGPU_INFO("DLSS draws (60 frames): fb width {}, wide-target draws {}, narrow {}, scene {}, HUD {}, "
                 "hand-offs {}, wants scene {}, scene resolve #{}, frame {}",
@@ -4402,6 +4422,15 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     const bool video_shader = vs_hash == 0xDA562C2172F5F825ull || vs_hash == 0x6EAD12298B35F2F8ull;
     const reg::RB_DEPTHCONTROL depth_control = draw_util::GetNormalizedDepthControl(regs);
     const bool scene_geometry = depth_control.z_enable && depth_control.zfunc != xenos::CompareFunction::kAlways;
+    // The game's shadow pass (render bucket ShadowBuffer: the casters
+    // depth-only, then the terrain, foliage and characters into the colour)
+    // draws from the sun into the same 1280-pitch surface, depth base 720,
+    // before the scene (2047). The deferred pass (ps E649FB4A tf0) and the
+    // character pass (ps A241C146 tf1) look the resolved map up by the sun's
+    // projection, not by screen position, so it keeps its own layout.
+    const bool light_space = scene_geometry && REXCVAR_GET(squeeze_offscreen_depth_base) >= 0 &&
+                             int32_t(regs.Get<reg::RB_DEPTH_INFO>().depth_base) ==
+                                 REXCVAR_GET(squeeze_offscreen_depth_base);
     // A frame showing a video is presented letterboxed instead, unsqueezed.
     if (video_shader) video_frame_ = true;
     // A loading screen (its picture, 84E84A..., in a frame without 3D) too, so
@@ -4448,16 +4477,59 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     // into the middle rows over a stale picture, blurry at the top and bottom.)
     const bool flat_on_frame = REXCVAR_GET(ui_squeeze_by_state) && !scene_geometry && !video_shader &&
                                vs_hash != 0x84E84A34660A2FD1ull && vs_hash != 0x079359A17CDF5F6Bull &&
-                               pixel_shader &&
+                               vs_hash != 0x62F1B391585BE113ull && pixel_shader &&
                                regs.Get<reg::PA_CL_VTE_CNTL>().value == 0x43F;
     ultrawide_draw_ = !video_frame_ && !presenter_video_frame_ && frontbuffer_width &&
                       regs.Get<reg::RB_SURFACE_INFO>().surface_pitch >= frontbuffer_width &&
-                      (scene_geometry || ui_shader || flat_on_frame);
+                      ((scene_geometry && !light_space) || ui_shader || flat_on_frame);
     // The UI sprite's extents across the 16:9 frame (-1..1), from its
     // vertices: the UI vertex shaders place it with a 4x4 matrix in c0-c3,
     // and text sets its glyphs' positions in the vertices.
     float e[4];
     ultrawide_ui_draw_ = ultrawide_draw_ && ui_shader;
+    // The scene's deferred lighting pass (shadows): its world positions from
+    // the squeezed depth need the squeeze taken out of its screen positions
+    // (else the shadows slide over objects as the camera moves).
+    {
+      const bool scene_squeezed = !video_frame_ && !presenter_video_frame_ && frontbuffer_width &&
+                                  regs.Get<reg::RB_SURFACE_INFO>().surface_pitch >= frontbuffer_width;
+      const bool deferred = vs_hash == 0x079359A17CDF5F6Bull && pixel_shader &&
+                            pixel_shader->ucode_data_hash() == 0xE649FB4A24977EEFull;
+      const float kx = float(REXCVAR_GET(ultrawide_squeeze)), ky = float(REXCVAR_GET(tall_squeeze));
+      const bool fix = deferred && scene_squeezed;
+      unsqueeze_ps_matrix_[0] = fix && kx > 0.0f ? kx : 1.0f;
+      unsqueeze_ps_matrix_[1] = fix && ky > 0.0f ? ky : 1.0f;
+    }
+    if (g_squeeze_trace) {
+      const auto vp_scale = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE);
+      const auto vp_offset = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET);
+      std::string tex;
+      auto add_textures = [&](const Shader* shader, const char* stage) {
+        if (!shader) return;
+        for (const Shader::TextureBinding& binding : shader->texture_bindings()) {
+          if (binding.fetch_constant >= 32) continue;
+          const xenos::xe_gpu_texture_fetch_t f = regs.GetTextureFetch(binding.fetch_constant);
+          tex += fmt::format(" {}t{}={:08X}:{}x{}:f{}", stage, binding.fetch_constant, uint32_t(f.base_address) << 12,
+                             uint32_t(f.size_2d.width) + 1, uint32_t(f.size_2d.height) + 1, uint32_t(f.format));
+        }
+      };
+      add_textures(vertex_shader, "v");
+      add_textures(pixel_shader, "p");
+      REXGPU_INFO("sq vp: x {:.1f}/{:.1f} y {:.1f}/{:.1f} scissor {:08X} {:08X} window off {:08X}",
+                  regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE), regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET),
+                  regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE), regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET),
+                  regs[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_TL], regs[XE_GPU_REG_PA_SC_SCREEN_SCISSOR_BR],
+                  regs[XE_GPU_REG_PA_SC_WINDOW_OFFSET]);
+      REXGPU_INFO("sq draw: pitch {} vs {:016X} ps {:016X} sq {} z {}/{} zw {} vte {:03X} vp {:.1f}/{:.1f} cbase {} "
+                  "fmt {} dbase {} mask {:X} blend {:08X} light {}{}",
+                  regs.Get<reg::RB_SURFACE_INFO>().surface_pitch, vs_hash,
+                  pixel_shader ? pixel_shader->ucode_data_hash() : 0, int(ultrawide_draw_),
+                  uint32_t(depth_control.z_enable), uint32_t(depth_control.zfunc),
+                  uint32_t(depth_control.z_write_enable), regs.Get<reg::PA_CL_VTE_CNTL>().value, vp_scale, vp_offset,
+                  regs.Get<reg::RB_COLOR_INFO>().color_base, uint32_t(regs.Get<reg::RB_COLOR_INFO>().color_format),
+                  regs.Get<reg::RB_DEPTH_INFO>().depth_base, regs[XE_GPU_REG_RB_COLOR_MASK],
+                  regs[XE_GPU_REG_RB_BLENDCONTROL0], int(light_space), tex);
+    }
     const bool have_extents = ultrawide_draw_ && ui_shader && UiSpriteExtents(*vertex_shader, e) && e[0] <= e[1];
     // UI parked beside the 16:9 frame (the radio popup and others while
     // hidden, or before they slide in) is off a 16:9 screen; squeezed, it
@@ -5647,8 +5719,10 @@ bool D3D12CommandProcessor::IssueCopy() {
   // into the frontbuffer target, which is copied out last; the scene is handed
   // over at the last color 0 resolve before that (its index learnt last frame;
   // only tile 1, collapsed to the full width, counts).
-  if (DlssTracing()) {
+  if (DlssTracing() || g_squeeze_trace) {
     const RegisterFile& tregs = *register_file_;
+    REXGPU_INFO("sq resolve: window tl {:08X} br {:08X} dest size {:08X}", tregs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL],
+                tregs[XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR], tregs[XE_GPU_REG_RB_COPY_DEST_INFO]);
     REXGPU_INFO("trace resolve: pitch {} src {} color base {} depth base {} dest {:08X} dest pitch {}",
                 tregs.Get<reg::RB_SURFACE_INFO>().surface_pitch,
                 tregs.Get<reg::RB_COPY_CONTROL>().copy_src_select, tregs.Get<reg::RB_COLOR_INFO>().color_base,
@@ -6386,6 +6460,16 @@ bool D3D12CommandProcessor::UploadFloatConstants(uint32_t stage, const uint64_t*
       std::memcpy(gathered, &regs[first_register + (i << 8) + (float_constant_index << 2)],
                   4 * sizeof(float) * run);
       gathered += 4 * sizeof(float) * run;
+    }
+  }
+  // The deferred pass's c0-c3 (IssueDraw): screen x / y columns divided by
+  // the squeeze. c0-c3 are the first four gathered when the shader uses them.
+  if (stage == 1 && (float_bitmap[0] & 0xF) == 0xF &&
+      (unsqueeze_ps_matrix_[0] != 1.0f || unsqueeze_ps_matrix_[1] != 1.0f)) {
+    float* m = reinterpret_cast<float*>(staging.data());
+    for (uint32_t row = 0; row < 4; ++row) {
+      m[row * 4 + 0] /= unsqueeze_ps_matrix_[0];
+      m[row * 4 + 1] /= unsqueeze_ps_matrix_[1];
     }
   }
   FloatConstantUpload& last = float_constants_last_[stage];
@@ -7150,8 +7234,14 @@ bool D3D12CommandProcessor::UpdateBindings(const D3D12Shader* vertex_shader,
     cbuffer_binding_float_vertex_.up_to_date = true;
     current_graphics_root_up_to_date_ &= ~(1u << root_parameter_float_constants_vertex);
   }
+  if (unsqueeze_ps_matrix_[0] != unsqueeze_ps_matrix_uploaded_[0] ||
+      unsqueeze_ps_matrix_[1] != unsqueeze_ps_matrix_uploaded_[1]) {
+    cbuffer_binding_float_pixel_.up_to_date = false;
+  }
   if (!cbuffer_binding_float_pixel_.up_to_date) {
     static const uint64_t kNoFloatConstants[4] = {};
+    unsqueeze_ps_matrix_uploaded_[0] = unsqueeze_ps_matrix_[0];
+    unsqueeze_ps_matrix_uploaded_[1] = unsqueeze_ps_matrix_[1];
     if (!UploadFloatConstants(
             1,
             pixel_shader ? pixel_shader->constant_register_map().float_bitmap : kNoFloatConstants,
